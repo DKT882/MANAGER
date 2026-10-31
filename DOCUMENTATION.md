@@ -133,14 +133,28 @@ To avoid notification spam in groups with many moderators or helper staff, repor
 
 ## 5. Asynchronous Interceptors
 
-### A. Sliding-Window Anti-Flood Middleware
+### A. Auto-Delete Join & Group Left Service Notifications
+- **Service Event Interception:** AIogram captures `F.new_chat_members | F.left_chat_member` events instantly.
+- **Immediate Zero-Latency Cleanup:** When `clean_service_messages` is active (enabled by default), incoming join/leave notification messages are purged with `await message.delete()` before users notice them.
+- **Dual-Mode Interactive Configuration:**
+  - **In-Group `/start`:** Authorized admins can toggle the feature (`🚷 Delete Join/Left: ON/OFF`) directly inside the chat.
+  - **Private DM Hub `/start`:** Authorized admins can open the bot in private DM, select their group, and configure join/leave cleanup remotely.
+- **Strict Multi-Role Security Authorization:**
+  - Configuration rights are strictly restricted via `check_can_setup_bot()` to:
+    1. 👑 **Chat Owner / Creator** (`ChatMemberOwner`)
+    2. 🕶️ **Anonymous Administrators** (`is_anonymous == True` or `sender_chat.id == chat.id`)
+    3. 👥 **Excepted Admins** (Admins explicitly added to `excepted_admins`)
+  - Any attempt by regular members or standard administrators to view or alter settings is rejected with a confidential alert.
+- **Durable Write-Behind Persistence:** Toggling the setting persists immediately to the MongoDB `chat_settings` collection in the background without blocking the Telegram event loop.
+
+### B. Sliding-Window Anti-Flood Middleware
 - Configured via `flood_window` (default `3.0s`) and `flood_limit` (default `5` messages).
 - When messages from a non-admin user exceed `flood_limit` within `flood_window`, the middleware:
   1. Instantly purges the offending flood message.
   2. Applies an automated 15-minute mute or ban.
   3. Drops the event from bubbling to further message handlers.
 
-### B. Media & Link Interceptors
+### C. Media & Link Interceptors
 - Sub-millisecond scanning on:
   - `message.sticker`
   - `message.animation` (GIFs)
@@ -148,7 +162,7 @@ To avoid notification spam in groups with many moderators or helper staff, repor
   - `message.audio`
   - `message.voice`
   - `message.entities` (`url`, `text_link`, and regex URLs)
-- Toggleable per-chat in the `/settings` UI.
+- Toggleable per-chat in the `/start` settings UI.
 - Strict **Admin Link Deletion** toggle available to enforce rules on administrators as well.
 
 ---

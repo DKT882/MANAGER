@@ -81,6 +81,8 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "warn_duration": 86400,    # 24 hours penalty duration in seconds
     # Reporting exception settings
     "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
+    # Service messages cleanup (auto delete user join / left notifications)
+    "clean_service_messages": True,
 }
 
 # CHAT_SETTINGS: chat_id -> configuration dict
@@ -400,10 +402,35 @@ class AntiFloodMiddleware(BaseMiddleware):
 router = Router(name="high_speed_admin_router")
 
 # ==============================================================================
+# 0. SERVICE MESSAGE CLEANER (AUTO-DELETE JOIN / LEAVE NOTIFICATIONS)
+# ==============================================================================
+
+@router.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    F.new_chat_members | F.left_chat_member
+)
+async def handle_service_messages(message: Message) -> None:
+    """
+    Auto-deletes user join (new_chat_members) and leave (left_chat_member)
+    service notifications instantly when clean_service_messages is enabled.
+    """
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    if settings.get("clean_service_messages", True):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+# ==============================================================================
 # ASYNCHRONOUS MEDIA & LINK INTERCEPTOR (SUB-SECOND SCANNER)
 # ==============================================================================
 
-@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+@router.message(
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    ~F.text.startswith("/")
+)
 async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None:
     """
     Monitors all incoming group messages against local settings:
@@ -984,6 +1011,12 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
+                text=f"🚷 Delete Join/Left: {state_badge(s.get('clean_service_messages', True))}",
+                callback_data=f"set:clean_service_messages:{chat_id}"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 text=f"⚡ Anti-Flood: {state_badge(s['flood_protection'])} ({s['flood_limit']}msg/{int(s['flood_window'])}s)",
                 callback_data=f"set:flood_protection:{chat_id}"
             ),
@@ -1006,6 +1039,23 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def format_settings_text(chat_title: str, s: Dict[str, Any]) -> str:
+    """
+    Renders standardized settings dashboard text.
+    """
+    return (
+        f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
+        f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
+        f"• <b>Join/Left Cleanup:</b> {'Active (Auto-Deleted)' if s.get('clean_service_messages', True) else 'Disabled'}\n"
+        f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
+        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
+        f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
+        f"<i>Select an option below to configure group settings:</i>"
+    )
 
 
 # ------------------------------------------------------------------------------
@@ -1037,16 +1087,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
         chat_title = message.chat.title or "This Chat"
         s = CHAT_SETTINGS[chat_id]
 
-        text = (
-            f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
-            f"Group: <code>{chat_title}</code>\n\n"
-            f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
-            f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
-            f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-            f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
-            f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
-            f"<i>Select an option below to toggle local cache settings instantly:</i>"
-        )
+        text = format_settings_text(chat_title, s)
 
         try:
             await message.answer(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
@@ -1083,16 +1124,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
             except Exception:
                 title = f"Group {target_cid}"
 
-            text = (
-                f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
-                f"Group: <code>{title}</code>\n\n"
-                f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
-                f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
-                f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-                f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
-                f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
-                f"<i>Select an option below to configure group settings:</i>"
-            )
+            text = format_settings_text(title, s)
             try:
                 await message.answer(text, reply_markup=generate_settings_keyboard(target_cid), parse_mode=ParseMode.HTML)
                 return
@@ -1161,16 +1193,7 @@ async def handle_dm_select_group(query: CallbackQuery, bot: Bot) -> None:
     except Exception:
         chat_title = f"Group {chat_id}"
 
-    text = (
-        f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
-        f"Group: <code>{chat_title}</code>\n\n"
-        f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
-        f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
-        f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
-        f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
-        f"<i>Select an option below to toggle settings:</i>"
-    )
+    text = format_settings_text(chat_title, s)
     try:
         await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
     except Exception:
@@ -1244,6 +1267,105 @@ async def handle_dm_help_callback(query: CallbackQuery) -> None:
     except Exception:
         pass
     await query.answer()
+
+
+@router.callback_query(F.data.startswith("set:"))
+async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
+    """
+    Handles interactive settings configuration clicks (both in-group and from private DMs).
+    Guarded strictly by check_can_setup_bot (Owner, Anonymous Admin, Excepted Admin).
+    Changes are reflected instantly in runtime memory and persisted asynchronously to MongoDB.
+    """
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        await query.answer()
+        return
+
+    action = parts[1]
+    try:
+        chat_id = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+
+    user_id = query.from_user.id
+    sender_chat_id = query.message.sender_chat.id if query.message and query.message.sender_chat else None
+
+    # STRICT ACCESS CONTROL: Only Owner, Anonymous Admins, or Excepted Admins can configure settings
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await query.answer("❌ Only the Chat Owner, Anonymous Admins, or Excepted Admins can configure settings.", show_alert=True)
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+
+    if action == "close":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.answer("Closed.")
+        return
+
+    if action == "reload":
+        await query.answer("Settings reloaded.")
+    elif action == "block_links":
+        s["block_links"] = not s["block_links"]
+        await query.answer(f"In-Chat Links: {'Blocked' if s['block_links'] else 'Allowed'}")
+    elif action == "admin_links_block":
+        s["admin_links_block"] = not s["admin_links_block"]
+        await query.answer(f"Admin Links: {'Blocked' if s['admin_links_block'] else 'Allowed'}")
+    elif action == "block_sticker":
+        s["block_sticker"] = not s["block_sticker"]
+        await query.answer(f"Stickers: {'Blocked' if s['block_sticker'] else 'Allowed'}")
+    elif action == "block_animation":
+        s["block_animation"] = not s["block_animation"]
+        await query.answer(f"GIFs: {'Blocked' if s['block_animation'] else 'Allowed'}")
+    elif action == "block_document":
+        s["block_document"] = not s["block_document"]
+        await query.answer(f"Documents: {'Blocked' if s['block_document'] else 'Allowed'}")
+    elif action == "block_voice":
+        s["block_voice"] = not s["block_voice"]
+        await query.answer(f"Audio/Voice: {'Blocked' if s['block_voice'] else 'Allowed'}")
+    elif action == "clean_service_messages":
+        current_val = s.get("clean_service_messages", True)
+        s["clean_service_messages"] = not current_val
+        await query.answer(f"Join/Left Cleanup: {'Active (Auto-Deleted)' if s['clean_service_messages'] else 'Disabled'}")
+    elif action == "flood_protection":
+        s["flood_protection"] = not s["flood_protection"]
+        await query.answer(f"Anti-Flood: {'Active' if s['flood_protection'] else 'Disabled'}")
+    elif action == "warn_toggle":
+        limits = [3, 5, 10]
+        cur = s.get("warn_limit", 3)
+        if cur in limits:
+            idx = limits.index(cur)
+            s["warn_limit"] = limits[(idx + 1) % len(limits)]
+        else:
+            s["warn_limit"] = 3
+        await query.answer(f"Warn Limit set to {s['warn_limit']} violations")
+    elif action == "view_excepted":
+        excepted = s.get("excepted_admins", [])
+        if excepted:
+            alert_msg = f"👥 Excepted Admins ({len(excepted)}):\n" + "\n".join(f"• ID: {eid}" for eid in excepted)
+        else:
+            alert_msg = "👥 No Excepted Admins designated yet.\nReply to an admin with /addexcept to designate them for confidential reports."
+        await query.answer(alert_msg[:200], show_alert=True)
+        return
+
+    # Background MongoDB persistence (write-behind non-blocking)
+    try:
+        c_info = await bot.get_chat(chat_id)
+        chat_title = c_info.title or f"Group {chat_id}"
+    except Exception:
+        chat_title = f"Group {chat_id}"
+
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+
+    # Re-render updated dashboard
+    text = format_settings_text(chat_title, s)
+    try:
+        await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 @router.message(Command("help"))

@@ -126,6 +126,7 @@ class ChatSettingsModel(BaseModel):
     flood: AntiFloodSettings = Field(default_factory=AntiFloodSettings)
     warnings: WarnSettings = Field(default_factory=WarnSettings)
     reporting: ReportingSettings = Field(default_factory=ReportingSettings)
+    clean_service_messages: bool = Field(default=True, description="Auto-delete join and group left service notifications")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -162,6 +163,7 @@ class ChatSettingsModel(BaseModel):
             "warn_action": self.warnings.warn_action.value if hasattr(self.warnings.warn_action, "value") else str(self.warnings.warn_action),
             "warn_duration": self.warnings.warn_duration,
             "excepted_admins": list(self.reporting.excepted_admin_ids),
+            "clean_service_messages": self.clean_service_messages,
         }
 
     @classmethod
@@ -219,6 +221,7 @@ class ChatSettingsModel(BaseModel):
             flood=flood,
             warnings=warnings,
             reporting=reporting,
+            clean_service_messages=mem_dict.get("clean_service_messages", True),
         )
 
 

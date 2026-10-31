@@ -74,8 +74,9 @@ Command autocomplete and menus in Telegram are strictly scoped:
 
 ---
 
-## ⚡ Asynchronous Spam & Media Interceptors
+## ⚡ Asynchronous Spam, Service & Media Interceptors
 
+- **Auto-Delete Join & Group Left Notifications:** Automatically wipes annoying member join (`new_chat_members`) and leave (`left_chat_member`) notification service messages immediately upon arrival. Fully configurable via interactive settings (`🚷 Delete Join/Left: ON/OFF`) directly inside groups or remotely from the bot's private DM hub. Strictly restricted so only the **Chat Owner**, **Anonymous Admins**, or **Excepted Admins** can toggle or configure it.
 - **Sliding-Window Anti-Flood Middleware:** High-speed router middleware tracking frequencies (`flood_window: 3s`, `flood_limit: 5`). Violators are automatically muted and spam messages are purged instantly.
 - **Media Type Filtering:** Instant suppression of `sticker`, `gif` (animation), `document`, `audio`, `voice`, `photo`, and `video`.
 - **Link Interceptor:** Real-time URL and invite link blocker with optional strict admin link deletion.
