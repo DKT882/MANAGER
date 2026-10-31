@@ -92,9 +92,9 @@ WARN_CACHE: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
 # FLOOD_CACHE: chat_id -> user_id -> deque of monotonic timestamps
 FLOOD_CACHE: Dict[int, Dict[int, deque]] = defaultdict(lambda: defaultdict(deque))
 
-# ADMIN_CACHE: (chat_id, user_id) -> (monotonic_timestamp, set_of_permissions, is_owner)
+# ADMIN_CACHE: (chat_id, user_id) -> (monotonic_timestamp, set_of_permissions, is_owner, is_anonymous)
 # Caches Telegram administrator custom rights for 60s to prevent roundtrip API lag
-ADMIN_CACHE: Dict[Tuple[int, int], Tuple[float, set, bool]] = {}
+ADMIN_CACHE: Dict[Tuple[int, int], Tuple[float, set, bool, bool]] = {}
 ADMIN_CACHE_TTL = 60.0  # seconds
 
 # ==============================================================================
@@ -130,7 +130,7 @@ async def check_admin_rights(
 
     # 1. Inspect local memory cache
     if cache_key in ADMIN_CACHE:
-        cached_time, perms, is_owner = ADMIN_CACHE[cache_key]
+        cached_time, perms, is_owner, _ = ADMIN_CACHE[cache_key]
         if now - cached_time < ADMIN_CACHE_TTL:
             if is_owner:
                 return True
@@ -142,10 +142,13 @@ async def check_admin_rights(
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         if isinstance(member, ChatMemberOwner):
-            ADMIN_CACHE[cache_key] = (now, set(), True)
+            ADMIN_CACHE[cache_key] = (now, set(), True, False)
             return True
         elif isinstance(member, ChatMemberAdministrator):
+            is_anon = getattr(member, "is_anonymous", False)
             perms = {"is_admin"}
+            if is_anon:
+                perms.add("is_anonymous")
             if member.can_restrict_members:
                 perms.add("can_restrict_members")
             if member.can_delete_messages:
@@ -159,12 +162,84 @@ async def check_admin_rights(
             if member.can_invite_users:
                 perms.add("can_invite_users")
 
-            ADMIN_CACHE[cache_key] = (now, perms, False)
+            ADMIN_CACHE[cache_key] = (now, perms, False, is_anon)
             if required_permission is None:
                 return True
             return required_permission in perms
         else:
-            ADMIN_CACHE[cache_key] = (now, set(), False)
+            ADMIN_CACHE[cache_key] = (now, set(), False, False)
+            return False
+    except Exception:
+        return False
+
+
+async def check_can_setup_bot(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    sender_chat_id: Optional[int] = None
+) -> bool:
+    """
+    Validates whether a user is authorized to configure or setup the bot.
+    Strictly permits ONLY:
+    1. Owner / Creator of the Supergroup (ChatMemberOwner)
+    2. Anonymous Admin (is_anonymous == True or sender_chat_id == chat_id)
+    3. Excepted / Exempted Admin (user_id in chat's excepted_admins list)
+    All other administrators (including admins with full custom rights) are denied.
+    """
+    if not chat_id:
+        return False
+
+    # Check native Telegram anonymous group admin message
+    if sender_chat_id and sender_chat_id == chat_id:
+        return True
+
+    if not user_id:
+        return False
+
+    # 1. Check Excepted / Exempted Admins in in-memory settings (0ms)
+    settings = CHAT_SETTINGS[chat_id]
+    excepted_ids = set(settings.get("excepted_admins", []))
+    if user_id in excepted_ids:
+        return True
+
+    # 2. Check local Admin Cache (TTL 60s)
+    now = time.monotonic()
+    cache_key = (chat_id, user_id)
+    if cache_key in ADMIN_CACHE:
+        cached_time, perms, is_owner, is_anon = ADMIN_CACHE[cache_key]
+        if now - cached_time < ADMIN_CACHE_TTL:
+            if is_owner or is_anon:
+                return True
+
+    # 3. Fetch Telegram member status
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        if isinstance(member, ChatMemberOwner):
+            ADMIN_CACHE[cache_key] = (now, set(), True, False)
+            return True
+        elif isinstance(member, ChatMemberAdministrator):
+            is_anon = getattr(member, "is_anonymous", False)
+            perms = {"is_admin"}
+            if is_anon:
+                perms.add("is_anonymous")
+            if member.can_restrict_members:
+                perms.add("can_restrict_members")
+            if member.can_delete_messages:
+                perms.add("can_delete_messages")
+            if member.can_pin_messages:
+                perms.add("can_pin_messages")
+            if member.can_promote_members:
+                perms.add("can_promote_members")
+            if member.can_change_info:
+                perms.add("can_change_info")
+            if member.can_invite_users:
+                perms.add("can_invite_users")
+
+            ADMIN_CACHE[cache_key] = (now, perms, False, is_anon)
+            return is_anon
+        else:
+            ADMIN_CACHE[cache_key] = (now, set(), False, False)
             return False
     except Exception:
         return False
@@ -891,8 +966,11 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 async def handle_settings(message: Message, bot: Bot) -> None:
     await wipe_trigger(message)
 
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_change_info"):
+
+    # Rule: ONLY Owner, Anonymous Admins, or Excepted/Exempted Admins can setup the bot
+    if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
         return
 
     chat_id = message.chat.id
@@ -927,8 +1005,9 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     chat_id = int(chat_id_str)
 
     user_id = query.from_user.id
-    if not await check_admin_rights(bot, chat_id, user_id, "can_change_info"):
-        await query.answer("❌ You lack administrative permissions to alter settings.", show_alert=True)
+    # Rule: ONLY Owner, Anonymous Admins, or Excepted/Exempted Admins can alter settings
+    if not await check_can_setup_bot(bot, chat_id, user_id):
+        await query.answer("❌ Only the Owner, Anonymous Admins, or Excepted Admins can configure the bot.", show_alert=True)
         return
 
     s = CHAT_SETTINGS[chat_id]
@@ -1468,8 +1547,10 @@ async def handle_pm_report_action_callback(query: CallbackQuery, bot: Bot) -> No
 async def handle_add_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
     """Designates an admin as an Excepted Admin to receive report notifications."""
     await wipe_trigger(message)
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members"):
+    # Rule: ONLY Owner, Anonymous Admins, or Excepted Admins can setup the bot
+    if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
         return
 
     target_id, target_name, _ = await resolve_target(message, command)
@@ -1500,8 +1581,9 @@ async def handle_add_except_admin(message: Message, command: CommandObject, bot:
 async def handle_rem_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
     """Removes an admin from the Excepted Admins report recipient list."""
     await wipe_trigger(message)
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members"):
+    if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
         return
 
     target_id, _, _ = await resolve_target(message, command)
@@ -1532,8 +1614,9 @@ async def handle_rem_except_admin(message: Message, command: CommandObject, bot:
 async def handle_list_excepted_admins(message: Message, bot: Bot) -> None:
     """Lists all Excepted Admins in the chat."""
     await wipe_trigger(message)
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id):
+    if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
         return
 
     chat_id = message.chat.id
@@ -1628,8 +1711,10 @@ async def setup_bot_commands(bot: Bot) -> None:
 async def handle_sync_commands(message: Message, bot: Bot) -> None:
     """Manual trigger to synchronize admin-only command catalog on demand."""
     await wipe_trigger(message)
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_change_info"):
+    # Rule: ONLY Owner, Anonymous Admins, or Excepted/Exempted Admins can configure the bot
+    if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
         return
     await setup_bot_commands(bot)
 

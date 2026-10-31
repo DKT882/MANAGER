@@ -96,11 +96,11 @@ The engine validates the native administrator custom privileges:
 | `/warns` | `[target]` | None (ephemeral) | Returns user warning count (auto-deleted after 5 seconds). |
 | `/report` | `(Reply only) [reason]` | None (Members & Admins) | Flags message publicly with one-click admin action buttons, and dispatches confidential private PM notifications **strictly** to Owner of the GC, Anonymous Admins, and Excepted Admins. |
 | `/show` | `(Reply only) [reason]` | None (Members & Admins) | Sends detailed private report directly to Owner of the GC, Anonymous Admins, and Excepted Admins in their private DM with moderation buttons. |
-| `/addexcept` | `[target]` | `can_promote_members` | Designates an admin as an Excepted Admin to receive report notifications. |
-| `/remexcept` | `[target]` | `can_promote_members` | Removes an admin from the Excepted Admin report notification list. |
-| `/excepted` | None | None (Admins) | Lists all currently configured Excepted Admins in the chat. |
-| `/settings` | None | `can_change_info` | Opens interactive inline configuration dashboard. |
-| `/setcommands` | None | `can_change_info` | Force synchronizes the scoped admin-only command menu. |
+| `/addexcept` | `[target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report notifications. |
+| `/remexcept` | `[target]` | Owner / Anon / Excepted | Removes an admin from the Excepted Admin report notification list. |
+| `/excepted` | None | Owner / Anon / Excepted | Lists all currently configured Excepted Admins in the chat. |
+| `/settings` | None | Owner / Anon / Excepted | Opens interactive inline configuration dashboard (Strictly restricted). |
+| `/setcommands` | None | Owner / Anon / Excepted | Force synchronizes the scoped admin-only command menu. |
 
 ---
 

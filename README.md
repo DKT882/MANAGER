@@ -64,11 +64,11 @@ Command autocomplete and menus in Telegram are strictly scoped:
 | `/warns` | `/warns [target]` | All Members (Ephemeral) | Returns user warning count (auto-deleted after 5 seconds). |
 | `/report` | `/report [reason]` (Reply only) | All Members & Admins | Publicly flags message in group with action buttons; sends private PMs **strictly** to Owner, Anonymous Admins & Excepted Admins. |
 | `/show` | `/show [reason]` (Reply only) | All Members | Forwards violator report directly to the Owner, Anonymous Admins & Excepted Admins' private DMs. |
-| `/addexcept`| `/addexcept [target]` | `can_promote_members` | Designates an admin as an Excepted Admin to receive report alerts. |
-| `/remexcept`| `/remexcept [target]` | `can_promote_members` | Removes an admin from the Excepted Admin report notification list. |
-| `/excepted` | `/excepted` | All Admins | Displays all currently configured Excepted Admins in the chat. |
-| `/settings` | `/settings` | `can_change_info` | Opens interactive inline configuration dashboard. |
-| `/setcommands`| `/setcommands` | `can_change_info` | Forces synchronization of scoped command menus with Telegram. |
+| `/addexcept`| `/addexcept [target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report alerts. |
+| `/remexcept`| `/remexcept [target]` | Owner / Anon / Excepted | Removes an admin from the Excepted Admin report notification list. |
+| `/excepted` | `/excepted` | Owner / Anon / Excepted | Displays all currently configured Excepted Admins in the chat. |
+| `/settings` | `/settings` | Owner / Anon / Excepted | Opens interactive inline configuration dashboard (Strictly restricted). |
+| `/setcommands`| `/setcommands` | Owner / Anon / Excepted | Forces synchronization of scoped command menus with Telegram. |
 
 ---
 
