@@ -94,8 +94,11 @@ The engine validates the native administrator custom privileges:
 | `/warn` | `[target]` | `can_restrict_members` | Increments warning count; triggers penalty at ceiling. |
 | `/resetwarn`| `[target]` | `can_restrict_members` | Clears target's warning counter to zero. |
 | `/warns` | `[target]` | None (ephemeral) | Returns user warning count (auto-deleted after 5 seconds). |
-| `/report` | `(Reply only) [reason]` | None (Members & Admins) | Flags message publicly in the group with instant admin action buttons (`Delete`, `Mute`, `Ban`, `Dismiss`). |
-| `/show` | `(Reply only) [reason]` | None (Members & Admins) | Sends detailed private report directly to group administrators in their private DM with moderation buttons. |
+| `/report` | `(Reply only) [reason]` | None (Members & Admins) | Flags message publicly with one-click admin action buttons, and dispatches confidential private PM notifications **strictly** to Owner of the GC, Anonymous Admins, and Excepted Admins. |
+| `/show` | `(Reply only) [reason]` | None (Members & Admins) | Sends detailed private report directly to Owner of the GC, Anonymous Admins, and Excepted Admins in their private DM with moderation buttons. |
+| `/addexcept` | `[target]` | `can_promote_members` | Designates an admin as an Excepted Admin to receive report notifications. |
+| `/remexcept` | `[target]` | `can_promote_members` | Removes an admin from the Excepted Admin report notification list. |
+| `/excepted` | None | None (Admins) | Lists all currently configured Excepted Admins in the chat. |
 | `/settings` | None | `can_change_info` | Opens interactive inline configuration dashboard. |
 | `/setcommands` | None | `can_change_info` | Force synchronizes the scoped admin-only command menu. |
 
@@ -106,15 +109,21 @@ The engine validates the native administrator custom privileges:
 Telegram supports distinct command scopes through `bot.set_my_commands()`:
 
 1. **`BotCommandScopeAllChatAdministrators` (Admins Only):**
-   - When an administrator taps `/` or opens the bot menu in any group, Telegram displays the complete catalog of administrative commands (`/mute`, `/ban`, `/pin`, `/clear`, `/warn`, `/report`, `/show`, `/settings`, etc.).
+   - When an administrator taps `/` or opens the bot menu in any group, Telegram displays the complete catalog of administrative commands (`/mute`, `/ban`, `/pin`, `/clear`, `/warn`, `/report`, `/show`, `/addexcept`, `/remexcept`, `/excepted`, `/settings`, etc.).
 2. **`BotCommandScopeAllGroupChats` (Regular Members):**
    - Regular members in groups see **ONLY** the community reporting commands:
-     - `/report`: Flags the replied message publicly in the group with one-click admin action buttons.
-     - `/show`: Forwards the reported message and violator info directly to administrators' private DMs.
+     - `/report`: Flags the replied message publicly in the group with one-click admin action buttons, while notifying only authorized admins privately.
+     - `/show`: Forwards the reported message and violator info directly to the Owner, Anonymous Admins, and Excepted Admins' private DMs.
 3. **`BotCommandScopeDefault`:**
    - Empty command list (`[]`) preventing leaked administrative tools across unauthorized scopes.
 4. **`BotCommandScopeAllPrivateChats` (Private DM):**
    - Displays navigation commands (`/start`, `/help`, `/settings`) when chatting directly with the bot.
+
+### Confidential Report Delivery Rules
+To avoid notification spam in groups with many moderators or helper staff, reports from `/report` and `/show` are **NOT** broadcast to all administrators. Instead, delivery is strictly limited to:
+- 👑 **The Owner / Creator of the Supergroup** (`ChatMemberOwner`).
+- 🕶️ **Anonymous Administrators** (`admin.is_anonymous == True`).
+- 👥 **Excepted Admins** (`excepted_admins` list configured via `/addexcept` or in `/settings`).
 
 > The catalog is synchronized automatically on bot startup, and can also be refreshed on-demand with `/setcommands`.
 

@@ -79,6 +79,8 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "warn_limit": 3,           # Ceiling before automated penalty
     "warn_action": "mute",     # Automated ceiling action: 'mute' or 'ban'
     "warn_duration": 86400,    # 24 hours penalty duration in seconds
+    # Reporting exception settings
+    "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
 }
 
 # CHAT_SETTINGS: chat_id -> configuration dict
@@ -872,6 +874,12 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
             ),
         ],
         [
+            InlineKeyboardButton(
+                text=f"👥 Excepted Admins ({len(s.get('excepted_admins', []))})",
+                callback_data=f"set:view_excepted:{chat_id}"
+            ),
+        ],
+        [
             InlineKeyboardButton(text="🔄 Reload", callback_data=f"set:reload:{chat_id}"),
             InlineKeyboardButton(text="✅ Close", callback_data=f"set:close:{chat_id}"),
         ]
@@ -897,7 +905,8 @@ async def handle_settings(message: Message, bot: Bot) -> None:
         f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
         f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
         f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n\n"
+        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
+        f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
         f"<i>Select an option below to toggle local cache settings instantly:</i>"
     )
 
@@ -947,6 +956,14 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         curr_idx = ceilings.index(s["warn_limit"]) if s["warn_limit"] in ceilings else 0
         s["warn_limit"] = ceilings[(curr_idx + 1) % len(ceilings)]
         await query.answer(f"Warn limit set to {s['warn_limit']}")
+    elif action == "view_excepted":
+        exc_list = s.get("excepted_admins", [])
+        if exc_list:
+            ids_str = ", ".join(str(uid) for uid in exc_list)
+            await query.answer(f"Excepted Admins ({len(exc_list)}): {ids_str}\nManage via /addexcept & /remexcept", show_alert=True)
+        else:
+            await query.answer("No excepted admins yet. Reports go strictly to Owner & Anonymous Admins. Use /addexcept <id> to add.", show_alert=True)
+        return
 
     # Fast in-memory UI re-render
     chat_title = query.message.chat.title or "This Chat"
@@ -958,7 +975,8 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
         f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
         f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n\n"
+        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
+        f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
         f"<i>Select an option below to toggle local cache settings instantly:</i>"
     )
 
@@ -1052,12 +1070,51 @@ def extract_message_snippet(target_msg: Message) -> str:
     return "[Message Content]"
 
 
+async def get_report_recipients(bot: Bot, chat_id: int) -> list[types.User]:
+    """
+    Returns the list of administrators authorized to receive reports:
+    - ONLY:
+      1. Owner of the GC (ChatMemberOwner)
+      2. Anonymous Admin(s) (is_anonymous == True)
+      3. Excepted Admins (user IDs explicitly configured in chat's excepted_admins)
+    All other administrators are strictly excluded to prevent notification spam.
+    """
+    try:
+        all_admins = await bot.get_chat_administrators(chat_id)
+    except Exception:
+        return []
+
+    settings = CHAT_SETTINGS[chat_id]
+    excepted_ids = set(settings.get("excepted_admins", []))
+
+    recipients = []
+    seen_ids = set()
+
+    for admin in all_admins:
+        if admin.user.is_bot or admin.user.id in seen_ids:
+            continue
+
+        is_owner = isinstance(admin, ChatMemberOwner)
+        is_anonymous = getattr(admin, "is_anonymous", False)
+        is_excepted = admin.user.id in excepted_ids
+
+        # Strict filter: ONLY owner + anonymous admins + excepted admins
+        if is_owner or is_anonymous or is_excepted:
+            recipients.append(admin.user)
+            seen_ids.add(admin.user.id)
+
+    return recipients
+
+
 @router.message(Command("report"))
 async def handle_report(message: Message, command: CommandObject, bot: Bot) -> None:
     """
     /report -> Works with reply only!
     Visible publicly to both admins and members in the group chat.
-    Includes instant administrative action buttons.
+    Dispatches private PM notifications ONLY to:
+    - Owner of the GC
+    - Anonymous Admins
+    - Excepted Admins
     """
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
@@ -1129,13 +1186,48 @@ async def handle_report(message: Message, command: CommandObject, bot: Bot) -> N
         f"📢 <b>Reported By:</b> <a href=\"tg://user?id={reporter.id}\">{reporter.full_name}</a> (<code>{reporter.id}</code>)\n"
         f"📝 <b>Reason:</b> <i>{reason}</i>\n"
         f"💬 <b>Preview:</b> <code>{snippet}</code>\n\n"
-        f"<i>Admins and members can view this report. Admins may take direct action below:</i>"
+        f"<i>🔒 Dispatched privately to Owner, Anonymous Admins & Excepted Admins.</i>"
     )
 
     try:
         await message.reply(report_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
+    # Private report notification: sent ONLY to Owner + Anonymous Admins + Excepted Admins
+    recipients = await get_report_recipients(bot, chat_id)
+    pm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑️ Delete", callback_data=f"pmrep:del:{chat_id}:{target_mid}:{target_id}"),
+            InlineKeyboardButton(text="🔇 Mute (15m)", callback_data=f"pmrep:mute:{chat_id}:{target_mid}:{target_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔨 Ban", callback_data=f"pmrep:ban:{chat_id}:{target_mid}:{target_id}"),
+            InlineKeyboardButton(text="🔗 View Message", url=msg_link),
+        ]
+    ])
+
+    pm_report_text = (
+        f"🚨 <b>MEMBER REPORT NOTIFICATION</b>\n\n"
+        f"🏷️ <b>Group:</b> <code>{message.chat.title}</code> (<code>{chat_id}</code>)\n"
+        f"👤 <b>Reported User:</b> <a href=\"tg://user?id={target_user.id}\">{target_user.full_name}</a> (<code>{target_user.id}</code>)\n"
+        f"📢 <b>Reported By:</b> <a href=\"tg://user?id={reporter.id}\">{reporter.full_name}</a> (<code>{reporter.id}</code>)\n"
+        f"📝 <b>Reason:</b> <i>{reason}</i>\n"
+        f"💬 <b>Preview:</b>\n<blockquote>{snippet}</blockquote>\n\n"
+        f"<i>🔒 Delivered exclusively to Owner, Anonymous Admins & Excepted Admins.</i>"
+    )
+
+    for user in recipients:
+        try:
+            await bot.send_message(
+                chat_id=user.id,
+                text=pm_report_text,
+                reply_markup=pm_keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data.startswith("rep:"))
@@ -1266,18 +1358,14 @@ async def handle_show(message: Message, command: CommandObject, bot: Bot) -> Non
         f"<i>Use the moderation buttons below to manage this violation directly:</i>"
     )
 
-    try:
-        admins = await bot.get_chat_administrators(chat_id)
-    except Exception:
-        admins = []
+    # Filter: Send ONLY to Owner + Anonymous Admins + Excepted Admins
+    recipients = await get_report_recipients(bot, chat_id)
 
     delivered_count = 0
-    for admin in admins:
-        if admin.user.is_bot:
-            continue
+    for user in recipients:
         try:
             await bot.send_message(
-                chat_id=admin.user.id,
+                chat_id=user.id,
                 text=pm_report_text,
                 reply_markup=pm_keyboard,
                 parse_mode=ParseMode.HTML,
@@ -1290,12 +1378,12 @@ async def handle_show(message: Message, command: CommandObject, bot: Bot) -> Non
     try:
         if delivered_count > 0:
             receipt = await message.answer(
-                f"📩 <b>Report delivered to {delivered_count} administrator(s) in private message.</b>",
+                f"📩 <b>Report delivered privately to {delivered_count} authorized recipient(s) (Owner, Anonymous Admins & Excepted Admins).</b>",
                 parse_mode=ParseMode.HTML
             )
         else:
             receipt = await message.answer(
-                "⚠️ <i>Report generated, but administrators must start the bot in private DM to receive notifications.</i>",
+                "⚠️ <i>Report generated, but the Owner / Excepted Admins must start the bot in private DM to receive notifications.</i>",
                 parse_mode=ParseMode.HTML
             )
         await asyncio.sleep(5)
@@ -1374,6 +1462,105 @@ async def handle_pm_report_action_callback(query: CallbackQuery, bot: Bot) -> No
 
 
 # ------------------------------------------------------------------------------
+# 9. Excepted Admin Management (/addexcept, /remexcept, /excepted)
+# ------------------------------------------------------------------------------
+@router.message(Command("addexcept", "exceptadmin"))
+async def handle_add_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Designates an admin as an Excepted Admin to receive report notifications."""
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members"):
+        return
+
+    target_id, target_name, _ = await resolve_target(message, command)
+    if not target_id:
+        return
+
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    current_excepted = set(settings.get("excepted_admins", []))
+    current_excepted.add(target_id)
+    settings["excepted_admins"] = list(current_excepted)
+
+    chat_title = message.chat.title or "This Chat"
+    DatabaseService.save_settings_background(chat_id, chat_title, settings)
+
+    try:
+        notice = await message.answer(
+            f"✅ User <code>{target_id}</code> designated as an <b>Excepted Admin</b> (will receive confidential reports).",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(5)
+        await notice.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("remexcept", "unexceptadmin"))
+async def handle_rem_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Removes an admin from the Excepted Admins report recipient list."""
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members"):
+        return
+
+    target_id, _, _ = await resolve_target(message, command)
+    if not target_id:
+        return
+
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    current_excepted = set(settings.get("excepted_admins", []))
+    current_excepted.discard(target_id)
+    settings["excepted_admins"] = list(current_excepted)
+
+    chat_title = message.chat.title or "This Chat"
+    DatabaseService.save_settings_background(chat_id, chat_title, settings)
+
+    try:
+        notice = await message.answer(
+            f"✅ User <code>{target_id}</code> removed from <b>Excepted Admins</b>.",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(5)
+        await notice.delete()
+    except Exception:
+        pass
+
+
+@router.message(Command("excepted"))
+async def handle_list_excepted_admins(message: Message, bot: Bot) -> None:
+    """Lists all Excepted Admins in the chat."""
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    if not await check_admin_rights(bot, message.chat.id, user_id):
+        return
+
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    excepted_ids = settings.get("excepted_admins", [])
+
+    if excepted_ids:
+        formatted = "\n".join(f"• <code>{uid}</code>" for uid in excepted_ids)
+        text = (
+            f"👥 <b>Excepted Admins for Reports:</b>\n{formatted}\n\n"
+            f"<i>Note: Owner of the GC & Anonymous Admins always receive reports automatically.</i>"
+        )
+    else:
+        text = (
+            "👥 <b>Excepted Admins for Reports:</b> <i>None configured.</i>\n\n"
+            "<i>Currently, reports are delivered strictly to the Owner of the GC & Anonymous Admins. Use <code>/addexcept &lt;id&gt;</code> to designate additional admins.</i>"
+        )
+
+    try:
+        notice = await message.answer(text, parse_mode=ParseMode.HTML)
+        await asyncio.sleep(8)
+        await notice.delete()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------------------
 # 9. Admin-Only Command Catalog Synchronization
 # ------------------------------------------------------------------------------
 async def setup_bot_commands(bot: Bot) -> None:
@@ -1401,6 +1588,9 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="warns", description="Check user warning status"),
         BotCommand(command="report", description="(Reply only) Report message publicly"),
         BotCommand(command="show", description="(Reply only) Report message to admins in PM"),
+        BotCommand(command="addexcept", description="Designate admin to receive reports"),
+        BotCommand(command="remexcept", description="Remove admin from report recipients"),
+        BotCommand(command="excepted", description="List excepted report admins"),
         BotCommand(command="settings", description="Open group protection panel"),
         BotCommand(command="setcommands", description="Force sync admin command catalog"),
     ]

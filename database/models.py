@@ -89,6 +89,7 @@ class ReportingSettings(BaseModel):
     public_report_enabled: bool = Field(default=True, description="Allow members to use /report in group")
     private_admin_report_enabled: bool = Field(default=True, description="Allow members to use /show to PM admins")
     log_channel_id: Optional[int] = Field(default=None, description="Optional dedicated Telegram channel ID for audit logs")
+    excepted_admin_ids: List[int] = Field(default_factory=list, description="Explicit list of admin user IDs designated to receive reports")
 
 
 class DocumentMetadata(BaseModel):
@@ -160,6 +161,7 @@ class ChatSettingsModel(BaseModel):
             "warn_limit": self.warnings.warn_limit,
             "warn_action": self.warnings.warn_action.value if hasattr(self.warnings.warn_action, "value") else str(self.warnings.warn_action),
             "warn_duration": self.warnings.warn_duration,
+            "excepted_admins": list(self.reporting.excepted_admin_ids),
         }
 
     @classmethod
@@ -203,6 +205,11 @@ class ChatSettingsModel(BaseModel):
             warn_action=warn_action,
             warn_duration=int(mem_dict.get("warn_duration", 86400)),
         )
+        reporting = ReportingSettings(
+            public_report_enabled=mem_dict.get("public_report_enabled", True),
+            private_admin_report_enabled=mem_dict.get("private_admin_report_enabled", True),
+            excepted_admin_ids=list(mem_dict.get("excepted_admins", [])),
+        )
 
         return cls(
             chat_id=chat_id,
@@ -211,6 +218,7 @@ class ChatSettingsModel(BaseModel):
             links=links,
             flood=flood,
             warnings=warnings,
+            reporting=reporting,
         )
 
 
