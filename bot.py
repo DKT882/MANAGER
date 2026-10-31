@@ -37,6 +37,10 @@ from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
     CallbackQuery,
     ChatMemberAdministrator,
     ChatMemberOwner,
@@ -995,6 +999,66 @@ async def handle_start_help(message: Message) -> None:
         pass
 
 
+# ------------------------------------------------------------------------------
+# 8. Admin-Only Command Catalog Synchronization
+# ------------------------------------------------------------------------------
+async def setup_bot_commands(bot: Bot) -> None:
+    """
+    Registers scoped command catalogs with Telegram Bot API:
+    - BotCommandScopeAllChatAdministrators: ADMIN ONLY commands visible in group menu.
+    - BotCommandScopeDefault: Completely empty list so regular users see ZERO admin commands.
+    - BotCommandScopeAllPrivateChats: Navigation commands for direct private chats.
+    """
+    admin_commands = [
+        BotCommand(command="mute", description="Restrict user send permissions"),
+        BotCommand(command="dmute", description="Delete replied message & mute user"),
+        BotCommand(command="unmute", description="Restore user chat privileges"),
+        BotCommand(command="pin", description="Silently pin message (no alerts)"),
+        BotCommand(command="unpin", description="Unpin replied or all messages"),
+        BotCommand(command="clear", description="Instant batch wipe of messages"),
+        BotCommand(command="ban", description="Permanently ban violator"),
+        BotCommand(command="dban", description="Delete message & ban violator"),
+        BotCommand(command="tban", description="Temporary ban with auto-unban"),
+        BotCommand(command="unban", description="Revoke member ban"),
+        BotCommand(command="promote", description="Elevate to admin (0 custom rights)"),
+        BotCommand(command="demote", description="Strip administrator privileges"),
+        BotCommand(command="warn", description="Issue warning with auto-enforcement"),
+        BotCommand(command="resetwarn", description="Clear user warning counter"),
+        BotCommand(command="warns", description="Check user warning status"),
+        BotCommand(command="settings", description="Open group protection panel"),
+        BotCommand(command="setcommands", description="Force sync admin command catalog"),
+    ]
+
+    private_commands = [
+        BotCommand(command="start", description="Launch bot interface"),
+        BotCommand(command="help", description="Commands & usage guide"),
+        BotCommand(command="settings", description="Open management panel"),
+    ]
+
+    try:
+        # 1. Default Scope (Empty: regular group members see NO admin commands in catalog)
+        await bot.set_my_commands(commands=[], scope=BotCommandScopeDefault())
+
+        # 2. Group Administrators Scope (Populates command catalog ONLY for group admins)
+        await bot.set_my_commands(commands=admin_commands, scope=BotCommandScopeAllChatAdministrators())
+
+        # 3. Direct Private Chats Scope
+        await bot.set_my_commands(commands=private_commands, scope=BotCommandScopeAllPrivateChats())
+        print("[CATALOG] Admin-only command catalog registered successfully with Telegram API.")
+    except Exception as e:
+        print(f"[CATALOG WARNING] Failed to register command scopes: {e}")
+
+
+@router.message(Command("setcommands", "syncmenu"))
+async def handle_sync_commands(message: Message, bot: Bot) -> None:
+    """Manual trigger to synchronize admin-only command catalog on demand."""
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_change_info"):
+        return
+    await setup_bot_commands(bot)
+
+
 # ==============================================================================
 # APPLICATION BOOTSTRAP & EXECUTION RUNNER
 # ==============================================================================
@@ -1025,6 +1089,9 @@ async def main() -> None:
 
     # Delete existing webhook to guarantee clean fast long-polling
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Register admin-only command catalog with Telegram API
+    await setup_bot_commands(bot)
     print(f"[READY] Listening for commands with zero DB roundtrips. Engine: {LOOP_ENGINE}")
 
     try:
