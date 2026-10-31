@@ -94,6 +94,7 @@ The engine validates the native administrator custom privileges:
 | `/warn` | `[target]` | `can_restrict_members` | Increments warning count; triggers penalty at ceiling. |
 | `/resetwarn`| `[target]` | `can_restrict_members` | Clears target's warning counter to zero. |
 | `/warns` | `[target]` | None (ephemeral) | Returns user warning count (auto-deleted after 5 seconds). |
+| `/kickme` | None | All Members (Hidden) | Instantly kicks the calling member from the group without a permanent ban (user can rejoin with link). Intentionally omitted from command catalogs. |
 | `/report` | `(Reply only) [reason]` | None (Members & Admins) | Flags message publicly with one-click admin action buttons, and dispatches confidential private PM notifications **strictly** to Owner of the GC, Anonymous Admins, and Excepted Admins. |
 | `/show` | `(Reply only) [reason]` | None (Members & Admins) | Sends detailed private report directly to Owner of the GC, Anonymous Admins, and Excepted Admins in their private DM with moderation buttons. |
 | `/addexcept` | `[target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report notifications. |

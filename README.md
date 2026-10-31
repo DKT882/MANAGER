@@ -62,6 +62,7 @@ Command autocomplete and menus in Telegram are strictly scoped:
 | `/warn` | `/warn [target]` | `can_restrict_members` | Increments warning count; triggers penalty at ceiling. |
 | `/resetwarn`| `/resetwarn [target]` | `can_restrict_members` | Resets target's warning counter to zero. |
 | `/warns` | `/warns [target]` | All Members (Ephemeral) | Returns user warning count (auto-deleted after 5 seconds). |
+| `/kickme` | `/kickme` | All Members (Hidden) | Instantly kicks the calling member from the group without a permanent ban (allows rejoining). Omitted from command catalogs. |
 | `/report` | `/report [reason]` (Reply only) | All Members & Admins | Publicly flags message in group with action buttons; sends private PMs **strictly** to Owner, Anonymous Admins & Excepted Admins. |
 | `/show` | `/show [reason]` (Reply only) | All Members | Forwards violator report directly to the Owner, Anonymous Admins & Excepted Admins' private DMs. |
 | `/addexcept`| `/addexcept [target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report alerts. |

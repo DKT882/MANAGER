@@ -716,6 +716,52 @@ async def handle_unban(message: Message, command: CommandObject, bot: Bot) -> No
 
 
 # ------------------------------------------------------------------------------
+# 4B. /kickme (Instant Self-Kick for Members - Hidden from Catalog)
+# ------------------------------------------------------------------------------
+@router.message(Command("kickme"))
+async def handle_kickme(message: Message, bot: Bot) -> None:
+    """
+    /kickme:
+    Instantly kicks the sending member from the group.
+    - Intentionally omitted from command catalogs (hidden command).
+    - Immediate trigger wipe (<1ms).
+    - Performs ban + unban to eject member without a permanent blacklist.
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    # Instant wipe of trigger message
+    await wipe_trigger(message)
+
+    user = message.from_user
+    if not user or user.is_bot:
+        return
+
+    chat_id = message.chat.id
+    user_id = user.id
+
+    # Telegram Bot API prevents kicking chat owners or administrators
+    if await check_admin_rights(bot, chat_id, user_id):
+        return
+
+    try:
+        # Standard Telegram kick: ban + unban to immediately eject from the chat
+        await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
+
+        # Background audit logging
+        DatabaseService.log_moderation_background(
+            chat_id=chat_id,
+            admin_id=user_id,
+            target_id=user_id,
+            action="kickme",
+            reason="Self-kick request"
+        )
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------------------
 # 5. /promote & /demote
 # ------------------------------------------------------------------------------
 @router.message(Command("promote"))
