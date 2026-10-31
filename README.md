@@ -67,7 +67,8 @@ Command autocomplete and menus in Telegram are strictly scoped:
 | `/addexcept`| `/addexcept [target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report alerts. |
 | `/remexcept`| `/remexcept [target]` | Owner / Anon / Excepted | Removes an admin from the Excepted Admin report notification list. |
 | `/excepted` | `/excepted` | Owner / Anon / Excepted | Displays all currently configured Excepted Admins in the chat. |
-| `/settings` | `/settings` | Owner / Anon / Excepted | Opens interactive inline configuration dashboard (Strictly restricted). |
+| `/start` | `/start` | Owner / Anon / Excepted | Launches the bot and immediately displays group settings (strictly visible to authorized admins only). In DM: opens multi-group management hub. |
+| `/settings` | `/settings` | Owner / Anon / Excepted | Alias to `/start` group settings dashboard. |
 | `/setcommands`| `/setcommands` | Owner / Anon / Excepted | Forces synchronization of scoped command menus with Telegram. |
 
 ---

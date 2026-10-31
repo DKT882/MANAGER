@@ -99,7 +99,8 @@ The engine validates the native administrator custom privileges:
 | `/addexcept` | `[target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report notifications. |
 | `/remexcept` | `[target]` | Owner / Anon / Excepted | Removes an admin from the Excepted Admin report notification list. |
 | `/excepted` | None | Owner / Anon / Excepted | Lists all currently configured Excepted Admins in the chat. |
-| `/settings` | None | Owner / Anon / Excepted | Opens interactive inline configuration dashboard (Strictly restricted). |
+| `/start` | None | Owner / Anon / Excepted | Launches the bot and immediately displays group settings (strictly visible to authorized admins only). In DM: opens multi-group management hub. |
+| `/settings` | None | Owner / Anon / Excepted | Alias to `/start` for backward compatibility. |
 | `/setcommands` | None | Owner / Anon / Excepted | Force synchronizes the scoped admin-only command menu. |
 
 ---

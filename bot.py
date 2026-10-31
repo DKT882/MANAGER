@@ -962,92 +962,159 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@router.message(Command("settings"))
-async def handle_settings(message: Message, bot: Bot) -> None:
-    await wipe_trigger(message)
+# ------------------------------------------------------------------------------
+# 7. /start (Primary Configuration & Group Settings Engine)
+# ------------------------------------------------------------------------------
+@router.message(Command("start", "settings"))
+async def handle_start(message: Message, command: CommandObject, bot: Bot) -> None:
+    """
+    /start & /settings:
+    - In Supergroups/Groups: Sends the group protection settings dashboard,
+      strictly visible/accessible ONLY to authorized admins (Owner, Anonymous Admin, Excepted Admin).
+    - In Private DMs: Displays the interactive management hub (Image 1 & 2) allowing
+      authorized admins to view and configure their groups directly from private chat.
+    """
+    # --------------------------------------------------------------------------
+    # CASE 1: GROUP / SUPERGROUP EXECUTION
+    # --------------------------------------------------------------------------
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await wipe_trigger(message)
 
-    sender_chat_id = message.sender_chat.id if message.sender_chat else None
-    user_id = message.from_user.id if message.from_user else 0
+        sender_chat_id = message.sender_chat.id if message.sender_chat else None
+        user_id = message.from_user.id if message.from_user else 0
 
-    # Rule: ONLY Owner, Anonymous Admins, or Excepted/Exempted Admins can setup the bot
-    if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
-        return
+        # STRICT RULE: Settings are sent and visible ONLY to authorized admins
+        if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
+            return
 
-    chat_id = message.chat.id
-    chat_title = message.chat.title or "This Chat"
-    s = CHAT_SETTINGS[chat_id]
+        chat_id = message.chat.id
+        chat_title = message.chat.title or "This Chat"
+        s = CHAT_SETTINGS[chat_id]
 
-    text = (
-        f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
-        f"Group: <code>{chat_title}</code>\n\n"
-        f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
-        f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
-        f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
-        f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
-        f"<i>Select an option below to toggle local cache settings instantly:</i>"
-    )
+        text = (
+            f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
+            f"Group: <code>{chat_title}</code>\n\n"
+            f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
+            f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
+            f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
+            f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
+            f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
+            f"<i>Select an option below to toggle local cache settings instantly:</i>"
+        )
 
-    try:
-        await message.answer(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data.startswith("set:"))
-async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
-    parts = query.data.split(":")
-    if len(parts) < 3:
-        await query.answer()
-        return
-
-    _, action, chat_id_str = parts[:3]
-    chat_id = int(chat_id_str)
-
-    user_id = query.from_user.id
-    # Rule: ONLY Owner, Anonymous Admins, or Excepted/Exempted Admins can alter settings
-    if not await check_can_setup_bot(bot, chat_id, user_id):
-        await query.answer("❌ Only the Owner, Anonymous Admins, or Excepted Admins can configure the bot.", show_alert=True)
-        return
-
-    s = CHAT_SETTINGS[chat_id]
-
-    if action == "close":
         try:
-            await query.message.delete()
+            await message.answer(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
         except Exception:
             pass
         return
 
-    if action == "reload":
-        await query.answer("Refreshed in-memory settings.")
-    elif action in ("block_links", "admin_links_block", "block_sticker", "block_animation", "block_document", "flood_protection"):
-        s[action] = not s[action]
-        await query.answer(f"Toggled {action}: {'ON' if s[action] else 'OFF'}")
-    elif action == "block_voice":
-        new_val = not s["block_voice"]
-        s["block_voice"] = new_val
-        s["block_audio"] = new_val
-        await query.answer(f"Voice & Audio: {'Blocked' if new_val else 'Allowed'}")
-    elif action == "warn_toggle":
-        # Cycle through warn ceilings: 3 -> 5 -> 10 -> 3
-        ceilings = [3, 5, 10]
-        curr_idx = ceilings.index(s["warn_limit"]) if s["warn_limit"] in ceilings else 0
-        s["warn_limit"] = ceilings[(curr_idx + 1) % len(ceilings)]
-        await query.answer(f"Warn limit set to {s['warn_limit']}")
-    elif action == "view_excepted":
-        exc_list = s.get("excepted_admins", [])
-        if exc_list:
-            ids_str = ", ".join(str(uid) for uid in exc_list)
-            await query.answer(f"Excepted Admins ({len(exc_list)}): {ids_str}\nManage via /addexcept & /remexcept", show_alert=True)
-        else:
-            await query.answer("No excepted admins yet. Reports go strictly to Owner & Anonymous Admins. Use /addexcept <id> to add.", show_alert=True)
+    # --------------------------------------------------------------------------
+    # CASE 2: DIRECT PRIVATE DM EXECUTION
+    # --------------------------------------------------------------------------
+    user_id = message.from_user.id if message.from_user else 0
+    bot_user = await bot.get_me()
+
+    # 2A. Deep link directly to a specific group's settings (e.g. /start group_-100123)
+    if command and command.args:
+        arg = command.args.strip()
+        target_cid = None
+        if arg.startswith("group_"):
+            try:
+                target_cid = int(arg.replace("group_", ""))
+            except ValueError:
+                pass
+        elif arg.startswith("-100"):
+            try:
+                target_cid = int(arg)
+            except ValueError:
+                pass
+
+        if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
+            s = CHAT_SETTINGS[target_cid]
+            try:
+                c_info = await bot.get_chat(target_cid)
+                title = c_info.title or f"Group {target_cid}"
+            except Exception:
+                title = f"Group {target_cid}"
+
+            text = (
+                f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
+                f"Group: <code>{title}</code>\n\n"
+                f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
+                f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
+                f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
+                f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
+                f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
+                f"<i>Select an option below to configure group settings:</i>"
+            )
+            try:
+                await message.answer(text, reply_markup=generate_settings_keyboard(target_cid), parse_mode=ParseMode.HTML)
+                return
+            except Exception:
+                pass
+
+    # 2B. Scan known groups where user is an authorized admin
+    authorized_chats = []
+    for cid in list(CHAT_SETTINGS.keys()):
+        if await check_can_setup_bot(bot, cid, user_id):
+            try:
+                c = await bot.get_chat(cid)
+                authorized_chats.append((cid, c.title or f"Group {cid}"))
+            except Exception:
+                authorized_chats.append((cid, f"Group {cid}"))
+
+    if authorized_chats:
+        group_buttons = [
+            [InlineKeyboardButton(text=f"👥 {title}", callback_data=f"dmgroup:{cid}")]
+            for cid, title in authorized_chats
+        ]
+        group_buttons.append([InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups")])
+        text = (
+            "⚙️ <b>Manage Group Settings</b>\n"
+            "👉 <i>Select the group whose settings you want to change:</i>\n\n"
+            "<i>Note: Only groups where you are the Owner, Anonymous Admin, or Excepted Admin appear here.</i>"
+        )
+        try:
+            await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=group_buttons), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    else:
+        # 2C. Generic Welcome Card (Image 2 style)
+        welcome_text = (
+            "👋 <b>Hello!</b>\n"
+            "<b>BioLink Restrictor & High-Speed Admin Bot</b> is active to help you manage your groups easily and safely!\n\n"
+            "👉 <i>Add me to a Supergroup and promote me as Admin to get in action!</i>\n\n"
+            "🔻 <b>WHICH ARE THE COMMANDS?</b>\n"
+            "Press <code>/help</code> to see all commands and permissions!\n"
+            "<i>Default protection is active automatically across all connected groups.</i>"
+        )
+        welcome_buttons = [
+            [InlineKeyboardButton(text="➕ Add me to a Group", url=f"https://t.me/{bot_user.username}?startgroup=true")],
+            [InlineKeyboardButton(text="⚙️ Manage Group Settings", callback_data="dm:refresh_groups")],
+            [InlineKeyboardButton(text="📖 Commands Guide", callback_data="dm:help")],
+        ]
+        try:
+            await message.answer(welcome_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=welcome_buttons), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("dmgroup:"))
+async def handle_dm_select_group(query: CallbackQuery, bot: Bot) -> None:
+    chat_id = int(query.data.split(":")[1])
+    user_id = query.from_user.id
+
+    if not await check_can_setup_bot(bot, chat_id, user_id):
+        await query.answer("❌ You are not an authorized admin for this group.", show_alert=True)
         return
 
-    # Fast in-memory UI re-render
-    chat_title = query.message.chat.title or "This Chat"
-    # Background write-behind persistence to MongoDB
-    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    s = CHAT_SETTINGS[chat_id]
+    try:
+        c = await bot.get_chat(chat_id)
+        chat_title = c.title or f"Group {chat_id}"
+    except Exception:
+        chat_title = f"Group {chat_id}"
+
     text = (
         f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
         f"Group: <code>{chat_title}</code>\n\n"
@@ -1056,30 +1123,52 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
         f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
         f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
-        f"<i>Select an option below to toggle local cache settings instantly:</i>"
+        f"<i>Select an option below to toggle settings:</i>"
     )
-
     try:
-        await query.message.edit_text(
-            text=text,
-            reply_markup=generate_settings_keyboard(chat_id),
-            parse_mode=ParseMode.HTML
-        )
+        await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
     except Exception:
         pass
+    await query.answer()
 
 
-# ------------------------------------------------------------------------------
-# 7. /start & /help
-# ------------------------------------------------------------------------------
-@router.message(Command("start", "help"))
-async def handle_start_help(message: Message) -> None:
-    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await wipe_trigger(message)
+@router.callback_query(F.data == "dm:refresh_groups")
+async def handle_dm_refresh_groups(query: CallbackQuery, bot: Bot) -> None:
+    user_id = query.from_user.id
+    authorized_chats = []
+    for cid in list(CHAT_SETTINGS.keys()):
+        if await check_can_setup_bot(bot, cid, user_id):
+            try:
+                c = await bot.get_chat(cid)
+                authorized_chats.append((cid, c.title or f"Group {cid}"))
+            except Exception:
+                authorized_chats.append((cid, f"Group {cid}"))
 
-    text = (
+    if authorized_chats:
+        group_buttons = [
+            [InlineKeyboardButton(text=f"👥 {title}", callback_data=f"dmgroup:{cid}")]
+            for cid, title in authorized_chats
+        ]
+        group_buttons.append([InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups")])
+        text = (
+            "⚙️ <b>Manage Group Settings</b>\n"
+            "👉 <i>Select the group whose settings you want to change:</i>"
+        )
+        try:
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=group_buttons), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer("List refreshed.")
+    else:
+        await query.answer("No authorized groups found yet. Ensure the bot is added to your group as an Admin.", show_alert=True)
+
+
+@router.callback_query(F.data == "dm:help")
+async def handle_dm_help_callback(query: CallbackQuery) -> None:
+    help_text = (
         "⚡ <b>High-Speed Telegram Admin Engine Active</b>\n\n"
         "<b>Available Admin Commands:</b>\n"
+        "• <code>/start</code> - Open group protection settings (Authorized admins only)\n"
         "• <code>/mute &lt;time&gt; [reason]</code> - Restrict user send permissions\n"
         "• <code>/dmute &lt;time&gt; [reason]</code> - Wipe replied message + Mute user\n"
         "• <code>/unmute</code> - Restore user chat privileges\n"
@@ -1096,16 +1185,57 @@ async def handle_start_help(message: Message) -> None:
         "• <code>/resetwarn</code> - Clear user warning counter\n"
         "• <code>/report [reason]</code> - (Reply only) Publicly flag message for review\n"
         "• <code>/show [reason]</code> - (Reply only) Forward report to admins in PM\n"
-        "• <code>/settings</code> - Real-time in-memory group protection panel\n\n"
+        "• <code>/addexcept</code> - Designate admin to receive confidential reports\n"
+        "• <code>/remexcept</code> - Remove admin from report recipients\n"
+        "• <code>/excepted</code> - List currently configured Excepted Admins\n\n"
+        f"<i>Engine loop: <code>{LOOP_ENGINE}</code> | Sub-second latency active.</i>"
+    )
+    back_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="dm:refresh_groups")]
+    ])
+    try:
+        await query.message.edit_text(help_text, reply_markup=back_markup, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await query.answer()
+
+
+@router.message(Command("help"))
+async def handle_help(message: Message, bot: Bot) -> None:
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await wipe_trigger(message)
+        user_id = message.from_user.id if message.from_user else 0
+        if not await check_admin_rights(bot, message.chat.id, user_id):
+            return
+
+    text = (
+        "⚡ <b>High-Speed Telegram Admin Engine Active</b>\n\n"
+        "<b>Available Admin Commands:</b>\n"
+        "• <code>/start</code> - Open group protection settings (Authorized admins only)\n"
+        "• <code>/mute &lt;time&gt; [reason]</code> - Restrict user send permissions\n"
+        "• <code>/dmute &lt;time&gt; [reason]</code> - Wipe replied message + Mute user\n"
+        "• <code>/unmute</code> - Restore user chat privileges\n"
+        "• <code>/pin</code> - Silently pin message with zero notification\n"
+        "• <code>/unpin</code> - Unpin replied message or all messages\n"
+        "• <code>/clear [count]</code> - Wipe recent messages instantly\n"
+        "• <code>/ban</code> - Permanently ban violator\n"
+        "• <code>/dban</code> - Delete replied message + Ban violator\n"
+        "• <code>/tban &lt;time&gt;</code> - Temporary ban with auto-unban\n"
+        "• <code>/unban</code> - Revoke member ban\n"
+        "• <code>/promote</code> - Elevate to admin with 0 custom rights\n"
+        "• <code>/demote</code> - Strip all administrator rights\n"
+        "• <code>/warn</code> - Issue warning increment with automated ceiling\n"
+        "• <code>/resetwarn</code> - Clear user warning counter\n"
+        "• <code>/report [reason]</code> - (Reply only) Publicly flag message for review\n"
+        "• <code>/show [reason]</code> - (Reply only) Forward report to admins in PM\n"
+        "• <code>/addexcept</code> - Designate admin to receive confidential reports\n"
+        "• <code>/remexcept</code> - Remove admin from report recipients\n"
+        "• <code>/excepted</code> - List currently configured Excepted Admins\n\n"
         f"<i>Engine loop: <code>{LOOP_ENGINE}</code> | Sub-second latency active.</i>"
     )
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Open Group Settings", callback_data=f"set:reload:{message.chat.id}")],
-    ])
-
     try:
-        await message.answer(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        await message.answer(text, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -1674,7 +1804,8 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="addexcept", description="Designate admin to receive reports"),
         BotCommand(command="remexcept", description="Remove admin from report recipients"),
         BotCommand(command="excepted", description="List excepted report admins"),
-        BotCommand(command="settings", description="Open group protection panel"),
+        BotCommand(command="start", description="Open group settings (Authorized admins only)"),
+        BotCommand(command="settings", description="Alias to /start group settings"),
         BotCommand(command="setcommands", description="Force sync admin command catalog"),
     ]
 
@@ -1685,9 +1816,8 @@ async def setup_bot_commands(bot: Bot) -> None:
     ]
 
     private_commands = [
-        BotCommand(command="start", description="Launch bot interface"),
+        BotCommand(command="start", description="Open management interface & settings"),
         BotCommand(command="help", description="Commands & usage guide"),
-        BotCommand(command="settings", description="Open management panel"),
     ]
 
     try:
