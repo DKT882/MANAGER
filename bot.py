@@ -32,6 +32,9 @@ except (ImportError, AttributeError):
     except (ImportError, AttributeError):
         LOOP_ENGINE = "asyncio-proactor"
 
+import uuid
+from database import DatabaseService, MongoDBManager
+
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router, types
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
@@ -741,6 +744,10 @@ async def handle_warn(message: Message, command: CommandObject, bot: Bot) -> Non
     WARN_CACHE[chat_id][target_id] += 1
     current_warns = WARN_CACHE[chat_id][target_id]
 
+    # Background write-behind warn record and audit log
+    DatabaseService.record_warn_background(chat_id, target_id, user_id, remaining_args or "Warning issued", current_warns)
+    DatabaseService.log_moderation_background(chat_id, user_id, target_id, "warn", remaining_args)
+
     if current_warns >= ceiling:
         # Automated enforcement threshold reached
         WARN_CACHE[chat_id][target_id] = 0  # Reset counter
@@ -781,6 +788,8 @@ async def handle_resetwarn(message: Message, command: CommandObject, bot: Bot) -
 
     # In-memory reset
     WARN_CACHE[message.chat.id][target_id] = 0
+    DatabaseService.reset_warn_background(message.chat.id, target_id)
+    DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "resetwarn")
 
 
 @router.message(Command("warns"))
@@ -941,6 +950,8 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
 
     # Fast in-memory UI re-render
     chat_title = query.message.chat.title or "This Chat"
+    # Background write-behind persistence to MongoDB
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
     text = (
         f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
         f"Group: <code>{chat_title}</code>\n\n"
@@ -1088,6 +1099,17 @@ async def handle_report(message: Message, command: CommandObject, bot: Bot) -> N
     target_id = target_user.id
     target_mid = target_msg.message_id
 
+    # Background MongoDB persistence for report record
+    DatabaseService.record_report_background(
+        report_id=str(uuid.uuid4()),
+        chat_id=chat_id,
+        target_user_id=target_id,
+        reporter_user_id=reporter.id,
+        message_id=target_mid,
+        message_snippet=snippet,
+        reason=reason,
+    )
+
     # Inline action buttons for admins right on the public report message
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1171,6 +1193,10 @@ async def handle_report_action_callback(query: CallbackQuery, bot: Bot) -> None:
     else:
         await query.answer()
         return
+
+    # Background MongoDB resolution record & audit trail
+    DatabaseService.resolve_report_background(chat_id, target_mid, admin_user.id, action)
+    DatabaseService.log_moderation_background(chat_id, admin_user.id, target_uid, f"report_{action}")
 
     try:
         await query.message.edit_text(
@@ -1332,6 +1358,10 @@ async def handle_pm_report_action_callback(query: CallbackQuery, bot: Bot) -> No
         await query.answer()
         return
 
+    # Background MongoDB resolution record & audit trail
+    DatabaseService.resolve_report_background(chat_id, target_mid, admin_user.id, action)
+    DatabaseService.log_moderation_background(chat_id, admin_user.id, target_uid, f"report_{action}")
+
     try:
         await query.message.edit_text(
             f"{query.message.text}\n\n✅ <b>Action Taken:</b> {result} (by you)",
@@ -1445,6 +1475,12 @@ async def main() -> None:
     # Delete existing webhook to guarantee clean fast long-polling
     await bot.delete_webhook(drop_pending_updates=True)
 
+    # Connect to MongoDB & hydrate in-memory caches
+    await MongoDBManager.connect()
+    if MongoDBManager.is_connected():
+        await DatabaseService.hydrate_settings_cache(CHAT_SETTINGS)
+        await DatabaseService.hydrate_warn_cache(WARN_CACHE)
+
     # Register admin-only command catalog with Telegram API
     await setup_bot_commands(bot)
     print(f"[READY] Listening for commands with zero DB roundtrips. Engine: {LOOP_ENGINE}")
@@ -1452,6 +1488,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
+        await MongoDBManager.disconnect()
         await bot.session.close()
 
 

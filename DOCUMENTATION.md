@@ -156,3 +156,137 @@ To push performance to the absolute physical minimum (under 100ms):
 
 3. **Use Webhooks with HTTP/2**
    - For high-volume groups, configure Webhooks via a reverse proxy (Nginx / Caddy with HTTP/2 and SSL termination) to receive push updates instantaneously instead of waiting on polling loop intervals.
+
+---
+
+## 7. Enterprise MongoDB Schema & Extensibility Architecture
+
+### Architectural Design Principles
+To combine **sub-millisecond Telegram command execution** with **durable database persistence**, the database layer employs a **Hybrid In-Memory Write-Through / Write-Behind Cache Architecture**:
+
+```
++------------------------------------------------------------------------------------------+
+|                 HYBRID IN-MEMORY CACHE & MONGODB ARCHITECTURE                             |
++------------------------------------------------------------------------------------------+
+
+      TELEGRAM EVENT (Mute / Warn / Settings Toggle)
+                           │
+                           ▼
+          [ 1. In-Memory Engine (RAM) ] ──────────► Sub-millisecond Execution (<1ms)
+                           │
+       (Asynchronous Non-Blocking Write-Behind)
+                           │
+                           ▼
+               [ 2. MongoDB Service ] ────────────► Persistent ReplicaSet Storage
+                           ▲
+                           │ (On Bot Startup Hydration)
+               [ 3. Initial Cache Load ]
+```
+
+### Future-Proofing & Extensibility Patterns
+
+1. **Document Versioning Pattern (`schema_version: int`)**:
+   - Every `chat_settings` document carries a `schema_version` (starting at `1`).
+   - The built-in progressive migration pipeline (`migrate_chat_settings_document()`) inspects documents during retrieval and upgrades legacy structures to newer versions without requiring offline migration scripts or database downtime.
+2. **Extensible Attributes & Feature Flags Bag**:
+   - `feature_flags: Dict[str, bool]`: Allows introducing new feature toggles per-chat dynamically without altering MongoDB collections.
+   - `custom_attributes: Dict[str, Any]`: Schema-less metadata bag pattern for storing arbitrary third-party plugin configurations, custom regex lists, or webhooks.
+3. **Pydantic v2 `extra="allow"` with Default Factories**:
+   - If future versions introduce new fields (e.g. `block_contact`, `block_location`, `ai_spam_filter`), documents saved by earlier versions automatically populate new defaults on deserialization without raising validation errors.
+
+---
+
+### Collection Schemas & Indexing Strategies
+
+#### 1. Collection: `chat_settings`
+- **Purpose:** Stores comprehensive configuration settings for each group.
+- **Indexes:**
+  - `chat_id` (Unique, Ascending) - Guarantees `O(1)` indexed lookups.
+- **Document Structure:**
+  ```json
+  {
+    "_id": ObjectId("..."),
+    "chat_id": -1001234567890,
+    "chat_title": "VIP Traders Group",
+    "chat_type": "supergroup",
+    "schema_version": 1,
+    "media": {
+      "block_sticker": false,
+      "block_animation": false,
+      "block_document": false,
+      "block_audio": false,
+      "block_voice": false,
+      "block_photo": false,
+      "block_video": false,
+      "block_contact": false,
+      "block_location": false
+    },
+    "links": {
+      "block_links": false,
+      "admin_links_block": false,
+      "block_channel_links": false,
+      "block_telegram_invites": false,
+      "whitelist_domains": [],
+      "whitelist_channels": []
+    },
+    "flood": {
+      "enabled": true,
+      "flood_window": 3.0,
+      "flood_limit": 5,
+      "action": "mute",
+      "mute_duration": 900
+    },
+    "warnings": {
+      "warn_limit": 3,
+      "warn_action": "mute",
+      "warn_duration": 86400,
+      "warn_decay_hours": 0
+    },
+    "reporting": {
+      "public_report_enabled": true,
+      "private_admin_report_enabled": true,
+      "log_channel_id": null
+    },
+    "feature_flags": {},
+    "custom_attributes": {},
+    "metadata": {
+      "created_at": ISODate("2026-10-31T12:00:00Z"),
+      "updated_at": ISODate("2026-10-31T12:00:00Z"),
+      "last_active_at": ISODate("2026-10-31T12:00:00Z")
+    }
+  }
+  ```
+
+#### 2. Collection: `user_warnings`
+- **Purpose:** Persists member warning counters and full violation incident history.
+- **Indexes:**
+  - `(chat_id, user_id)` (Compound Unique Index).
+- **Document Structure:**
+  ```json
+  {
+    "chat_id": -1001234567890,
+    "user_id": 987654321,
+    "warn_count": 2,
+    "incidents": [
+      {
+        "reason": "Spamming referral link",
+        "warned_by_id": 11223344,
+        "warned_at": ISODate("2026-10-31T12:15:00Z")
+      }
+    ],
+    "last_warned_at": ISODate("2026-10-31T12:15:00Z"),
+    "updated_at": ISODate("2026-10-31T12:15:00Z")
+  }
+  ```
+
+#### 3. Collection: `moderation_audit_logs`
+- **Purpose:** Immutable audit trail for all admin actions (`mute`, `ban`, `warn`, `pin`, `clear`, `promote`, `demote`).
+- **Indexes:**
+  - `(chat_id, timestamp DESC)` (Fast reverse-chronological group audit query).
+
+#### 4. Collection: `reports`
+- **Purpose:** Tracks community reports filed via `/report` or `/show` along with admin resolution status.
+- **Indexes:**
+  - `(chat_id, status)` (Compound index for fetching open pending reports).
+  - `report_id` (Unique index for UUID lookups).
+
