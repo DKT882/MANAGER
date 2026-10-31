@@ -127,6 +127,7 @@ class ChatSettingsModel(BaseModel):
     warnings: WarnSettings = Field(default_factory=WarnSettings)
     reporting: ReportingSettings = Field(default_factory=ReportingSettings)
     clean_service_messages: bool = Field(default=True, description="Auto-delete join and group left service notifications")
+    block_bots: bool = Field(default=False, description="Auto-ban bots added to the group chat")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -164,6 +165,7 @@ class ChatSettingsModel(BaseModel):
             "warn_duration": self.warnings.warn_duration,
             "excepted_admins": list(self.reporting.excepted_admin_ids),
             "clean_service_messages": self.clean_service_messages,
+            "block_bots": self.block_bots,
         }
 
     @classmethod
@@ -222,6 +224,7 @@ class ChatSettingsModel(BaseModel):
             warnings=warnings,
             reporting=reporting,
             clean_service_messages=mem_dict.get("clean_service_messages", True),
+            block_bots=mem_dict.get("block_bots", False),
         )
 
 

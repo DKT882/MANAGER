@@ -76,6 +76,7 @@ Command autocomplete and menus in Telegram are strictly scoped:
 
 ## ⚡ Asynchronous Spam, Service & Media Interceptors
 
+- **Anti-Bot Automated Ban System:** When enabled, automatically and instantly bans any bot added to the group chat (`ban_chat_member`) without delay. Configurable via interactive dashboard (`🤖 Anti-Bot: ON/OFF`) directly inside groups or from the bot's private DM hub. Strictly restricted so only the **Chat Owner**, **Anonymous Admins**, or **Excepted Admins** can configure it.
 - **Auto-Delete Join & Group Left Notifications:** Automatically wipes annoying member join (`new_chat_members`) and leave (`left_chat_member`) notification service messages immediately upon arrival. Fully configurable via interactive settings (`🚷 Delete Join/Left: ON/OFF`) directly inside groups or remotely from the bot's private DM hub. Strictly restricted so only the **Chat Owner**, **Anonymous Admins**, or **Excepted Admins** can toggle or configure it.
 - **Sliding-Window Anti-Flood Middleware:** High-speed router middleware tracking frequencies (`flood_window: 3s`, `flood_limit: 5`). Violators are automatically muted and spam messages are purged instantly.
 - **Media Type Filtering:** Instant suppression of `sticker`, `gif` (animation), `document`, `audio`, `voice`, `photo`, and `video`.

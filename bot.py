@@ -86,6 +86,8 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
     # Service messages cleanup (auto delete user join / left notifications)
     "clean_service_messages": True,
+    # Anti-bot setting (auto-ban bots added to the group chat)
+    "block_bots": False,
 }
 
 # CHAT_SETTINGS: chat_id -> configuration dict
@@ -412,13 +414,33 @@ router = Router(name="high_speed_admin_router")
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
     F.new_chat_members | F.left_chat_member
 )
-async def handle_service_messages(message: Message) -> None:
+async def handle_service_messages(message: Message, bot: Bot) -> None:
     """
-    Auto-deletes user join (new_chat_members) and leave (left_chat_member)
-    service notifications instantly when clean_service_messages is enabled.
+    1. Anti-Bot: If block_bots is enabled, bans any newly added bot instantly.
+    2. Auto-deletes user join (new_chat_members) and leave (left_chat_member)
+       service notifications instantly when clean_service_messages is enabled.
     """
     chat_id = message.chat.id
     settings = CHAT_SETTINGS[chat_id]
+
+    # 1. Anti-Bot Auto-Ban: Instantly ban any newly added bot
+    if settings.get("block_bots") and message.new_chat_members:
+        bot_id = bot.id
+        for member in message.new_chat_members:
+            if member.is_bot and member.id != bot_id:
+                try:
+                    await bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
+                    DatabaseService.log_moderation_background(
+                        chat_id=chat_id,
+                        admin_id=bot_id,
+                        target_id=member.id,
+                        action="anti_bot_ban",
+                        reason="Automated Anti-Bot Protection"
+                    )
+                except Exception:
+                    pass
+
+    # 2. Service Message Cleanup
     if settings.get("clean_service_messages", True):
         try:
             await message.delete()
@@ -1017,6 +1039,10 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
                 text=f"🚷 Delete Join/Left: {state_badge(s.get('clean_service_messages', True))}",
                 callback_data=f"set:clean_service_messages:{chat_id}"
             ),
+            InlineKeyboardButton(
+                text=f"🤖 Anti-Bot: {state_badge(s.get('block_bots', False))}",
+                callback_data=f"set:block_bots:{chat_id}"
+            ),
         ],
         [
             InlineKeyboardButton(
@@ -1054,6 +1080,7 @@ def format_settings_text(chat_title: str, s: Dict[str, Any]) -> str:
         f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
         f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
         f"• <b>Join/Left Cleanup:</b> {'Active (Auto-Deleted)' if s.get('clean_service_messages', True) else 'Disabled'}\n"
+        f"• <b>Anti-Bot (Auto-Ban):</b> {'ACTIVE' if s.get('block_bots', False) else 'Disabled'}\n"
         f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
         f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
         f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
@@ -1333,6 +1360,10 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         current_val = s.get("clean_service_messages", True)
         s["clean_service_messages"] = not current_val
         await query.answer(f"Join/Left Cleanup: {'Active (Auto-Deleted)' if s['clean_service_messages'] else 'Disabled'}")
+    elif action == "block_bots":
+        current_val = s.get("block_bots", False)
+        s["block_bots"] = not current_val
+        await query.answer(f"Anti-Bot: {'ACTIVE (Auto-Ban)' if s['block_bots'] else 'Disabled'}")
     elif action == "flood_protection":
         s["flood_protection"] = not s["flood_protection"]
         await query.answer(f"Anti-Flood: {'Active' if s['flood_protection'] else 'Disabled'}")
