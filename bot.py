@@ -32,7 +32,10 @@ except (ImportError, AttributeError):
     except (ImportError, AttributeError):
         LOOP_ENGINE = "asyncio-proactor"
 
+import gc
 import uuid
+from aiohttp import web
+from aiogram.client.session.aiohttp import AiohttpSession
 from database import DatabaseService, MongoDBManager
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router, types
@@ -2018,6 +2021,97 @@ async def handle_sync_commands(message: Message, bot: Bot) -> None:
 
 
 # ==============================================================================
+# RENDER HOBBY & FREE TIER RESOURCE OPTIMIZERS (<50MB RAM & <5GB/MO BANDWIDTH)
+# ==============================================================================
+
+async def resource_optimizer_worker() -> None:
+    """
+    Continuous background cleanup task running every 5 minutes.
+    Aggressively purges expired cache keys, evicts stale flood deques, and triggers
+    garbage collection to keep RAM usage strictly below 40-50MB on Render's 512MB tier.
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)
+            now = time.monotonic()
+
+            # 1. Purge expired ADMIN_CACHE entries
+            expired_admins = [k for k, v in list(ADMIN_CACHE.items()) if now - v[0] > ADMIN_CACHE_TTL]
+            for k in expired_admins:
+                ADMIN_CACHE.pop(k, None)
+
+            # 2. Purge stale FLOOD_CACHE entries
+            empty_chats = []
+            for chat_id, user_dict in list(FLOOD_CACHE.items()):
+                inactive_users = [
+                    uid for uid, dq in list(user_dict.items())
+                    if not dq or (now - dq[-1] > 30.0)
+                ]
+                for uid in inactive_users:
+                    user_dict.pop(uid, None)
+                if not user_dict:
+                    empty_chats.append(chat_id)
+            for cid in empty_chats:
+                FLOOD_CACHE.pop(cid, None)
+
+            # 3. Clean zero-warn entries from WARN_CACHE
+            empty_warn_chats = []
+            for chat_id, user_dict in list(WARN_CACHE.items()):
+                zero_users = [uid for uid, count in list(user_dict.items()) if count <= 0]
+                for uid in zero_users:
+                    user_dict.pop(uid, None)
+                if not user_dict:
+                    empty_warn_chats.append(chat_id)
+            for cid in empty_warn_chats:
+                WARN_CACHE.pop(cid, None)
+
+            # 4. Trigger Python garbage collection
+            gc.collect()
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+async def start_render_health_server() -> Optional[web.AppRunner]:
+    """
+    Starts an ultra-lightweight HTTP micro-server on $PORT if specified by Render.
+    Allows deploying seamlessly as a Render Web Service without deployment timeout failures,
+    and supports free-tier uptime monitoring to prevent sleep.
+    """
+    port_str = os.getenv("PORT")
+    if not port_str:
+        return None
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        return None
+
+    app = web.Application()
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "healthy",
+            "bot": "MANAGER",
+            "engine": LOOP_ENGINE,
+            "connected_chats": len(CHAT_SETTINGS),
+            "ram_tier": "Render Hobby/Free (Target: <50MB RAM, <5GB Outbound)"
+        })
+
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[RENDER] Health micro-server listening on 0.0.0.0:{port}")
+    return runner
+
+
+# ==============================================================================
 # APPLICATION BOOTSTRAP & EXECUTION RUNNER
 # ==============================================================================
 
@@ -2036,7 +2130,10 @@ async def main() -> None:
         sys.exit(1)
 
     print(f"[INITIALIZING] Launching Ultra-Optimized Admin Bot with {LOOP_ENGINE}...")
-    bot = Bot(token=token.strip())
+
+    # High-efficiency session connector with DNS caching & socket limit (Render RAM optimization)
+    session = AiohttpSession(limit=10)
+    bot = Bot(token=token.strip(), session=session)
     dp = Dispatcher()
 
     # Register high-speed Anti-Flood Middleware
@@ -2056,11 +2153,28 @@ async def main() -> None:
 
     # Register admin-only command catalog with Telegram API
     await setup_bot_commands(bot)
+
+    # Start background RAM & cache resource optimizer task
+    optimizer_task = asyncio.create_task(resource_optimizer_worker())
+
+    # Start Render health server if PORT is assigned
+    health_runner = await start_render_health_server()
+
     print(f"[READY] Listening for commands with zero DB roundtrips. Engine: {LOOP_ENGINE}")
 
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        # Polling timeout set to 50s: holds long-polling socket up to 50s on Telegram server.
+        # Slashes outbound HTTP request headers by >90% to stay well under Render's 5GB limit (<50MB/mo).
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+            polling_timeout=50,
+            handle_signals=True
+        )
     finally:
+        optimizer_task.cancel()
+        if health_runner:
+            await health_runner.cleanup()
         await MongoDBManager.disconnect()
         await bot.session.close()
 

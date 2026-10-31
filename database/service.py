@@ -40,7 +40,8 @@ class DatabaseService:
 
         count = 0
         try:
-            cursor = db.chat_settings.find({})
+            # Low-memory projection: omit MongoDB internal _id field
+            cursor = db.chat_settings.find({}, {"_id": 0})
             async for doc in cursor:
                 chat_id = doc.get("chat_id")
                 if not chat_id:
@@ -72,7 +73,11 @@ class DatabaseService:
 
         count = 0
         try:
-            cursor = db.user_warnings.find({"warn_count": {"$gt": 0}})
+            # Bandwidth & RAM optimized projection: load strictly active counters
+            cursor = db.user_warnings.find(
+                {"warn_count": {"$gt": 0}},
+                {"_id": 0, "chat_id": 1, "user_id": 1, "warn_count": 1}
+            )
             async for doc in cursor:
                 chat_id = doc.get("chat_id")
                 user_id = doc.get("user_id")

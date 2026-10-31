@@ -1,0 +1,30 @@
+services:
+  # ============================================================================
+  # MANAGER: High-Speed Telegram Moderation Engine (Render Blueprint)
+  # Tailored for Render Free & Hobby Tiers (512MB RAM, 5GB Outbound Bandwidth)
+  # ============================================================================
+  - type: web
+    name: manager-moderation-bot
+    runtime: python
+    buildCommand: pip install -U pip setuptools && pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free # Change to 'starter' or 'hobby' if desired
+    region: frankfurt # Frankfurt/Europe is directly adjacent to Telegram Data Centers for sub-50ms latency!
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false # Set securely in Render dashboard
+      - key: MONGO_URI
+        sync: false # Set MongoDB Atlas connection string
+      - key: MONGO_DB_NAME
+        value: telegram_admin_bot
+      - key: PORT
+        value: "10000"
+      - key: PYTHON_VERSION
+        value: "3.11.8"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: MALLOC_TRIM_THRESHOLD_
+        value: "100000" # Returns heap memory > 100KB directly back to the OS
+      - key: MALLOC_ARENA_MAX
+        value: "2" # Constrains glibc memory arenas to prevent RAM bloat
