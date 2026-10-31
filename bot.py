@@ -39,6 +39,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
     CallbackQuery,
@@ -985,6 +986,8 @@ async def handle_start_help(message: Message) -> None:
         "• <code>/demote</code> - Strip all administrator rights\n"
         "• <code>/warn</code> - Issue warning increment with automated ceiling\n"
         "• <code>/resetwarn</code> - Clear user warning counter\n"
+        "• <code>/report [reason]</code> - (Reply only) Publicly flag message for review\n"
+        "• <code>/show [reason]</code> - (Reply only) Forward report to admins in PM\n"
         "• <code>/settings</code> - Real-time in-memory group protection panel\n\n"
         f"<i>Engine loop: <code>{LOOP_ENGINE}</code> | Sub-second latency active.</i>"
     )
@@ -1000,7 +1003,348 @@ async def handle_start_help(message: Message) -> None:
 
 
 # ------------------------------------------------------------------------------
-# 8. Admin-Only Command Catalog Synchronization
+# 8. /report & /show (Public & Private Reporting Engine)
+# ------------------------------------------------------------------------------
+
+def get_message_link(chat: types.Chat, message_id: int) -> str:
+    """Constructs direct Telegram link to message."""
+    if chat.username:
+        return f"https://t.me/{chat.username}/{message_id}"
+    clean_id = str(chat.id)
+    if clean_id.startswith("-100"):
+        clean_id = clean_id[4:]
+    elif clean_id.startswith("-"):
+        clean_id = clean_id[1:]
+    return f"https://t.me/c/{clean_id}/{message_id}"
+
+
+def extract_message_snippet(target_msg: Message) -> str:
+    """Extracts text preview or media indicator from message."""
+    if target_msg.text:
+        return target_msg.text[:300] + ("..." if len(target_msg.text) > 300 else "")
+    if target_msg.caption:
+        return target_msg.caption[:300] + ("..." if len(target_msg.caption) > 300 else "")
+    if target_msg.sticker:
+        return f"[Sticker {target_msg.sticker.emoji or ''}]"
+    if target_msg.animation:
+        return "[GIF / Animation]"
+    if target_msg.photo:
+        return "[Photo]"
+    if target_msg.video:
+        return "[Video]"
+    if target_msg.voice:
+        return "[Voice Note]"
+    if target_msg.audio:
+        return "[Audio Track]"
+    if target_msg.document:
+        return f"[Document: {target_msg.document.file_name or 'file'}]"
+    return "[Message Content]"
+
+
+@router.message(Command("report"))
+async def handle_report(message: Message, command: CommandObject, bot: Bot) -> None:
+    """
+    /report -> Works with reply only!
+    Visible publicly to both admins and members in the group chat.
+    Includes instant administrative action buttons.
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    # Must be used as a reply
+    if not message.reply_to_message:
+        try:
+            warning = await message.reply("⚠️ <code>/report</code> must be used as a reply to a message!")
+            await asyncio.sleep(5)
+            await warning.delete()
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    target_msg = message.reply_to_message
+    target_user = target_msg.from_user
+    reporter = message.from_user
+
+    if not target_user or not reporter:
+        return
+
+    # Check if user attempts to report self
+    if target_user.id == reporter.id:
+        try:
+            warning = await message.reply("⚠️ You cannot report your own message.")
+            await asyncio.sleep(5)
+            await warning.delete()
+            await message.delete()
+        except Exception:
+            pass
+        return
+
+    reason = command.args.strip() if command and command.args else "No specific reason provided"
+    snippet = extract_message_snippet(target_msg)
+    msg_link = get_message_link(message.chat, target_msg.message_id)
+
+    chat_id = message.chat.id
+    target_id = target_user.id
+    target_mid = target_msg.message_id
+
+    # Inline action buttons for admins right on the public report message
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑️ Delete", callback_data=f"rep:del:{chat_id}:{target_mid}:{target_id}"),
+            InlineKeyboardButton(text="🔇 Mute (15m)", callback_data=f"rep:mute:{chat_id}:{target_mid}:{target_id}"),
+            InlineKeyboardButton(text="🔨 Ban", callback_data=f"rep:ban:{chat_id}:{target_mid}:{target_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔗 View Message", url=msg_link),
+            InlineKeyboardButton(text="✅ Dismiss", callback_data=f"rep:dismiss:{chat_id}:{target_mid}:{target_id}"),
+        ]
+    ])
+
+    report_text = (
+        f"🚨 <b>MESSAGE REPORTED</b>\n\n"
+        f"👤 <b>Reported User:</b> <a href=\"tg://user?id={target_user.id}\">{target_user.full_name}</a> (<code>{target_user.id}</code>)\n"
+        f"📢 <b>Reported By:</b> <a href=\"tg://user?id={reporter.id}\">{reporter.full_name}</a> (<code>{reporter.id}</code>)\n"
+        f"📝 <b>Reason:</b> <i>{reason}</i>\n"
+        f"💬 <b>Preview:</b> <code>{snippet}</code>\n\n"
+        f"<i>Admins and members can view this report. Admins may take direct action below:</i>"
+    )
+
+    try:
+        await message.reply(report_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("rep:"))
+async def handle_report_action_callback(query: CallbackQuery, bot: Bot) -> None:
+    """Handles action buttons on public group reports (admin-only execution)."""
+    parts = query.data.split(":")
+    if len(parts) < 5:
+        await query.answer()
+        return
+
+    _, action, chat_id_str, target_mid_str, target_uid_str = parts[:5]
+    chat_id = int(chat_id_str)
+    target_mid = int(target_mid_str)
+    target_uid = int(target_uid_str)
+
+    admin_user = query.from_user
+    needed_perm = "can_restrict_members" if action in ("mute", "ban") else "can_delete_messages"
+    if not await check_admin_rights(bot, chat_id, admin_user.id, needed_perm):
+        await query.answer("❌ Only administrators can resolve reports.", show_alert=True)
+        return
+
+    if action == "del":
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=target_mid)
+        except Exception:
+            pass
+        status_text = f"✅ Message deleted by <a href=\"tg://user?id={admin_user.id}\">{admin_user.full_name}</a>."
+    elif action == "mute":
+        try:
+            until_ts = int(time.time() + 900)  # 15 minutes
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=target_uid,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                ),
+                until_date=until_ts
+            )
+            await bot.delete_message(chat_id=chat_id, message_id=target_mid)
+        except Exception:
+            pass
+        status_text = f"✅ User muted (15m) & message deleted by <a href=\"tg://user?id={admin_user.id}\">{admin_user.full_name}</a>."
+    elif action == "ban":
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=target_uid)
+            await bot.delete_message(chat_id=chat_id, message_id=target_mid)
+        except Exception:
+            pass
+        status_text = f"✅ User banned & message deleted by <a href=\"tg://user?id={admin_user.id}\">{admin_user.full_name}</a>."
+    elif action == "dismiss":
+        status_text = f"✅ Report dismissed by <a href=\"tg://user?id={admin_user.id}\">{admin_user.full_name}</a>."
+    else:
+        await query.answer()
+        return
+
+    try:
+        await query.message.edit_text(
+            f"🛡️ <b>REPORT RESOLVED</b>\n\n{status_text}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+    await query.answer("Report handled successfully.")
+
+
+@router.message(Command("show"))
+async def handle_show(message: Message, command: CommandObject, bot: Bot) -> None:
+    """
+    /show -> Reports message directly to chat administrators in private message (DM).
+    Works when replying to a message.
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    # Delete trigger to keep group chat pristine
+    await wipe_trigger(message)
+
+    if not message.reply_to_message:
+        try:
+            warning = await message.answer("⚠️ <code>/show</code> must be used as a reply to the message you want to report to admins in PM!")
+            await asyncio.sleep(5)
+            await warning.delete()
+        except Exception:
+            pass
+        return
+
+    target_msg = message.reply_to_message
+    target_user = target_msg.from_user
+    reporter = message.from_user
+
+    if not target_user or not reporter:
+        return
+
+    chat_id = message.chat.id
+    chat_title = message.chat.title or "This Group"
+    reason = command.args.strip() if command and command.args else "Reported via /show"
+    snippet = extract_message_snippet(target_msg)
+    msg_link = get_message_link(message.chat, target_msg.message_id)
+
+    target_id = target_user.id
+    target_mid = target_msg.message_id
+
+    pm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑️ Delete Message", callback_data=f"pmrep:del:{chat_id}:{target_mid}:{target_id}"),
+            InlineKeyboardButton(text="🔇 Mute (15m)", callback_data=f"pmrep:mute:{chat_id}:{target_mid}:{target_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔨 Ban User", callback_data=f"pmrep:ban:{chat_id}:{target_mid}:{target_id}"),
+            InlineKeyboardButton(text="🔗 Open Message", url=msg_link),
+        ]
+    ])
+
+    pm_report_text = (
+        f"📬 <b>PRIVATE ADMIN REPORT INCOMING</b>\n\n"
+        f"🏷️ <b>Group:</b> <code>{chat_title}</code> (<code>{chat_id}</code>)\n"
+        f"👤 <b>Reported User:</b> <a href=\"tg://user?id={target_user.id}\">{target_user.full_name}</a> (<code>{target_user.id}</code>)\n"
+        f"📢 <b>Reported By:</b> <a href=\"tg://user?id={reporter.id}\">{reporter.full_name}</a> (<code>{reporter.id}</code>)\n"
+        f"📝 <b>Reason:</b> <i>{reason}</i>\n"
+        f"💬 <b>Preview:</b>\n<blockquote>{snippet}</blockquote>\n\n"
+        f"<i>Use the moderation buttons below to manage this violation directly:</i>"
+    )
+
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception:
+        admins = []
+
+    delivered_count = 0
+    for admin in admins:
+        if admin.user.is_bot:
+            continue
+        try:
+            await bot.send_message(
+                chat_id=admin.user.id,
+                text=pm_report_text,
+                reply_markup=pm_keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            delivered_count += 1
+        except Exception:
+            pass
+
+    try:
+        if delivered_count > 0:
+            receipt = await message.answer(
+                f"📩 <b>Report delivered to {delivered_count} administrator(s) in private message.</b>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            receipt = await message.answer(
+                "⚠️ <i>Report generated, but administrators must start the bot in private DM to receive notifications.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        await asyncio.sleep(5)
+        await receipt.delete()
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("pmrep:"))
+async def handle_pm_report_action_callback(query: CallbackQuery, bot: Bot) -> None:
+    """Handles action buttons taken by an admin inside their private DM."""
+    parts = query.data.split(":")
+    if len(parts) < 5:
+        await query.answer()
+        return
+
+    _, action, chat_id_str, target_mid_str, target_uid_str = parts[:5]
+    chat_id = int(chat_id_str)
+    target_mid = int(target_mid_str)
+    target_uid = int(target_uid_str)
+
+    admin_user = query.from_user
+    needed_perm = "can_restrict_members" if action in ("mute", "ban") else "can_delete_messages"
+    if not await check_admin_rights(bot, chat_id, admin_user.id, needed_perm):
+        await query.answer("❌ You lack administrative permissions in that group.", show_alert=True)
+        return
+
+    if action == "del":
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=target_mid)
+            result = "🗑️ Message Deleted"
+        except Exception as e:
+            result = f"⚠️ Could not delete: {e}"
+    elif action == "mute":
+        try:
+            until_ts = int(time.time() + 900)
+            await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=target_uid,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                ),
+                until_date=until_ts
+            )
+            await bot.delete_message(chat_id=chat_id, message_id=target_mid)
+            result = "🔇 User Muted (15m) & Message Deleted"
+        except Exception as e:
+            result = f"⚠️ Could not mute: {e}"
+    elif action == "ban":
+        try:
+            await bot.ban_chat_member(chat_id=chat_id, user_id=target_uid)
+            await bot.delete_message(chat_id=chat_id, message_id=target_mid)
+            result = "🔨 User Banned & Message Deleted"
+        except Exception as e:
+            result = f"⚠️ Could not ban: {e}"
+    else:
+        await query.answer()
+        return
+
+    try:
+        await query.message.edit_text(
+            f"{query.message.text}\n\n✅ <b>Action Taken:</b> {result} (by you)",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+    except Exception:
+        pass
+    await query.answer(f"Executed: {result}")
+
+
+# ------------------------------------------------------------------------------
+# 9. Admin-Only Command Catalog Synchronization
 # ------------------------------------------------------------------------------
 async def setup_bot_commands(bot: Bot) -> None:
     """
@@ -1025,8 +1369,16 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="warn", description="Issue warning with auto-enforcement"),
         BotCommand(command="resetwarn", description="Clear user warning counter"),
         BotCommand(command="warns", description="Check user warning status"),
+        BotCommand(command="report", description="(Reply only) Report message publicly"),
+        BotCommand(command="show", description="(Reply only) Report message to admins in PM"),
         BotCommand(command="settings", description="Open group protection panel"),
         BotCommand(command="setcommands", description="Force sync admin command catalog"),
+    ]
+
+    # Commands visible to regular members inside group chats
+    group_member_commands = [
+        BotCommand(command="report", description="(Reply only) Report message publicly"),
+        BotCommand(command="show", description="(Reply only) Report message to admins in PM"),
     ]
 
     private_commands = [
@@ -1036,15 +1388,18 @@ async def setup_bot_commands(bot: Bot) -> None:
     ]
 
     try:
-        # 1. Default Scope (Empty: regular group members see NO admin commands in catalog)
+        # 1. Default Scope (Empty: regular members see NO admin commands in catalog)
         await bot.set_my_commands(commands=[], scope=BotCommandScopeDefault())
 
-        # 2. Group Administrators Scope (Populates command catalog ONLY for group admins)
+        # 2. All Group Chats Scope (Members see ONLY member reporting tools)
+        await bot.set_my_commands(commands=group_member_commands, scope=BotCommandScopeAllGroupChats())
+
+        # 3. Group Administrators Scope (Populates full admin catalog ONLY for group admins)
         await bot.set_my_commands(commands=admin_commands, scope=BotCommandScopeAllChatAdministrators())
 
-        # 3. Direct Private Chats Scope
+        # 4. Direct Private Chats Scope
         await bot.set_my_commands(commands=private_commands, scope=BotCommandScopeAllPrivateChats())
-        print("[CATALOG] Admin-only command catalog registered successfully with Telegram API.")
+        print("[CATALOG] Scoped command catalogs registered successfully with Telegram API.")
     except Exception as e:
         print(f"[CATALOG WARNING] Failed to register command scopes: {e}")
 

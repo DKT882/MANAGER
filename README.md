@@ -31,6 +31,8 @@ An ultra-optimized Telegram moderation bot built in Python 3.11+ using `aiogram`
    - `/promote`: Instantly lift target to admin with 0 custom permissions.
    - `/demote`: Instantly strip all administrator privileges.
    - `/warn`, `/resetwarn`, & `/warns`: Local warning counter mapping to automated enforcement ceilings.
+   - `/report [reason]`: (Reply only) Publicly flag a message with one-click admin action buttons (`Delete`, `Mute`, `Ban`, `Dismiss`).
+   - `/show [reason]`: (Reply only) Forward a violator report directly to administrators' private DMs with moderation buttons.
    - `/settings`: Interactive inline control panel matching the BioLink Restrictor architecture.
 
 5. **Spam & Media Interceptors**
