@@ -70,24 +70,31 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "block_document": False,
     "block_audio": False,
     "block_voice": False,
+    "block_photo": False,
+    "block_video": False,
+    "media_action": "delete",  # 'delete' or 'warn'
     # Link filters
     "block_links": False,
     "admin_links_block": False,
+    "block_channel_links": False,
+    "link_action": "delete",   # 'delete' or 'warn'
     # Anti-flood settings
     "flood_protection": True,
     "flood_window": 3.0,       # Frequency window in seconds
     "flood_limit": 5,          # Maximum messages allowed inside window
-    "flood_action": "mute",    # Violation action: 'mute' or 'delete'
+    "flood_action": "mute",    # Violation action: 'mute', 'delete', 'kick', 'ban'
+    "flood_duration": 900,     # Mute duration in seconds
     # Warning settings
-    "warn_limit": 3,           # Ceiling before automated penalty
-    "warn_action": "mute",     # Automated ceiling action: 'mute' or 'ban'
-    "warn_duration": 86400,    # 24 hours penalty duration in seconds
+    "warn_limit": 3,           # Ceiling before automated penalty (1 to 10)
+    "warn_action": "mute",     # Automated ceiling action: 'mute', 'ban', 'kick'
+    "warn_duration": 86400,    # Penalty duration in seconds (0 = permanent)
     # Reporting exception settings
     "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
     # Service messages cleanup (auto delete user join / left notifications)
     "clean_service_messages": True,
-    # Anti-bot setting (auto-ban bots added to the group chat)
+    # Anti-bot setting (auto-ban/auto-kick bots added to the group chat)
     "block_bots": False,
+    "bot_action": "ban",       # Violation action: 'ban' or 'kick'
 }
 
 # CHAT_SETTINGS: chat_id -> configuration dict
@@ -131,6 +138,19 @@ def format_uptime(total_seconds: int) -> str:
     if days > 0:
         return f"{days}d {hours}h {minutes}m {secs}s"
     return f"{hours}h {minutes}m {secs}s"
+
+
+def format_duration(seconds: int) -> str:
+    """Formats duration seconds into human-readable label."""
+    if seconds <= 0:
+        return "Permanent"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 # ==============================================================================
 # INSTANT WIPE & PARALLEL NATIVE ADMIN RIGHTS ENGINE
@@ -410,9 +430,10 @@ class AntiFloodMiddleware(BaseMiddleware):
 
             # 2. Automated restriction
             action = settings.get("flood_action", "mute")
+            flood_dur = settings.get("flood_duration", 900)
             try:
                 if action == "mute":
-                    until_ts = int(time.time() + 900)  # 15 minutes penalty
+                    until_ts = int(time.time() + flood_dur) if flood_dur > 0 else 0
                     await bot.restrict_chat_member(
                         chat_id=chat_id,
                         user_id=user_id,
@@ -422,8 +443,11 @@ class AntiFloodMiddleware(BaseMiddleware):
                             can_send_other_messages=False,
                             can_add_web_page_previews=False,
                         ),
-                        until_date=until_ts
+                        until_date=until_ts if until_ts > 0 else None
                     )
+                elif action == "kick":
+                    await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+                    await bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
                 elif action == "ban":
                     await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
             except Exception:
@@ -458,20 +482,25 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
     chat_id = message.chat.id
     settings = CHAT_SETTINGS[chat_id]
 
-    # 1. Anti-Bot Auto-Ban: Instantly ban any newly added bot
+    # 1. Anti-Bot Auto-Ban / Auto-Kick: Instantly penalize newly added bot
     if settings.get("block_bots") and message.new_chat_members:
         bot_id = bot.id
+        bot_action = settings.get("bot_action", "ban")
         for member in message.new_chat_members:
             if member.is_bot and member.id != bot_id:
                 try:
-                    await bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
+                    if bot_action == "kick":
+                        await bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
+                        await bot.unban_chat_member(chat_id=chat_id, user_id=member.id)
+                    else:
+                        await bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
                     METRICS["violations_handled"] += 1
                     METRICS["connected_channels_caught"] += 1
                     DatabaseService.log_moderation_background(
                         chat_id=chat_id,
                         admin_id=bot_id,
                         target_id=member.id,
-                        action="anti_bot_ban",
+                        action=f"anti_bot_{bot_action}",
                         reason="Automated Anti-Bot Protection"
                     )
                 except Exception:
@@ -513,49 +542,54 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
 
     # 1. Media Type Interceptions
     if not is_admin:
+        media_violation = False
         if settings.get("block_sticker") and message.sticker:
-            METRICS["violations_handled"] += 1
-            await wipe_trigger(message)
-            return
+            media_violation = True
+        elif settings.get("block_animation") and message.animation:
+            media_violation = True
+        elif settings.get("block_document") and message.document:
+            media_violation = True
+        elif settings.get("block_audio") and message.audio:
+            media_violation = True
+        elif settings.get("block_voice") and message.voice:
+            media_violation = True
+        elif settings.get("block_photo") and message.photo:
+            media_violation = True
+        elif settings.get("block_video") and message.video:
+            media_violation = True
 
-        if settings.get("block_animation") and message.animation:
+        if media_violation:
             METRICS["violations_handled"] += 1
             await wipe_trigger(message)
-            return
-
-        if settings.get("block_document") and message.document:
-            METRICS["violations_handled"] += 1
-            await wipe_trigger(message)
-            return
-
-        if settings.get("block_audio") and message.audio:
-            METRICS["violations_handled"] += 1
-            await wipe_trigger(message)
-            return
-
-        if settings.get("block_voice") and message.voice:
-            METRICS["violations_handled"] += 1
-            await wipe_trigger(message)
+            if settings.get("media_action") == "warn":
+                WARN_CACHE[chat_id][user.id] += 1
+                DatabaseService.record_warn_background(chat_id, user.id, bot.id, "Sent blocked media", WARN_CACHE[chat_id][user.id])
             return
 
     # 2. Link Interceptions
     has_link = False
+    is_channel_link = False
     if message.entities:
         for entity in message.entities:
             if entity.type in ("url", "text_link"):
                 has_link = True
                 break
+            elif entity.type == "mention":
+                is_channel_link = True
 
     if not has_link and message.text:
         if re.search(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+)", message.text, re.IGNORECASE):
             has_link = True
 
-    if has_link:
+    if has_link or (is_channel_link and settings.get("block_channel_links")):
         # Check non-admin link block
-        if not is_admin and settings.get("block_links"):
+        if not is_admin and (settings.get("block_links") or (is_channel_link and settings.get("block_channel_links"))):
             METRICS["violations_handled"] += 1
             METRICS["chat_links_caught"] += 1
             await wipe_trigger(message)
+            if settings.get("link_action") == "warn":
+                WARN_CACHE[chat_id][user.id] += 1
+                DatabaseService.record_warn_background(chat_id, user.id, bot.id, "Sent blocked link", WARN_CACHE[chat_id][user.id])
             return
 
         # Check strict admin link block
@@ -976,7 +1010,7 @@ async def handle_warn(message: Message, command: CommandObject, bot: Bot) -> Non
             WARN_CACHE.pop(chat_id, None)
         action = settings.get("warn_action", "mute")
         duration = settings.get("warn_duration", 86400)
-        until_ts = int(time.time() + duration)
+        until_ts = int(time.time() + duration) if duration > 0 else None
 
         try:
             if action == "mute":
@@ -991,6 +1025,9 @@ async def handle_warn(message: Message, command: CommandObject, bot: Bot) -> Non
                     ),
                     until_date=until_ts
                 )
+            elif action == "kick":
+                await bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+                await bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
             elif action == "ban":
                 await bot.ban_chat_member(chat_id=chat_id, user_id=target_id, until_date=until_ts)
         except Exception:
@@ -1043,75 +1080,54 @@ async def handle_get_warns(message: Message, command: CommandObject, bot: Bot) -
 
 def generate_settings_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
     """
-    Renders high-speed inline keyboard representing current in-memory settings.
-    Supports in-group close and private DM navigation back to managed group list / main menu.
+    Renders high-speed modular settings hub with direct jump to feature customization submenus.
     """
     s = CHAT_SETTINGS[chat_id]
-
-    def state_badge(is_active: bool) -> str:
-        return "✅ ON" if is_active else "❌ OFF"
-
-    def block_badge(is_blocked: bool) -> str:
-        return "❌ Blocked" if is_blocked else "✅ Allowed"
+    warn_dur_str = format_duration(s.get("warn_duration", 86400))
+    flood_dur_str = format_duration(s.get("flood_duration", 900))
+    media_blocked = sum(1 for k in [
+        "block_sticker", "block_animation", "block_document",
+        "block_audio", "block_voice", "block_photo", "block_video"
+    ] if s.get(k))
 
     buttons = [
         [
             InlineKeyboardButton(
-                text=f"✉️ In-Chat Links: {state_badge(s['block_links'])}",
-                callback_data=f"set:block_links:{chat_id}"
+                text=f"⚠️ Warn Ceiling ({s.get('warn_limit', 3)} ➔ {s.get('warn_action', 'mute').upper()} {warn_dur_str})",
+                callback_data=f"set:menu:warn:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"⚡ Anti-Flood ({'ON' if s.get('flood_protection') else 'OFF'} | {s.get('flood_limit', 5)}msg/{int(s.get('flood_window', 3))}s ➔ {s.get('flood_action', 'mute').upper()})",
+                callback_data=f"set:menu:flood:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🤖 Anti-Bot ({'ON' if s.get('block_bots') else 'OFF'} ➔ {s.get('bot_action', 'ban').upper()})",
+                callback_data=f"set:menu:bot:{chat_id}"
             ),
             InlineKeyboardButton(
-                text=f"👮 Admin Links: {block_badge(s['admin_links_block'])}",
-                callback_data=f"set:admin_links_block:{chat_id}"
+                text=f"🧹 Service Msgs ({'ON' if s.get('clean_service_messages', True) else 'OFF'})",
+                callback_data=f"set:menu:service:{chat_id}"
             ),
         ],
         [
             InlineKeyboardButton(
-                text=f"🎭 Stickers: {block_badge(s['block_sticker'])}",
-                callback_data=f"set:block_sticker:{chat_id}"
+                text=f"🔗 Links & Invites ({'RESTRICTED' if s.get('block_links') or s.get('admin_links_block') else 'ALLOWED'})",
+                callback_data=f"set:menu:links:{chat_id}"
             ),
             InlineKeyboardButton(
-                text=f"🎞️ GIFs: {block_badge(s['block_animation'])}",
-                callback_data=f"set:block_animation:{chat_id}"
+                text=f"🎭 Media Filters ({media_blocked}/7 Blocked)",
+                callback_data=f"set:menu:media:{chat_id}"
             ),
         ],
         [
             InlineKeyboardButton(
-                text=f"📁 Documents: {block_badge(s['block_document'])}",
-                callback_data=f"set:block_document:{chat_id}"
-            ),
-            InlineKeyboardButton(
-                text=f"🎙️ Audio/Voice: {block_badge(s['block_voice'])}",
-                callback_data=f"set:block_voice:{chat_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🚷 Delete Join/Left: {state_badge(s.get('clean_service_messages', True))}",
-                callback_data=f"set:clean_service_messages:{chat_id}"
-            ),
-            InlineKeyboardButton(
-                text=f"🤖 Anti-Bot: {state_badge(s.get('block_bots', False))}",
-                callback_data=f"set:block_bots:{chat_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"⚡ Anti-Flood: {state_badge(s['flood_protection'])} ({s['flood_limit']}msg/{int(s['flood_window'])}s)",
-                callback_data=f"set:flood_protection:{chat_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"⚠️ Warn Limit: {s['warn_limit']} | Action: {s['warn_action'].upper()}",
-                callback_data=f"set:warn_toggle:{chat_id}"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"👥 Excepted Admins ({len(s.get('excepted_admins', []))})",
-                callback_data=f"set:view_excepted:{chat_id}"
-            ),
+                text=f"👥 Excepted Admins ({len(s.get('excepted_admins', []))} configured)",
+                callback_data=f"set:menu:excepted:{chat_id}"
+            )
         ],
     ]
 
@@ -1128,6 +1144,287 @@ def generate_settings_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeybo
         ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def generate_warn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    s = CHAT_SETTINGS[chat_id]
+    w_limit = s.get("warn_limit", 3)
+    w_action = s.get("warn_action", "mute").upper()
+    w_dur = format_duration(s.get("warn_duration", 86400))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➖ Decrease", callback_data=f"set:warn_dec:{chat_id}"),
+            InlineKeyboardButton(text=f"⚠️ Ceiling: {w_limit} Warns", callback_data=f"set:warn_cycle:{chat_id}"),
+            InlineKeyboardButton(text="➕ Increase", callback_data=f"set:warn_inc:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🔨 Punishment: {w_action} (MUTE/BAN/KICK)", callback_data=f"set:warn_action:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton(text=f"⏱️ Duration: {w_dur}", callback_data=f"set:warn_dur:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_warn_text(chat_title: str, s: Dict[str, Any]) -> str:
+    w_limit = s.get("warn_limit", 3)
+    w_action = s.get("warn_action", "mute").upper()
+    w_dur = format_duration(s.get("warn_duration", 86400))
+    return (
+        f"⚠️ <b>WARN CEILING & PUNISHMENT CONFIGURATION</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>Violation Ceiling:</b> <code>{w_limit} warnings</code>\n"
+        f"• <b>Punishment Action:</b> <code>{w_action}</code> (MUTE / BAN / KICK)\n"
+        f"• <b>Penalty Duration:</b> <code>{w_dur}</code> (1h, 6h, 12h, 24h, 7d, Permanent)\n\n"
+        f"<i>Tap the buttons below to customize thresholds and penalties:</i>"
+    )
+
+
+def generate_flood_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    s = CHAT_SETTINGS[chat_id]
+    is_on = s.get("flood_protection", True)
+    f_limit = s.get("flood_limit", 5)
+    f_win = int(s.get("flood_window", 3))
+    f_action = s.get("flood_action", "mute").upper()
+    f_dur = format_duration(s.get("flood_duration", 900))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"⚡ Protection: {'✅ ACTIVE' if is_on else '❌ DISABLED'}",
+                callback_data=f"set:flood_toggle:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="➖ Msg", callback_data=f"set:flood_limit_dec:{chat_id}"),
+            InlineKeyboardButton(text=f"📬 Limit: {f_limit} msgs", callback_data=f"set:flood_limit_cycle:{chat_id}"),
+            InlineKeyboardButton(text="➕ Msg", callback_data=f"set:flood_limit_inc:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="➖ Sec", callback_data=f"set:flood_win_dec:{chat_id}"),
+            InlineKeyboardButton(text=f"⏱️ Window: {f_win}s", callback_data=f"set:flood_win_cycle:{chat_id}"),
+            InlineKeyboardButton(text="➕ Sec", callback_data=f"set:flood_win_inc:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🔨 Punishment: {f_action}", callback_data=f"set:flood_action:{chat_id}"),
+            InlineKeyboardButton(text=f"⏱️ Mute Duration: {f_dur}", callback_data=f"set:flood_dur:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_flood_text(chat_title: str, s: Dict[str, Any]) -> str:
+    is_on = s.get("flood_protection", True)
+    f_limit = s.get("flood_limit", 5)
+    f_win = int(s.get("flood_window", 3))
+    f_action = s.get("flood_action", "mute").upper()
+    f_dur = format_duration(s.get("flood_duration", 900))
+    return (
+        f"⚡ <b>ANTI-FLOOD TUNING & PUNISHMENTS</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>Status:</b> {'<code>ACTIVE</code>' if is_on else '<i>Disabled</i>'}\n"
+        f"• <b>Frequency Ceiling:</b> <code>{f_limit} messages inside {f_win} seconds</code>\n"
+        f"• <b>Automated Punishment:</b> <code>{f_action}</code> (MUTE / DELETE / KICK / BAN)\n"
+        f"• <b>Mute Duration:</b> <code>{f_dur}</code> (1m, 5m, 15m, 1h, 24h)\n\n"
+        f"<i>Tap below to tune anti-spam parameters:</i>"
+    )
+
+
+def generate_bot_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    s = CHAT_SETTINGS[chat_id]
+    is_on = s.get("block_bots", False)
+    b_action = s.get("bot_action", "ban").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"🤖 Anti-Bot: {'✅ ACTIVE' if is_on else '❌ DISABLED'}",
+                callback_data=f"set:bot_toggle:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🔨 Punishment: {b_action} (BAN / KICK)",
+                callback_data=f"set:bot_action:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_bot_text(chat_title: str, s: Dict[str, Any]) -> str:
+    is_on = s.get("block_bots", False)
+    b_action = s.get("bot_action", "ban").upper()
+    return (
+        f"🤖 <b>ANTI-BOT AUTO-PROTECTION</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>Status:</b> {'<code>ACTIVE</code>' if is_on else '<i>Disabled</i>'}\n"
+        f"• <b>Punishment Action:</b> <code>{b_action}</code> (BAN: permanent / KICK: allows rejoining)\n\n"
+        f"<i>When active, any unauthorized bot added to this group is instantly penalized.</i>"
+    )
+
+
+def generate_service_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    s = CHAT_SETTINGS[chat_id]
+    is_on = s.get("clean_service_messages", True)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"🚷 Delete Join/Left: {'✅ ACTIVE' if is_on else '❌ DISABLED'}",
+                callback_data=f"set:service_toggle:{chat_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_service_text(chat_title: str, s: Dict[str, Any]) -> str:
+    is_on = s.get("clean_service_messages", True)
+    return (
+        f"🧹 <b>SERVICE MESSAGE CLEANER</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>Status:</b> {'<code>ACTIVE (Auto-Delete)</code>' if is_on else '<i>Disabled</i>'}\n\n"
+        f"<i>Automatically purges user joined and user left system notifications.</i>"
+    )
+
+
+def generate_links_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    s = CHAT_SETTINGS[chat_id]
+    def badge(b: bool) -> str:
+        return "❌ Blocked" if b else "✅ Allowed"
+    l_action = s.get("link_action", "delete").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"✉️ Member Links: {badge(s.get('block_links'))}", callback_data=f"set:links_member:{chat_id}"),
+            InlineKeyboardButton(text=f"👮 Admin Links: {badge(s.get('admin_links_block'))}", callback_data=f"set:links_admin:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"📢 Channel Links: {badge(s.get('block_channel_links'))}", callback_data=f"set:links_channels:{chat_id}"),
+            InlineKeyboardButton(text=f"🔨 Action: {l_action}", callback_data=f"set:links_action:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_links_text(chat_title: str, s: Dict[str, Any]) -> str:
+    def badge(b: bool) -> str:
+        return "<code>Blocked</code>" if b else "<i>Allowed</i>"
+    return (
+        f"🔗 <b>LINKS & INVITES CONFIGURATION</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>Regular Member Links:</b> {badge(s.get('block_links'))}\n"
+        f"• <b>Administrator Links:</b> {badge(s.get('admin_links_block'))}\n"
+        f"• <b>Channel Mentions & Links:</b> {badge(s.get('block_channel_links'))}\n"
+        f"• <b>Violation Action:</b> <code>{s.get('link_action', 'delete').upper()}</code> (DELETE ONLY or DELETE + WARN)\n\n"
+        f"<i>Tap below to configure link interception rules:</i>"
+    )
+
+
+def generate_media_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    s = CHAT_SETTINGS[chat_id]
+    def b(key: str) -> str:
+        return "❌" if s.get(key) else "✅"
+    m_action = s.get("media_action", "delete").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"🎭 Stickers: {b('block_sticker')}", callback_data=f"set:media_sticker:{chat_id}"),
+            InlineKeyboardButton(text=f"🎞️ GIFs: {b('block_animation')}", callback_data=f"set:media_animation:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"📁 Docs: {b('block_document')}", callback_data=f"set:media_document:{chat_id}"),
+            InlineKeyboardButton(text=f"🎙️ Voice: {b('block_voice')}", callback_data=f"set:media_voice:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🎵 Audio: {b('block_audio')}", callback_data=f"set:media_audio:{chat_id}"),
+            InlineKeyboardButton(text=f"🖼️ Photos: {b('block_photo')}", callback_data=f"set:media_photo:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text=f"🎥 Videos: {b('block_video')}", callback_data=f"set:media_video:{chat_id}"),
+            InlineKeyboardButton(text=f"🔨 Action: {m_action}", callback_data=f"set:media_action:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_media_text(chat_title: str, s: Dict[str, Any]) -> str:
+    def b(key: str) -> str:
+        return "<code>Blocked</code>" if s.get(key) else "<i>Allowed</i>"
+    return (
+        f"🎭 <b>MEDIA PERMISSIONS & FILTERS</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"• <b>Stickers:</b> {b('block_sticker')} | <b>GIFs:</b> {b('block_animation')}\n"
+        f"• <b>Documents:</b> {b('block_document')} | <b>Voice:</b> {b('block_voice')}\n"
+        f"• <b>Audio MP3:</b> {b('block_audio')} | <b>Photos:</b> {b('block_photo')}\n"
+        f"• <b>Videos:</b> {b('block_video')}\n"
+        f"• <b>Violation Action:</b> <code>{s.get('media_action', 'delete').upper()}</code> (DELETE ONLY or DELETE + WARN)\n\n"
+        f"<i>Tap buttons below to toggle restrictions for regular members:</i>"
+    )
+
+
+def generate_excepted_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🗑️ Clear All Excepted Admins", callback_data=f"set:excepted_clear:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+        ]
+    ])
+
+
+def format_excepted_text(chat_title: str, s: Dict[str, Any]) -> str:
+    excepted = s.get("excepted_admins", [])
+    if excepted:
+        list_str = "\n".join(f"• <code>{eid}</code>" for eid in excepted)
+    else:
+        list_str = "<i>No Excepted Admins designated yet.</i>"
+    return (
+        f"👥 <b>EXCEPTED ADMINISTRATORS</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"Designated administrators who have full setup permissions and receive confidential <code>/show</code> reports:\n"
+        f"{list_str}\n\n"
+        f"<i>To add an administrator, reply to their message in the group with <code>/addexcept</code>.</i>"
+    )
+
+
+def format_settings_text(chat_title: str, s: Dict[str, Any]) -> str:
+    """Renders standardized settings dashboard text."""
+    warn_dur_str = format_duration(s.get("warn_duration", 86400))
+    flood_dur_str = format_duration(s.get("flood_duration", 900))
+    media_blocked = sum(1 for k in [
+        "block_sticker", "block_animation", "block_document",
+        "block_audio", "block_voice", "block_photo", "block_video"
+    ] if s.get(k))
+
+    return (
+        f"⚙️ <b>GROUP CONFIGURATION DASHBOARD</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"🛡️ <b>PUNISHMENTS & VIOLATIONS:</b>\n"
+        f"• <b>Warn Ceiling:</b> <code>{s.get('warn_limit', 3)} violations</code> ➔ <code>{s.get('warn_action', 'mute').upper()} ({warn_dur_str})</code>\n"
+        f"• <b>Anti-Flood:</b> {'<code>ACTIVE</code>' if s.get('flood_protection') else '<i>Disabled</i>'} "
+        f"({s.get('flood_limit', 5)} msgs / {int(s.get('flood_window', 3))}s) ➔ <code>{s.get('flood_action', 'mute').upper()} ({flood_dur_str})</code>\n"
+        f"• <b>Anti-Bot:</b> {'<code>ACTIVE</code>' if s.get('block_bots') else '<i>Disabled</i>'} "
+        f"➔ <code>{s.get('bot_action', 'ban').upper()}</code>\n\n"
+        f"🔒 <b>RESTRICTIONS & FILTERS:</b>\n"
+        f"• <b>Member Links:</b> {'<code>Blocked</code>' if s.get('block_links') else '<i>Allowed</i>'} (Action: <code>{s.get('link_action', 'delete').upper()}</code>)\n"
+        f"• <b>Admin Links:</b> {'<code>Blocked</code>' if s.get('admin_links_block') else '<i>Allowed</i>'}\n"
+        f"• <b>Channel Links / Invites:</b> {'<code>Blocked</code>' if s.get('block_channel_links') else '<i>Allowed</i>'}\n"
+        f"• <b>Media Blocked:</b> <code>{media_blocked}/7 types</code> (Action: <code>{s.get('media_action', 'delete').upper()}</code>)\n"
+        f"• <b>Join/Left Cleanup:</b> {'<code>ACTIVE</code>' if s.get('clean_service_messages', True) else '<i>Disabled</i>'}\n"
+        f"• <b>Excepted Admins:</b> <code>{len(s.get('excepted_admins', []))} designated</code>\n\n"
+        f"👉 <i>Tap any category below to customize rules, thresholds, and punishments:</i>"
+    )
 
 
 def generate_dm_main_menu(bot_username: str) -> InlineKeyboardMarkup:
@@ -1170,24 +1467,6 @@ def generate_dm_main_menu(bot_username: str) -> InlineKeyboardMarkup:
                 )
             ]
         ]
-    )
-
-
-def format_settings_text(chat_title: str, s: Dict[str, Any]) -> str:
-    """
-    Renders standardized settings dashboard text.
-    """
-    return (
-        f"⚙️ <b>SETTINGS MANAGEMENT</b>\n"
-        f"Group: <code>{chat_title}</code>\n\n"
-        f"• <b>In-Chat Links:</b> {'Blocked' if s['block_links'] else 'Allowed'}\n"
-        f"• <b>Admin Links:</b> {'DELETED' if s['admin_links_block'] else 'Allowed'}\n"
-        f"• <b>Join/Left Cleanup:</b> {'Active (Auto-Deleted)' if s.get('clean_service_messages', True) else 'Disabled'}\n"
-        f"• <b>Anti-Bot (Auto-Ban):</b> {'ACTIVE' if s.get('block_bots', False) else 'Disabled'}\n"
-        f"• <b>Anti-Flood:</b> {'ACTIVE' if s['flood_protection'] else 'Disabled'} ({s['flood_limit']} in {int(s['flood_window'])}s)\n"
-        f"• <b>Warn Ceiling:</b> {s['warn_limit']} violations ➔ {s['warn_action'].upper()}\n"
-        f"• <b>Excepted Admins:</b> {len(s.get('excepted_admins', []))} designated\n\n"
-        f"<i>Select an option below to configure group settings:</i>"
     )
 
 
@@ -1481,7 +1760,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     """
     Handles interactive settings configuration clicks (both in-group and from private DMs).
     Guarded strictly by check_can_setup_bot (Owner, Anonymous Admin, Excepted Admin).
-    Changes are reflected instantly in runtime memory and persisted asynchronously to MongoDB.
+    Provides deep modular customization for all violation limits, punishments, and features.
     """
     parts = query.data.split(":")
     if len(parts) < 3:
@@ -1489,11 +1768,21 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         return
 
     action = parts[1]
-    try:
-        chat_id = int(parts[2])
-    except ValueError:
-        await query.answer()
-        return
+    # For nested menu callbacks: set:menu:<submenu>:<chat_id>
+    if action == "menu" and len(parts) >= 4:
+        sub = parts[2]
+        try:
+            chat_id = int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+    else:
+        sub = None
+        try:
+            chat_id = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
 
     user_id = query.from_user.id
     sender_chat_id = query.message.sender_chat.id if query.message and query.message.sender_chat else None
@@ -1504,7 +1793,15 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         return
 
     s = CHAT_SETTINGS[chat_id]
+    is_dm = query.message.chat.type == ChatType.PRIVATE if query.message else False
 
+    try:
+        c_info = await bot.get_chat(chat_id)
+        chat_title = c_info.title or f"Group {chat_id}"
+    except Exception:
+        chat_title = f"Group {chat_id}"
+
+    # 1. Close Menu Action
     if action == "close":
         try:
             await query.message.delete()
@@ -1513,69 +1810,201 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("Closed.")
         return
 
-    if action == "reload":
-        await query.answer("Settings reloaded.")
-    elif action == "block_links":
-        s["block_links"] = not s["block_links"]
-        await query.answer(f"In-Chat Links: {'Blocked' if s['block_links'] else 'Allowed'}")
-    elif action == "admin_links_block":
-        s["admin_links_block"] = not s["admin_links_block"]
-        await query.answer(f"Admin Links: {'Blocked' if s['admin_links_block'] else 'Allowed'}")
-    elif action == "block_sticker":
-        s["block_sticker"] = not s["block_sticker"]
-        await query.answer(f"Stickers: {'Blocked' if s['block_sticker'] else 'Allowed'}")
-    elif action == "block_animation":
-        s["block_animation"] = not s["block_animation"]
-        await query.answer(f"GIFs: {'Blocked' if s['block_animation'] else 'Allowed'}")
-    elif action == "block_document":
-        s["block_document"] = not s["block_document"]
-        await query.answer(f"Documents: {'Blocked' if s['block_document'] else 'Allowed'}")
-    elif action == "block_voice":
-        s["block_voice"] = not s["block_voice"]
-        await query.answer(f"Audio/Voice: {'Blocked' if s['block_voice'] else 'Allowed'}")
-    elif action == "clean_service_messages":
-        current_val = s.get("clean_service_messages", True)
-        s["clean_service_messages"] = not current_val
-        await query.answer(f"Join/Left Cleanup: {'Active (Auto-Deleted)' if s['clean_service_messages'] else 'Disabled'}")
-    elif action == "block_bots":
-        current_val = s.get("block_bots", False)
-        s["block_bots"] = not current_val
-        await query.answer(f"Anti-Bot: {'ACTIVE (Auto-Ban)' if s['block_bots'] else 'Disabled'}")
-    elif action == "flood_protection":
-        s["flood_protection"] = not s["flood_protection"]
-        await query.answer(f"Anti-Flood: {'Active' if s['flood_protection'] else 'Disabled'}")
-    elif action == "warn_toggle":
-        limits = [3, 5, 10]
-        cur = s.get("warn_limit", 3)
-        if cur in limits:
-            idx = limits.index(cur)
-            s["warn_limit"] = limits[(idx + 1) % len(limits)]
+    # 2. Category Submenu Navigation
+    if action == "menu":
+        if sub == "main":
+            text = format_settings_text(chat_title, s)
+            kb = generate_settings_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "warn":
+            text = format_warn_text(chat_title, s)
+            kb = generate_warn_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "flood":
+            text = format_flood_text(chat_title, s)
+            kb = generate_flood_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "bot":
+            text = format_bot_text(chat_title, s)
+            kb = generate_bot_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "service":
+            text = format_service_text(chat_title, s)
+            kb = generate_service_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "links":
+            text = format_links_text(chat_title, s)
+            kb = generate_links_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "media":
+            text = format_media_text(chat_title, s)
+            kb = generate_media_keyboard(chat_id, is_dm=is_dm)
+        elif sub == "excepted":
+            text = format_excepted_text(chat_title, s)
+            kb = generate_excepted_keyboard(chat_id, is_dm=is_dm)
         else:
-            s["warn_limit"] = 3
-        await query.answer(f"Warn Limit set to {s['warn_limit']} violations")
-    elif action == "view_excepted":
-        excepted = s.get("excepted_admins", [])
-        if excepted:
-            alert_msg = f"👥 Excepted Admins ({len(excepted)}):\n" + "\n".join(f"• ID: {eid}" for eid in excepted)
-        else:
-            alert_msg = "👥 No Excepted Admins designated yet.\nReply to an admin with /addexcept to designate them for confidential reports."
-        await query.answer(alert_msg[:200], show_alert=True)
+            text = format_settings_text(chat_title, s)
+            kb = generate_settings_keyboard(chat_id, is_dm=is_dm)
+
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer()
         return
 
-    # Background MongoDB persistence (write-behind non-blocking)
-    try:
-        c_info = await bot.get_chat(chat_id)
-        chat_title = c_info.title or f"Group {chat_id}"
-    except Exception:
-        chat_title = f"Group {chat_id}"
+    # 3. Warn Ceiling & Punishment Mutations
+    if action == "warn_inc":
+        s["warn_limit"] = min(10, int(s.get("warn_limit", 3)) + 1)
+        await query.answer(f"Warn Ceiling: {s['warn_limit']} violations")
+    elif action == "warn_dec":
+        s["warn_limit"] = max(1, int(s.get("warn_limit", 3)) - 1)
+        await query.answer(f"Warn Ceiling: {s['warn_limit']} violations")
+    elif action == "warn_cycle":
+        limits = [1, 2, 3, 5, 10]
+        cur = int(s.get("warn_limit", 3))
+        idx = limits.index(cur) if cur in limits else 2
+        s["warn_limit"] = limits[(idx + 1) % len(limits)]
+        await query.answer(f"Warn Ceiling: {s['warn_limit']} violations")
+    elif action == "warn_action":
+        actions = ["mute", "ban", "kick"]
+        cur = s.get("warn_action", "mute")
+        idx = actions.index(cur) if cur in actions else 0
+        s["warn_action"] = actions[(idx + 1) % len(actions)]
+        await query.answer(f"Warn Punishment: {s['warn_action'].upper()}")
+    elif action == "warn_dur":
+        durations = [3600, 21600, 43200, 86400, 604800, 0]
+        cur = int(s.get("warn_duration", 86400))
+        idx = durations.index(cur) if cur in durations else 3
+        s["warn_duration"] = durations[(idx + 1) % len(durations)]
+        await query.answer(f"Warn Duration: {format_duration(s['warn_duration'])}")
 
+    # 4. Anti-Flood Tuning & Punishment Mutations
+    elif action == "flood_toggle":
+        s["flood_protection"] = not s.get("flood_protection", True)
+        await query.answer(f"Anti-Flood: {'ACTIVE' if s['flood_protection'] else 'DISABLED'}")
+    elif action == "flood_limit_inc":
+        s["flood_limit"] = min(25, int(s.get("flood_limit", 5)) + 1)
+        await query.answer(f"Flood Limit: {s['flood_limit']} msgs")
+    elif action == "flood_limit_dec":
+        s["flood_limit"] = max(1, int(s.get("flood_limit", 5)) - 1)
+        await query.answer(f"Flood Limit: {s['flood_limit']} msgs")
+    elif action == "flood_limit_cycle":
+        limits = [3, 5, 7, 10, 15, 20]
+        cur = int(s.get("flood_limit", 5))
+        idx = limits.index(cur) if cur in limits else 1
+        s["flood_limit"] = limits[(idx + 1) % len(limits)]
+        await query.answer(f"Flood Limit: {s['flood_limit']} msgs")
+    elif action == "flood_win_inc":
+        s["flood_window"] = min(20.0, float(s.get("flood_window", 3.0)) + 1.0)
+        await query.answer(f"Flood Window: {int(s['flood_window'])}s")
+    elif action == "flood_win_dec":
+        s["flood_window"] = max(1.0, float(s.get("flood_window", 3.0)) - 1.0)
+        await query.answer(f"Flood Window: {int(s['flood_window'])}s")
+    elif action == "flood_win_cycle":
+        windows = [1.0, 2.0, 3.0, 5.0, 10.0]
+        cur = float(s.get("flood_window", 3.0))
+        idx = windows.index(cur) if cur in windows else 2
+        s["flood_window"] = windows[(idx + 1) % len(windows)]
+        await query.answer(f"Flood Window: {int(s['flood_window'])}s")
+    elif action == "flood_action":
+        actions = ["mute", "delete", "kick", "ban"]
+        cur = s.get("flood_action", "mute")
+        idx = actions.index(cur) if cur in actions else 0
+        s["flood_action"] = actions[(idx + 1) % len(actions)]
+        await query.answer(f"Flood Punishment: {s['flood_action'].upper()}")
+    elif action == "flood_dur":
+        durations = [60, 300, 900, 3600, 86400]
+        cur = int(s.get("flood_duration", 900))
+        idx = durations.index(cur) if cur in durations else 2
+        s["flood_duration"] = durations[(idx + 1) % len(durations)]
+        await query.answer(f"Mute Duration: {format_duration(s['flood_duration'])}")
+
+    # 5. Anti-Bot Protection & Punishment
+    elif action == "bot_toggle":
+        s["block_bots"] = not s.get("block_bots", False)
+        await query.answer(f"Anti-Bot: {'ACTIVE' if s['block_bots'] else 'DISABLED'}")
+    elif action == "bot_action":
+        s["bot_action"] = "kick" if s.get("bot_action", "ban") == "ban" else "ban"
+        await query.answer(f"Anti-Bot Punishment: {s['bot_action'].upper()}")
+
+    # 6. Service Messages Cleaner
+    elif action == "service_toggle":
+        s["clean_service_messages"] = not s.get("clean_service_messages", True)
+        await query.answer(f"Join/Left Cleaner: {'ACTIVE' if s['clean_service_messages'] else 'DISABLED'}")
+
+    # 7. Links & Invites Restrictions
+    elif action == "links_member":
+        s["block_links"] = not s.get("block_links", False)
+        await query.answer(f"Member Links: {'Blocked' if s['block_links'] else 'Allowed'}")
+    elif action == "links_admin":
+        s["admin_links_block"] = not s.get("admin_links_block", False)
+        await query.answer(f"Admin Links: {'Blocked' if s['admin_links_block'] else 'Allowed'}")
+    elif action == "links_channels":
+        s["block_channel_links"] = not s.get("block_channel_links", False)
+        await query.answer(f"Channel Links: {'Blocked' if s['block_channel_links'] else 'Allowed'}")
+    elif action == "links_action":
+        s["link_action"] = "warn" if s.get("link_action", "delete") == "delete" else "delete"
+        await query.answer(f"Link Action: {s['link_action'].upper()}")
+
+    # 8. Media Restrictions
+    elif action == "media_sticker":
+        s["block_sticker"] = not s.get("block_sticker", False)
+        await query.answer(f"Stickers: {'Blocked' if s['block_sticker'] else 'Allowed'}")
+    elif action == "media_animation":
+        s["block_animation"] = not s.get("block_animation", False)
+        await query.answer(f"GIFs: {'Blocked' if s['block_animation'] else 'Allowed'}")
+    elif action == "media_document":
+        s["block_document"] = not s.get("block_document", False)
+        await query.answer(f"Documents: {'Blocked' if s['block_document'] else 'Allowed'}")
+    elif action == "media_voice":
+        s["block_voice"] = not s.get("block_voice", False)
+        await query.answer(f"Voice Notes: {'Blocked' if s['block_voice'] else 'Allowed'}")
+    elif action == "media_audio":
+        s["block_audio"] = not s.get("block_audio", False)
+        await query.answer(f"Audio: {'Blocked' if s['block_audio'] else 'Allowed'}")
+    elif action == "media_photo":
+        s["block_photo"] = not s.get("block_photo", False)
+        await query.answer(f"Photos: {'Blocked' if s['block_photo'] else 'Allowed'}")
+    elif action == "media_video":
+        s["block_video"] = not s.get("block_video", False)
+        await query.answer(f"Videos: {'Blocked' if s['block_video'] else 'Allowed'}")
+    elif action == "media_action":
+        s["media_action"] = "warn" if s.get("media_action", "delete") == "delete" else "delete"
+        await query.answer(f"Media Action: {s['media_action'].upper()}")
+
+    # 9. Excepted Admins Management
+    elif action == "excepted_clear":
+        s["excepted_admins"] = []
+        await query.answer("All Excepted Admins cleared.", show_alert=True)
+    elif action == "reload":
+        await query.answer("Settings reloaded.")
+
+    # Background MongoDB persistence (write-behind non-blocking)
     DatabaseService.save_settings_background(chat_id, chat_title, s)
 
-    # Re-render updated dashboard
-    text = format_settings_text(chat_title, s)
-    is_dm = query.message.chat.type == ChatType.PRIVATE if query.message else False
+    # Re-render appropriate screen
+    if action.startswith("warn_"):
+        text = format_warn_text(chat_title, s)
+        kb = generate_warn_keyboard(chat_id, is_dm=is_dm)
+    elif action.startswith("flood_"):
+        text = format_flood_text(chat_title, s)
+        kb = generate_flood_keyboard(chat_id, is_dm=is_dm)
+    elif action.startswith("bot_"):
+        text = format_bot_text(chat_title, s)
+        kb = generate_bot_keyboard(chat_id, is_dm=is_dm)
+    elif action.startswith("service_"):
+        text = format_service_text(chat_title, s)
+        kb = generate_service_keyboard(chat_id, is_dm=is_dm)
+    elif action.startswith("links_"):
+        text = format_links_text(chat_title, s)
+        kb = generate_links_keyboard(chat_id, is_dm=is_dm)
+    elif action.startswith("media_"):
+        text = format_media_text(chat_title, s)
+        kb = generate_media_keyboard(chat_id, is_dm=is_dm)
+    elif action.startswith("excepted_"):
+        text = format_excepted_text(chat_title, s)
+        kb = generate_excepted_keyboard(chat_id, is_dm=is_dm)
+    else:
+        text = format_settings_text(chat_title, s)
+        kb = generate_settings_keyboard(chat_id, is_dm=is_dm)
+
     try:
-        await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id, is_dm=is_dm), parse_mode=ParseMode.HTML)
+        await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 

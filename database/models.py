@@ -39,6 +39,7 @@ class MediaRestrictionSettings(BaseModel):
     block_video_note: bool = Field(default=False, description="Block round video notes (telegrams)")
     block_contact: bool = Field(default=False, description="Block contact vCards")
     block_location: bool = Field(default=False, description="Block location shares")
+    media_action: str = Field(default="delete", description="Punishment action: 'delete' or 'warn'")
 
 
 class LinkRestrictionSettings(BaseModel):
@@ -53,6 +54,7 @@ class LinkRestrictionSettings(BaseModel):
     block_telegram_invites: bool = Field(default=False, description="Block t.me/+ or joinchat invite links")
     whitelist_domains: List[str] = Field(default_factory=list, description="Approved domains that bypass link blocker")
     whitelist_channels: List[str] = Field(default_factory=list, description="Approved usernames/channels exempt from filters")
+    link_action: str = Field(default="delete", description="Punishment action: 'delete' or 'warn'")
 
 
 class AntiFloodSettings(BaseModel):
@@ -128,6 +130,7 @@ class ChatSettingsModel(BaseModel):
     reporting: ReportingSettings = Field(default_factory=ReportingSettings)
     clean_service_messages: bool = Field(default=True, description="Auto-delete join and group left service notifications")
     block_bots: bool = Field(default=False, description="Auto-ban bots added to the group chat")
+    bot_action: str = Field(default="ban", description="Punishment when unauthorized bot joins: 'ban' or 'kick'")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -154,18 +157,23 @@ class ChatSettingsModel(BaseModel):
             "block_voice": self.media.block_voice,
             "block_photo": self.media.block_photo,
             "block_video": self.media.block_video,
+            "media_action": getattr(self.media, "media_action", "delete"),
             "block_links": self.links.block_links,
             "admin_links_block": self.links.admin_links_block,
+            "block_channel_links": self.links.block_channel_links,
+            "link_action": getattr(self.links, "link_action", "delete"),
             "flood_protection": self.flood.enabled,
             "flood_window": self.flood.flood_window,
             "flood_limit": self.flood.flood_limit,
             "flood_action": self.flood.action.value if hasattr(self.flood.action, "value") else str(self.flood.action),
+            "flood_duration": self.flood.mute_duration,
             "warn_limit": self.warnings.warn_limit,
             "warn_action": self.warnings.warn_action.value if hasattr(self.warnings.warn_action, "value") else str(self.warnings.warn_action),
             "warn_duration": self.warnings.warn_duration,
             "excepted_admins": list(self.reporting.excepted_admin_ids),
             "clean_service_messages": self.clean_service_messages,
             "block_bots": self.block_bots,
+            "bot_action": getattr(self, "bot_action", "ban"),
         }
 
     @classmethod
@@ -181,10 +189,13 @@ class ChatSettingsModel(BaseModel):
             block_voice=mem_dict.get("block_voice", False),
             block_photo=mem_dict.get("block_photo", False),
             block_video=mem_dict.get("block_video", False),
+            media_action=mem_dict.get("media_action", "delete"),
         )
         links = LinkRestrictionSettings(
             block_links=mem_dict.get("block_links", False),
             admin_links_block=mem_dict.get("admin_links_block", False),
+            block_channel_links=mem_dict.get("block_channel_links", False),
+            link_action=mem_dict.get("link_action", "delete"),
         )
         flood_action_raw = mem_dict.get("flood_action", "mute")
         try:
@@ -197,6 +208,7 @@ class ChatSettingsModel(BaseModel):
             flood_window=float(mem_dict.get("flood_window", 3.0)),
             flood_limit=int(mem_dict.get("flood_limit", 5)),
             action=flood_action,
+            mute_duration=int(mem_dict.get("flood_duration", 900)),
         )
         warn_action_raw = mem_dict.get("warn_action", "mute")
         try:
@@ -225,6 +237,7 @@ class ChatSettingsModel(BaseModel):
             reporting=reporting,
             clean_service_messages=mem_dict.get("clean_service_messages", True),
             block_bots=mem_dict.get("block_bots", False),
+            bot_action=mem_dict.get("bot_action", "ban"),
         )
 
 
