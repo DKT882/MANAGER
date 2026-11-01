@@ -80,6 +80,8 @@ class WarnSettings(BaseModel):
     warn_action: ViolationAction = Field(default=ViolationAction.MUTE, description="Ceiling enforcement action")
     warn_duration: int = Field(default=86400, ge=60, description="Penalty duration in seconds (e.g. 24h)")
     warn_decay_hours: int = Field(default=0, ge=0, description="Hours after which an unpunished warn expires (0 = no decay)")
+    warn_cancel_btn: bool = Field(default=True, description="Attach inline cancel button to warn notices")
+    custom_warn_msg: str = Field(default="", description="Custom template for warning notices configured via PM")
 
 
 class ReportingSettings(BaseModel):
@@ -170,6 +172,8 @@ class ChatSettingsModel(BaseModel):
             "warn_limit": self.warnings.warn_limit,
             "warn_action": self.warnings.warn_action.value if hasattr(self.warnings.warn_action, "value") else str(self.warnings.warn_action),
             "warn_duration": self.warnings.warn_duration,
+            "warn_cancel_btn": getattr(self.warnings, "warn_cancel_btn", True),
+            "custom_warn_msg": getattr(self.warnings, "custom_warn_msg", ""),
             "excepted_admins": list(self.reporting.excepted_admin_ids),
             "clean_service_messages": self.clean_service_messages,
             "block_bots": self.block_bots,
@@ -220,6 +224,8 @@ class ChatSettingsModel(BaseModel):
             warn_limit=int(mem_dict.get("warn_limit", 3)),
             warn_action=warn_action,
             warn_duration=int(mem_dict.get("warn_duration", 86400)),
+            warn_cancel_btn=bool(mem_dict.get("warn_cancel_btn", True)),
+            custom_warn_msg=str(mem_dict.get("custom_warn_msg", "")),
         )
         reporting = ReportingSettings(
             public_report_enabled=mem_dict.get("public_report_enabled", True),

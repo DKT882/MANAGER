@@ -204,6 +204,30 @@ class DatabaseService:
         except Exception as e:
             print(f"[DATABASE ERROR] Failed to reset warn: {e}")
 
+    @classmethod
+    def cancel_warn_background(cls, chat_id: int, user_id: int, new_count: int) -> None:
+        """Schedules warning decrement / cancellation in MongoDB."""
+        if not MongoDBManager.is_connected():
+            return
+        asyncio.create_task(cls._cancel_warn_worker(chat_id, user_id, new_count))
+
+    @staticmethod
+    async def _cancel_warn_worker(chat_id: int, user_id: int, new_count: int) -> None:
+        db = get_db()
+        if db is None:
+            return
+
+        try:
+            await db.user_warnings.update_one(
+                {"chat_id": chat_id, "user_id": user_id},
+                {
+                    "$set": {"warn_count": max(0, new_count), "updated_at": datetime.now(timezone.utc)},
+                    "$pop": {"incidents": 1}
+                }
+            )
+        except Exception as e:
+            print(f"[DATABASE ERROR] Failed to cancel warn: {e}")
+
     # --------------------------------------------------------------------------
     # 4. Moderation Audit Trail
     # --------------------------------------------------------------------------

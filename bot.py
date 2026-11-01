@@ -8,6 +8,7 @@ Features: In-memory Caching, Instant Wipe Trigger, Strict Parallel Native Admin 
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import re
 import sys
@@ -90,6 +91,8 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "warn_limit": 3,           # Ceiling before automated penalty (1 to 10)
     "warn_action": "mute",     # Automated ceiling action: 'mute', 'ban', 'kick'
     "warn_duration": 86400,    # Penalty duration in seconds (0 = permanent)
+    "warn_cancel_btn": True,   # Attach inline Cancel Warn button to warn notices
+    "custom_warn_msg": "",     # Custom warn notice template configured in private DM
     # Reporting exception settings
     "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
     # Service messages cleanup (auto delete user join / left notifications)
@@ -112,6 +115,9 @@ FLOOD_CACHE: Dict[int, Dict[int, deque]] = defaultdict(lambda: defaultdict(deque
 # Caches Telegram administrator custom rights for 60s to prevent roundtrip API lag
 ADMIN_CACHE: Dict[Tuple[int, int], Tuple[float, set, bool, bool]] = {}
 ADMIN_CACHE_TTL = 60.0  # seconds
+
+# PENDING_CUSTOM_WARN: admin_user_id -> chat_id being configured in private DM
+PENDING_CUSTOM_WARN: Dict[int, int] = {}
 
 # ==============================================================================
 # SYSTEM HEALTH & PERFORMANCE METRICS REGISTRY
@@ -372,6 +378,149 @@ async def resolve_target(
 
 
 # ==============================================================================
+# ANTI-SPAM WARNING NOTICE ENGINE & INLINE CANCEL DISPATCHER
+# ==============================================================================
+
+def format_warn_notice(
+    chat_id: int,
+    user: types.User,
+    reason: str,
+    count: int,
+    ceiling: int,
+    chat_title: str = "Group"
+) -> str:
+    """
+    Renders customizable warning notices with template replacement.
+    Supports user mentions, violation reason, counts, ceiling, and punishments.
+    """
+    s = CHAT_SETTINGS[chat_id]
+    custom_tpl = s.get("custom_warn_msg", "").strip()
+    action_str = s.get("warn_action", "mute").upper()
+    user_mention = f"<a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a>"
+    username_str = f"@{user.username}" if user.username else user.full_name
+
+    if custom_tpl:
+        res = custom_tpl
+        res = res.replace("{user}", user_mention)
+        res = res.replace("{user_id}", str(user.id))
+        res = res.replace("{username}", username_str)
+        res = res.replace("{reason}", html.escape(reason))
+        res = res.replace("{count}", str(count))
+        res = res.replace("{limit}", str(ceiling))
+        res = res.replace("{remaining}", str(max(0, ceiling - count)))
+        res = res.replace("{action}", action_str)
+        res = res.replace("{chat}", html.escape(chat_title))
+        return res
+
+    return (
+        f"⚠️ <b>ANTI-SPAM WARNING NOTICE</b>\n\n"
+        f"👤 <b>User:</b> {user_mention}\n"
+        f"📋 <b>Reason:</b> {html.escape(reason)}\n"
+        f"🔢 <b>Warnings:</b> <b>{count}/{ceiling}</b>\n"
+        f"⚖️ <b>Penalty on {ceiling} warns:</b> <code>{action_str}</code>"
+    )
+
+
+def generate_warn_notice_keyboard(chat_id: int, target_user_id: int) -> Optional[InlineKeyboardMarkup]:
+    """
+    Builds the inline Cancel Warn button if toggled ON in group settings.
+    If toggled OFF, returns None so no cancel button is shown on the warning notice.
+    """
+    s = CHAT_SETTINGS[chat_id]
+    if not s.get("warn_cancel_btn", True):
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Cancel Warn", callback_data=f"warn:cancel:{chat_id}:{target_user_id}")]
+    ])
+
+
+async def issue_warn_and_notify(
+    bot: Bot,
+    chat_id: int,
+    target_user: types.User,
+    admin_id: int,
+    reason: str,
+    reply_to_message_id: Optional[int] = None
+) -> None:
+    """
+    Issues a warning increment in memory and MongoDB, evaluates warning ceiling,
+    enforces automated penalty if reached, or sends customizable warning notice
+    with optional inline Cancel Warn button (cancellable by any administrator).
+    """
+    settings = CHAT_SETTINGS[chat_id]
+    ceiling = settings.get("warn_limit", 3)
+
+    WARN_CACHE[chat_id][target_user.id] += 1
+    current_warns = WARN_CACHE[chat_id][target_user.id]
+
+    DatabaseService.record_warn_background(chat_id, target_user.id, admin_id, reason, current_warns)
+    DatabaseService.log_moderation_background(chat_id, admin_id, target_user.id, "warn", reason)
+
+    try:
+        c_info = await bot.get_chat(chat_id)
+        chat_title = c_info.title or f"Group {chat_id}"
+    except Exception:
+        chat_title = "Group"
+
+    if current_warns >= ceiling:
+        WARN_CACHE[chat_id].pop(target_user.id, None)
+        if not WARN_CACHE[chat_id]:
+            WARN_CACHE.pop(chat_id, None)
+
+        action = settings.get("warn_action", "mute")
+        duration = settings.get("warn_duration", 86400)
+        until_ts = int(time.time() + duration) if duration > 0 else None
+
+        try:
+            if action == "mute":
+                await bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target_user.id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_media_messages=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False,
+                    ),
+                    until_date=until_ts
+                )
+            elif action == "kick":
+                await bot.ban_chat_member(chat_id=chat_id, user_id=target_user.id)
+                await bot.unban_chat_member(chat_id=chat_id, user_id=target_user.id)
+            elif action == "ban":
+                await bot.ban_chat_member(chat_id=chat_id, user_id=target_user.id, until_date=until_ts)
+        except Exception as e:
+            print(f"[PUNISHMENT NOTICE] Action {action} notice: {e}")
+
+        dur_text = format_duration(duration)
+        user_mention = f"<a href='tg://user?id={target_user.id}'>{html.escape(target_user.full_name)}</a>"
+        penalty_msg = (
+            f"🚨 <b>WARNING CEILING REACHED!</b>\n\n"
+            f"👤 <b>User:</b> {user_mention}\n"
+            f"⛔ <b>Punishment:</b> <code>{action.upper()}</code> ({dur_text})\n"
+            f"📋 <b>Reason:</b> Accumulated {ceiling} warnings ({html.escape(reason)})."
+        )
+        try:
+            await bot.send_message(chat_id=chat_id, text=penalty_msg, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    notice_text = format_warn_notice(chat_id, target_user, reason, current_warns, ceiling, chat_title)
+    kb = generate_warn_notice_keyboard(chat_id, target_user.id)
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=notice_text,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        print(f"[WARN NOTICE] Failed to send warn notice: {e}")
+
+
+# ==============================================================================
 # ANTI-FLOOD MIDDLEWARE (ASYNCHRONOUS WINDOWED SPAM ENGINE)
 # ==============================================================================
 
@@ -437,7 +586,9 @@ class AntiFloodMiddleware(BaseMiddleware):
             action = settings.get("flood_action", "mute")
             flood_dur = settings.get("flood_duration", 900)
             try:
-                if action == "mute":
+                if action == "warn":
+                    await issue_warn_and_notify(bot, chat_id, user, bot.id, f"Spam Flood ({limit} msgs in {int(window)}s)")
+                elif action == "mute":
                     until_ts = int(time.time() + flood_dur) if flood_dur > 0 else 0
                     await bot.restrict_chat_member(
                         chat_id=chat_id,
@@ -567,8 +718,7 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
             METRICS["violations_handled"] += 1
             await wipe_trigger(message)
             if settings.get("media_action") == "warn":
-                WARN_CACHE[chat_id][user.id] += 1
-                DatabaseService.record_warn_background(chat_id, user.id, bot.id, "Sent blocked media", WARN_CACHE[chat_id][user.id])
+                await issue_warn_and_notify(bot, chat_id, user, bot.id, "Sent blocked media")
             return
 
     # 2. Link Interceptions
@@ -593,8 +743,7 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
             METRICS["chat_links_caught"] += 1
             await wipe_trigger(message)
             if settings.get("link_action") == "warn":
-                WARN_CACHE[chat_id][user.id] += 1
-                DatabaseService.record_warn_background(chat_id, user.id, bot.id, "Sent blocked link", WARN_CACHE[chat_id][user.id])
+                await issue_warn_and_notify(bot, chat_id, user, bot.id, "Sent blocked link")
             return
 
         # Check strict admin link block
@@ -996,47 +1145,14 @@ async def handle_warn(message: Message, command: CommandObject, bot: Bot) -> Non
     if await check_admin_rights(bot, message.chat.id, target_id):
         return
 
-    chat_id = message.chat.id
-    settings = CHAT_SETTINGS[chat_id]
-    ceiling = settings.get("warn_limit", 3)
+    target_user = None
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == target_id:
+        target_user = message.reply_to_message.from_user
+    else:
+        target_user = types.User(id=target_id, is_bot=False, first_name=target_name or f"User {target_id}")
 
-    # Fast in-memory counter increment
-    WARN_CACHE[chat_id][target_id] += 1
-    current_warns = WARN_CACHE[chat_id][target_id]
-
-    # Background write-behind warn record and audit log
-    DatabaseService.record_warn_background(chat_id, target_id, user_id, remaining_args or "Warning issued", current_warns)
-    DatabaseService.log_moderation_background(chat_id, user_id, target_id, "warn", remaining_args)
-
-    if current_warns >= ceiling:
-        # Automated enforcement threshold reached
-        WARN_CACHE[chat_id].pop(target_id, None)  # Reset counter immediately without memory overhead
-        if not WARN_CACHE[chat_id]:
-            WARN_CACHE.pop(chat_id, None)
-        action = settings.get("warn_action", "mute")
-        duration = settings.get("warn_duration", 86400)
-        until_ts = int(time.time() + duration) if duration > 0 else None
-
-        try:
-            if action == "mute":
-                await bot.restrict_chat_member(
-                    chat_id=chat_id,
-                    user_id=target_id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False,
-                        can_send_media_messages=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False,
-                    ),
-                    until_date=until_ts
-                )
-            elif action == "kick":
-                await bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
-                await bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
-            elif action == "ban":
-                await bot.ban_chat_member(chat_id=chat_id, user_id=target_id, until_date=until_ts)
-        except Exception:
-            pass
+    reason = remaining_args or "Rule violation"
+    await issue_warn_and_notify(bot, message.chat.id, target_user, user_id, reason)
 
 
 @router.message(Command("resetwarn"))
@@ -1156,7 +1272,10 @@ def generate_warn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardM
     w_limit = s.get("warn_limit", 3)
     w_action = s.get("warn_action", "mute").upper()
     w_dur = format_duration(s.get("warn_duration", 86400))
-    return InlineKeyboardMarkup(inline_keyboard=[
+    cancel_on = s.get("warn_cancel_btn", True)
+    custom_msg = s.get("custom_warn_msg", "").strip()
+
+    buttons = [
         [
             InlineKeyboardButton(text="➖ Decrease", callback_data=f"set:warn_dec:{chat_id}"),
             InlineKeyboardButton(text=f"⚠️ Ceiling: {w_limit} Warns", callback_data=f"set:warn_cycle:{chat_id}"),
@@ -1169,22 +1288,86 @@ def generate_warn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardM
             InlineKeyboardButton(text=f"⏱️ Duration: {w_dur}", callback_data=f"set:warn_dur:{chat_id}")
         ],
         [
-            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
-        ]
+            InlineKeyboardButton(
+                text=f"❌ Cancel Button: {'✅ ON' if cancel_on else '❌ OFF'}",
+                callback_data=f"set:warn_toggle_cancel:{chat_id}"
+            )
+        ],
+    ]
+
+    if is_dm:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✏️ Custom Msg: {'Customized' if custom_msg else 'Default'}",
+                callback_data=f"set:warn_custom_msg:{chat_id}"
+            )
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton(
+                text="✏️ Setup Custom Msg in DM ↗️",
+                url=f"https://t.me/{BOT_IDENTITY.get('username', 'personal_guardBot')}?start=custom_warn_{abs(chat_id)}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
     ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def format_warn_text(chat_title: str, s: Dict[str, Any]) -> str:
     w_limit = s.get("warn_limit", 3)
     w_action = s.get("warn_action", "mute").upper()
     w_dur = format_duration(s.get("warn_duration", 86400))
+    cancel_on = s.get("warn_cancel_btn", True)
+    custom_msg = s.get("custom_warn_msg", "").strip()
+    status_custom = "Custom Template Active" if custom_msg else "Default Template"
     return (
-        f"⚠️ <b>WARN CEILING & PUNISHMENT CONFIGURATION</b>\n"
+        f"⚠️ <b>WARN CEILING & ANTI-SPAM NOTICE CONFIGURATION</b>\n"
         f"Group: <code>{chat_title}</code>\n\n"
         f"• <b>Violation Ceiling:</b> <code>{w_limit} warnings</code>\n"
         f"• <b>Punishment Action:</b> <code>{w_action}</code> (MUTE / BAN / KICK)\n"
-        f"• <b>Penalty Duration:</b> <code>{w_dur}</code> (1h, 6h, 12h, 24h, 7d, Permanent)\n\n"
-        f"<i>Tap the buttons below to customize thresholds and penalties:</i>"
+        f"• <b>Penalty Duration:</b> <code>{w_dur}</code>\n"
+        f"• <b>Inline Cancel Button:</b> {'<code>ENABLED</code>' if cancel_on else '<i>DISABLED</i>'}\n"
+        f"• <b>Warn Notice Template:</b> <code>{status_custom}</code>\n\n"
+        f"<i>Tap the buttons below to customize thresholds, toggle the cancel button, or configure custom messages in DM:</i>"
+    )
+
+
+def generate_warn_custom_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Reset to Default Template", callback_data=f"set:warn_custom_reset:{chat_id}")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Back to Warn Settings", callback_data=f"set:menu:warn:{chat_id}")
+        ]
+    ])
+
+
+def format_warn_custom_text(chat_title: str, s: Dict[str, Any]) -> str:
+    custom_msg = s.get("custom_warn_msg", "").strip()
+    template_display = f"<code>{html.escape(custom_msg)}</code>" if custom_msg else "<i>Default standard template is active</i>"
+
+    return (
+        f"📝 <b>CUSTOM WARN MESSAGE CONFIGURATION</b>\n"
+        f"Group: <code>{chat_title}</code>\n\n"
+        f"<b>Current Active Template:</b>\n"
+        f"{template_display}\n\n"
+        f"<b>Available Formatting Placeholders:</b>\n"
+        f"• <code>{{user}}</code> - User clickable mention\n"
+        f"• <code>{{user_id}}</code> - Target user's numerical ID\n"
+        f"• <code>{{username}}</code> - Target username or name\n"
+        f"• <code>{{reason}}</code> - Violation reason (e.g. Blocked Link)\n"
+        f"• <code>{{count}}</code> - Current warning count\n"
+        f"• <code>{{limit}}</code> - Max warning ceiling\n"
+        f"• <code>{{remaining}}</code> - Warnings left until punishment\n"
+        f"• <code>{{action}}</code> - Punishment action (MUTE/BAN/KICK)\n"
+        f"• <code>{{chat}}</code> - Group title\n\n"
+        f"👉 <b>To set a new custom message:</b> Type and send your desired custom message right here in this private chat!\n"
+        f"<i>HTML tags (&lt;b&gt;, &lt;i&gt;, &lt;code&gt;) are fully supported.</i>"
     )
 
 
@@ -1532,6 +1715,27 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 target_cid = int(arg)
             except ValueError:
                 pass
+        elif arg.startswith("custom_warn_"):
+            try:
+                raw_id = arg.replace("custom_warn_", "")
+                target_cid = -int(raw_id) if not raw_id.startswith("-") else int(raw_id)
+            except ValueError:
+                target_cid = None
+
+            if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
+                PENDING_CUSTOM_WARN[user_id] = target_cid
+                try:
+                    c_info = await bot.get_chat(target_cid)
+                    title = c_info.title or f"Group {target_cid}"
+                except Exception:
+                    title = f"Group {target_cid}"
+                text = format_warn_custom_text(title, CHAT_SETTINGS[target_cid])
+                kb = generate_warn_custom_keyboard(target_cid)
+                try:
+                    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+                    return
+                except Exception:
+                    pass
 
         if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
             s = CHAT_SETTINGS[target_cid]
@@ -1877,6 +2081,32 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         idx = durations.index(cur) if cur in durations else 3
         s["warn_duration"] = durations[(idx + 1) % len(durations)]
         await query.answer(f"Warn Duration: {format_duration(s['warn_duration'])}")
+    elif action == "warn_toggle_cancel":
+        s["warn_cancel_btn"] = not s.get("warn_cancel_btn", True)
+        status_str = "ENABLED" if s["warn_cancel_btn"] else "DISABLED"
+        await query.answer(f"Cancel Warn Button: {status_str}")
+    elif action == "warn_custom_msg":
+        PENDING_CUSTOM_WARN[user_id] = chat_id
+        text = format_warn_custom_text(chat_title, s)
+        kb = generate_warn_custom_keyboard(chat_id)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer()
+        return
+    elif action == "warn_custom_reset":
+        s["custom_warn_msg"] = ""
+        PENDING_CUSTOM_WARN.pop(user_id, None)
+        text = format_warn_custom_text(chat_title, s)
+        kb = generate_warn_custom_keyboard(chat_id)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer("Custom warning template reset to default.")
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        return
 
     # 4. Anti-Flood Tuning & Punishment Mutations
     elif action == "flood_toggle":
@@ -2012,6 +2242,142 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
+
+# ==============================================================================
+# CANCEL WARN INLINE CALLBACK HANDLER (ANY ADMIN VALIDATION)
+# ==============================================================================
+
+@router.callback_query(F.data.startswith("warn:cancel:"))
+async def handle_cancel_warn_callback(query: CallbackQuery, bot: Bot) -> None:
+    """
+    Handles Cancel Warn inline button clicks on warning notices.
+    Strictly verifies admin status (any group admin or anonymous admin can cancel).
+    Decrements user warning count in memory & DB, and edits notice into a clean confirmation.
+    """
+    parts = query.data.split(":")
+    if len(parts) < 4:
+        await query.answer()
+        return
+
+    try:
+        chat_id = int(parts[2])
+        target_id = int(parts[3])
+    except ValueError:
+        await query.answer()
+        return
+
+    admin_user = query.from_user
+    sender_chat_id = query.message.sender_chat.id if query.message and query.message.sender_chat else None
+
+    # Verification: Any chat administrator or anonymous group admin can cancel warnings
+    is_admin = await check_admin_rights(bot, chat_id, admin_user.id)
+    if not is_admin and sender_chat_id and sender_chat_id == chat_id:
+        is_admin = True
+
+    if not is_admin:
+        await query.answer("⚠️ Only chat administrators can cancel warnings!", show_alert=True)
+        return
+
+    current_count = WARN_CACHE[chat_id].get(target_id, 0)
+    new_count = max(0, current_count - 1)
+    if new_count <= 0:
+        WARN_CACHE[chat_id].pop(target_id, None)
+        if not WARN_CACHE[chat_id]:
+            WARN_CACHE.pop(chat_id, None)
+    else:
+        WARN_CACHE[chat_id][target_id] = new_count
+
+    DatabaseService.cancel_warn_background(chat_id, target_id, new_count)
+    DatabaseService.log_moderation_background(chat_id, admin_user.id, target_id, "cancel_warn", "Warning cancelled by admin")
+
+    ceiling = CHAT_SETTINGS[chat_id].get("warn_limit", 3)
+    admin_name = html.escape(admin_user.full_name)
+    admin_mention = f"<a href='tg://user?id={admin_user.id}'>{admin_name}</a>"
+
+    confirmation_text = (
+        f"✅ <b>Warning Cancelled</b>\n\n"
+        f"🛡️ <b>Admin:</b> {admin_mention}\n"
+        f"👤 <b>Target ID:</b> <code>{target_id}</code>\n"
+        f"🔢 <b>Current Warnings:</b> <b>{new_count}/{ceiling}</b>\n"
+        f"<i>The warning has been officially forgiven and cleared.</i>"
+    )
+
+    try:
+        await query.message.edit_text(confirmation_text, reply_markup=None, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+    await query.answer(f"Warning cancelled! Current warnings: {new_count}/{ceiling}")
+
+
+# ==============================================================================
+# PRIVATE DM CUSTOM WARN MESSAGE LISTENER & CANCEL ENGINE
+# ==============================================================================
+
+@router.message(Command("cancel"), F.chat.type == ChatType.PRIVATE)
+async def handle_dm_cancel_input(message: Message) -> None:
+    """Cancels active custom warning message editing in private DM."""
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id in PENDING_CUSTOM_WARN:
+        chat_id = PENDING_CUSTOM_WARN.pop(user_id)
+        await message.answer(
+            "❌ Custom warning message configuration cancelled.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Return to Warn Settings", callback_data=f"set:menu:warn:{chat_id}")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+            ])
+        )
+
+
+@router.message(F.chat.type == ChatType.PRIVATE, ~F.text.startswith("/"))
+async def handle_dm_custom_warn_text(message: Message, bot: Bot) -> None:
+    """
+    Listens for custom warning message template input sent by an authorized admin in private DM.
+    Saves the template to chat settings and MongoDB and shows a live preview.
+    """
+    user_id = message.from_user.id if message.from_user else 0
+    if user_id not in PENDING_CUSTOM_WARN:
+        return
+
+    chat_id = PENDING_CUSTOM_WARN.pop(user_id)
+    if not await check_can_setup_bot(bot, chat_id, user_id):
+        await message.answer("❌ You are no longer authorized to manage settings for this group.")
+        return
+
+    custom_text = message.text.strip()
+    if len(custom_text) > 1000:
+        PENDING_CUSTOM_WARN[user_id] = chat_id
+        await message.answer("❌ Message template too long (maximum 1000 characters). Please send a shorter template.")
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+    s["custom_warn_msg"] = custom_text
+
+    try:
+        c_info = await bot.get_chat(chat_id)
+        chat_title = c_info.title or f"Group {chat_id}"
+    except Exception:
+        chat_title = f"Group {chat_id}"
+
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+
+    preview = format_warn_notice(chat_id, message.from_user, "Blocked Link Violation", count=1, ceiling=int(s.get("warn_limit", 3)), chat_title=chat_title)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Return to Warn Settings", callback_data=f"set:menu:warn:{chat_id}")],
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+    ])
+
+    await message.answer(
+        f"✅ <b>Custom Warning Message Saved!</b>\n\n"
+        f"<b>Group:</b> <code>{chat_title}</code>\n\n"
+        f"<b>Live Notice Preview:</b>\n\n"
+        f"{preview}\n\n"
+        f"<i>This custom message will now be used for all warning notices in {chat_title}.</i>",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML
+    )
 
 
 @router.message(Command("help"))
@@ -2859,12 +3225,14 @@ async def resource_optimizer_worker() -> None:
                 # Tier 2 Emergency Relief (>250MB): Shed flood and warn memory
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
+                PENDING_CUSTOM_WARN.clear()
 
             if rss_mb > 400.0:
                 # Tier 3 Critical Circuit Breaker (>400MB): Complete heap shed before Render's 512MB OOM
                 ADMIN_CACHE.clear()
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
+                PENDING_CUSTOM_WARN.clear()
                 print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
 
             # Trigger Python garbage collection
