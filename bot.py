@@ -2123,18 +2123,14 @@ async def resource_optimizer_worker() -> None:
 
 async def start_render_health_server() -> Optional[web.AppRunner]:
     """
-    Starts an ultra-lightweight HTTP micro-server on $PORT if specified by Render.
-    Allows deploying seamlessly as a Render Web Service without deployment timeout failures,
-    and supports free-tier uptime monitoring to prevent sleep.
+    Starts an ultra-lightweight HTTP micro-server on $PORT (default 10000).
+    Provides dedicated /health and / routes for Render health checks and uptime monitoring.
     """
-    port_str = os.getenv("PORT")
-    if not port_str:
-        return None
-
+    port_str = os.getenv("PORT", "10000").strip()
     try:
         port = int(port_str)
     except ValueError:
-        return None
+        port = 10000
 
     app = web.Application()
 
@@ -2147,15 +2143,20 @@ async def start_render_health_server() -> Optional[web.AppRunner]:
             "ram_tier": "Render Hobby/Free (Target: <50MB RAM, <5GB Outbound)"
         })
 
-    app.router.add_get("/", health_handler)
+    # Health check routes for Render Web Service
     app.router.add_get("/health", health_handler)
+    app.router.add_get("/", health_handler)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"[RENDER] Health micro-server listening on 0.0.0.0:{port}")
-    return runner
+    try:
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"[RENDER] Health check route /health active on 0.0.0.0:{port}")
+        return runner
+    except Exception as e:
+        print(f"[RENDER WARNING] Could not bind health server to port {port}: {e}")
+        return None
 
 
 # ==============================================================================
