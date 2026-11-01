@@ -119,6 +119,13 @@ ADMIN_CACHE_TTL = 60.0  # seconds
 # PENDING_CUSTOM_WARN: admin_user_id -> chat_id being configured in private DM
 PENDING_CUSTOM_WARN: Dict[int, int] = {}
 
+# CHAT_TITLES: chat_id -> cached group title (eliminates redundant getChat roundtrips)
+CHAT_TITLES: Dict[int, str] = {}
+
+# Pre-compiled high-performance regex patterns
+RE_DURATION = re.compile(r"^(\d+)([smhdw]?)$")
+RE_LINK = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
+
 # ==============================================================================
 # SYSTEM HEALTH & PERFORMANCE METRICS REGISTRY
 # ==============================================================================
@@ -163,6 +170,26 @@ def format_duration(seconds: int) -> str:
 # ==============================================================================
 # INSTANT WIPE & PARALLEL NATIVE ADMIN RIGHTS ENGINE
 # ==============================================================================
+
+async def get_cached_chat_title(bot: Bot, chat_id: int, fallback: Optional[str] = None) -> str:
+    """
+    Returns group title from zero-latency memory cache.
+    Eliminates redundant Telegram API roundtrips (100-300ms network latency per call)
+    and slashes outbound bandwidth on Render.
+    """
+    if chat_id in CHAT_TITLES:
+        return CHAT_TITLES[chat_id]
+    if fallback and fallback != f"Group {chat_id}":
+        CHAT_TITLES[chat_id] = fallback
+        return fallback
+    try:
+        c_info = await bot.get_chat(chat_id)
+        title = c_info.title or f"Group {chat_id}"
+        CHAT_TITLES[chat_id] = title
+        return title
+    except Exception:
+        return fallback or f"Group {chat_id}"
+
 
 async def wipe_trigger(message: Message) -> None:
     """
@@ -325,7 +352,7 @@ def parse_time_duration(duration_str: Optional[str]) -> Tuple[int, str]:
     if not duration_str:
         return 0, "indefinitely"
 
-    match = re.match(r"^(\d+)([smhdw]?)$", duration_str.strip().lower())
+    match = RE_DURATION.match(duration_str.strip().lower())
     if not match:
         return 0, "indefinitely"
 
@@ -415,6 +442,7 @@ def format_warn_notice(
     return (
         f"⚠️ <b>ANTI-SPAM WARNING NOTICE</b>\n\n"
         f"👤 <b>User:</b> {user_mention}\n"
+        f"🏷️ <b>Group:</b> <code>{html.escape(chat_title)}</code>\n"
         f"📋 <b>Reason:</b> {html.escape(reason)}\n"
         f"🔢 <b>Warnings:</b> <b>{count}/{ceiling}</b>\n"
         f"⚖️ <b>Penalty on {ceiling} warns:</b> <code>{action_str}</code>"
@@ -456,11 +484,7 @@ async def issue_warn_and_notify(
     DatabaseService.record_warn_background(chat_id, target_user.id, admin_id, reason, current_warns)
     DatabaseService.log_moderation_background(chat_id, admin_id, target_user.id, "warn", reason)
 
-    try:
-        c_info = await bot.get_chat(chat_id)
-        chat_title = c_info.title or f"Group {chat_id}"
-    except Exception:
-        chat_title = "Group"
+    chat_title = await get_cached_chat_title(bot, chat_id, fallback="Group")
 
     if current_warns >= ceiling:
         WARN_CACHE[chat_id].pop(target_user.id, None)
@@ -636,6 +660,8 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
        service notifications instantly when clean_service_messages is enabled.
     """
     chat_id = message.chat.id
+    if message.chat and message.chat.title:
+        CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
 
     # 1. Anti-Bot Auto-Ban / Auto-Kick: Instantly penalize newly added bot
@@ -693,6 +719,8 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
         return
 
     chat_id = message.chat.id
+    if message.chat and message.chat.title:
+        CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
     is_admin = await check_admin_rights(bot, chat_id, user.id)
 
@@ -733,7 +761,7 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
                 is_channel_link = True
 
     if not has_link and message.text:
-        if re.search(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+)", message.text, re.IGNORECASE):
+        if RE_LINK.search(message.text):
             has_link = True
 
     if has_link or (is_channel_link and settings.get("block_channel_links")):
@@ -1724,11 +1752,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
 
             if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
                 PENDING_CUSTOM_WARN[user_id] = target_cid
-                try:
-                    c_info = await bot.get_chat(target_cid)
-                    title = c_info.title or f"Group {target_cid}"
-                except Exception:
-                    title = f"Group {target_cid}"
+                title = await get_cached_chat_title(bot, target_cid)
                 text = format_warn_custom_text(title, CHAT_SETTINGS[target_cid])
                 kb = generate_warn_custom_keyboard(target_cid)
                 try:
@@ -1739,12 +1763,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
 
         if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
             s = CHAT_SETTINGS[target_cid]
-            try:
-                c_info = await bot.get_chat(target_cid)
-                title = c_info.title or f"Group {target_cid}"
-            except Exception:
-                title = f"Group {target_cid}"
-
+            title = await get_cached_chat_title(bot, target_cid)
             text = format_settings_text(title, s)
             try:
                 await message.answer(
@@ -1807,11 +1826,8 @@ async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
     authorized_chats = []
     for cid in list(CHAT_SETTINGS.keys()):
         if cid < 0 and await check_can_setup_bot(bot, cid, user_id):
-            try:
-                c = await bot.get_chat(cid)
-                authorized_chats.append((cid, c.title or f"Group {cid}"))
-            except Exception:
-                authorized_chats.append((cid, f"Group {cid}"))
+            title = await get_cached_chat_title(bot, cid)
+            authorized_chats.append((cid, title))
 
     if authorized_chats:
         group_buttons = [
@@ -1873,12 +1889,7 @@ async def handle_dm_select_group(query: CallbackQuery, bot: Bot) -> None:
         return
 
     s = CHAT_SETTINGS[chat_id]
-    try:
-        c = await bot.get_chat(chat_id)
-        chat_title = c.title or f"Group {chat_id}"
-    except Exception:
-        chat_title = f"Group {chat_id}"
-
+    chat_title = await get_cached_chat_title(bot, chat_id)
     text = format_settings_text(chat_title, s)
     try:
         await query.message.edit_text(
@@ -2003,12 +2014,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
 
     s = CHAT_SETTINGS[chat_id]
     is_dm = query.message.chat.type == ChatType.PRIVATE if query.message else False
-
-    try:
-        c_info = await bot.get_chat(chat_id)
-        chat_title = c_info.title or f"Group {chat_id}"
-    except Exception:
-        chat_title = f"Group {chat_id}"
+    chat_title = await get_cached_chat_title(bot, chat_id)
 
     # 1. Close Menu Action
     if action == "close":
@@ -2353,12 +2359,7 @@ async def handle_dm_custom_warn_text(message: Message, bot: Bot) -> None:
 
     s = CHAT_SETTINGS[chat_id]
     s["custom_warn_msg"] = custom_text
-
-    try:
-        c_info = await bot.get_chat(chat_id)
-        chat_title = c_info.title or f"Group {chat_id}"
-    except Exception:
-        chat_title = f"Group {chat_id}"
+    chat_title = await get_cached_chat_title(bot, chat_id)
 
     DatabaseService.save_settings_background(chat_id, chat_title, s)
 
@@ -2873,6 +2874,8 @@ async def handle_add_except_admin(message: Message, command: CommandObject, bot:
         return
 
     chat_id = message.chat.id
+    if message.chat and message.chat.title:
+        CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
     current_excepted = set(settings.get("excepted_admins", []))
     current_excepted.add(target_id)
@@ -2906,6 +2909,8 @@ async def handle_rem_except_admin(message: Message, command: CommandObject, bot:
         return
 
     chat_id = message.chat.id
+    if message.chat and message.chat.title:
+        CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
     current_excepted = set(settings.get("excepted_admins", []))
     current_excepted.discard(target_id)
@@ -2935,6 +2940,8 @@ async def handle_list_excepted_admins(message: Message, bot: Bot) -> None:
         return
 
     chat_id = message.chat.id
+    if message.chat and message.chat.title:
+        CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
     excepted_ids = settings.get("excepted_admins", [])
 
@@ -3226,6 +3233,7 @@ async def resource_optimizer_worker() -> None:
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
+                CHAT_TITLES.clear()
 
             if rss_mb > 400.0:
                 # Tier 3 Critical Circuit Breaker (>400MB): Complete heap shed before Render's 512MB OOM
@@ -3233,6 +3241,7 @@ async def resource_optimizer_worker() -> None:
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
+                CHAT_TITLES.clear()
                 print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
 
             # Trigger Python garbage collection
@@ -3382,7 +3391,7 @@ async def main() -> None:
     # Connect to MongoDB & hydrate in-memory caches
     await MongoDBManager.connect()
     if MongoDBManager.is_connected():
-        await DatabaseService.hydrate_settings_cache(CHAT_SETTINGS)
+        await DatabaseService.hydrate_settings_cache(CHAT_SETTINGS, CHAT_TITLES)
         await DatabaseService.hydrate_warn_cache(WARN_CACHE)
 
     # Register admin-only command catalog with Telegram API

@@ -29,7 +29,10 @@ class DatabaseService:
     # 1. Cache Hydration (Bot Startup)
     # --------------------------------------------------------------------------
     @staticmethod
-    async def hydrate_settings_cache(cache_dict: Dict[int, Dict[str, Any]]) -> int:
+    async def hydrate_settings_cache(
+        cache_dict: Dict[int, Dict[str, Any]],
+        chat_titles_dict: Optional[Dict[int, str]] = None
+    ) -> int:
         """
         Loads all group configurations from MongoDB into the bot's runtime memory cache.
         Guarantees 0ms read operations for incoming Telegram events.
@@ -52,6 +55,8 @@ class DatabaseService:
                 try:
                     model = ChatSettingsModel.model_validate(migrated_doc)
                     cache_dict[chat_id] = model.to_in_memory_dict()
+                    if chat_titles_dict is not None and doc.get("chat_title"):
+                        chat_titles_dict[chat_id] = str(doc["chat_title"])
                     count += 1
                 except Exception as parse_err:
                     print(f"[DATABASE] Error parsing settings for chat {chat_id}: {parse_err}")
