@@ -105,6 +105,34 @@ ADMIN_CACHE: Dict[Tuple[int, int], Tuple[float, set, bool, bool]] = {}
 ADMIN_CACHE_TTL = 60.0  # seconds
 
 # ==============================================================================
+# SYSTEM HEALTH & PERFORMANCE METRICS REGISTRY
+# ==============================================================================
+BOT_START_TIME: float = time.time()
+BOT_IDENTITY: Dict[str, Any] = {
+    "status": "ONLINE",
+    "username": "personal_guardBot",
+    "id": 9224266782,
+}
+METRICS: Dict[str, Any] = {
+    "violations_handled": 0,
+    "connected_channels_caught": 0,
+    "bio_links_caught": 0,
+    "chat_links_caught": 0,
+    "cached_user_bios": 0,
+    "last_heartbeat": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"),
+}
+
+
+def format_uptime(total_seconds: int) -> str:
+    """Formats seconds into human-readable uptime string matching production monitor."""
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m {secs}s"
+    return f"{hours}h {minutes}m {secs}s"
+
+# ==============================================================================
 # INSTANT WIPE & PARALLEL NATIVE ADMIN RIGHTS ENGINE
 # ==============================================================================
 
@@ -372,6 +400,7 @@ class AntiFloodMiddleware(BaseMiddleware):
         # Flood threshold exceeded
         if len(user_deque) > limit:
             user_deque.clear()  # Reset after violation trigger
+            METRICS["violations_handled"] += 1
 
             # 1. Instant wipe of violating flood message
             try:
@@ -436,6 +465,8 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
             if member.is_bot and member.id != bot_id:
                 try:
                     await bot.ban_chat_member(chat_id=chat_id, user_id=member.id)
+                    METRICS["violations_handled"] += 1
+                    METRICS["connected_channels_caught"] += 1
                     DatabaseService.log_moderation_background(
                         chat_id=chat_id,
                         admin_id=bot_id,
@@ -483,22 +514,27 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
     # 1. Media Type Interceptions
     if not is_admin:
         if settings.get("block_sticker") and message.sticker:
+            METRICS["violations_handled"] += 1
             await wipe_trigger(message)
             return
 
         if settings.get("block_animation") and message.animation:
+            METRICS["violations_handled"] += 1
             await wipe_trigger(message)
             return
 
         if settings.get("block_document") and message.document:
+            METRICS["violations_handled"] += 1
             await wipe_trigger(message)
             return
 
         if settings.get("block_audio") and message.audio:
+            METRICS["violations_handled"] += 1
             await wipe_trigger(message)
             return
 
         if settings.get("block_voice") and message.voice:
+            METRICS["violations_handled"] += 1
             await wipe_trigger(message)
             return
 
@@ -517,11 +553,15 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
     if has_link:
         # Check non-admin link block
         if not is_admin and settings.get("block_links"):
+            METRICS["violations_handled"] += 1
+            METRICS["chat_links_caught"] += 1
             await wipe_trigger(message)
             return
 
         # Check strict admin link block
         if is_admin and settings.get("admin_links_block"):
+            METRICS["violations_handled"] += 1
+            METRICS["chat_links_caught"] += 1
             await wipe_trigger(message)
             return
 
@@ -2115,6 +2155,9 @@ async def resource_optimizer_worker() -> None:
             # 5. Trigger Python garbage collection
             gc.collect()
 
+            # 6. Update internal heartbeat timestamp
+            METRICS["last_heartbeat"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
         except asyncio.CancelledError:
             break
         except Exception:
@@ -2124,7 +2167,8 @@ async def resource_optimizer_worker() -> None:
 async def start_render_health_server() -> Optional[web.AppRunner]:
     """
     Starts an ultra-lightweight HTTP micro-server on $PORT (default 10000).
-    Provides dedicated /health and / routes for Render health checks and uptime monitoring.
+    Provides dedicated /health and / routes for Render health checks and uptime monitoring
+    matching the standard production JSON health schema.
     """
     port_str = os.getenv("PORT", "10000").strip()
     try:
@@ -2135,13 +2179,40 @@ async def start_render_health_server() -> Optional[web.AppRunner]:
     app = web.Application()
 
     async def health_handler(request: web.Request) -> web.Response:
-        return web.json_response({
-            "status": "healthy",
-            "bot": "MANAGER",
-            "engine": LOOP_ENGINE,
-            "connected_chats": len(CHAT_SETTINGS),
-            "ram_tier": "Render Hobby/Free (Target: <50MB RAM, <5GB Outbound)"
-        })
+        uptime_sec = int(time.time() - BOT_START_TIME)
+        is_connected = MongoDBManager.is_connected()
+        METRICS["last_heartbeat"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+        response_payload = {
+            "status": "UP",
+            "service": os.getenv("SERVICE_NAME", "BioLinkChannelRestrictorBot"),
+            "telegram_bot": {
+                "status": BOT_IDENTITY.get("status", "ONLINE"),
+                "username": BOT_IDENTITY.get("username", "personal_guardBot"),
+                "id": BOT_IDENTITY.get("id", 9224266782),
+            },
+            "database": {
+                "type": "MongoDB Atlas" if is_connected else "In-Memory RAM Cache",
+                "connected": is_connected,
+                "metrics": {
+                    "connected": is_connected,
+                    "violations_handled": METRICS["violations_handled"],
+                    "connected_channels_caught": METRICS["connected_channels_caught"],
+                    "bio_links_caught": METRICS["bio_links_caught"],
+                    "chat_links_caught": METRICS["chat_links_caught"],
+                    "last_heartbeat": METRICS["last_heartbeat"],
+                },
+            },
+            "stats": {
+                "active_groups": len([cid for cid in CHAT_SETTINGS.keys() if cid < 0]),
+                "cached_admins_chats": len({k[0] for k in ADMIN_CACHE.keys()}),
+                "cached_user_bios": METRICS.get("cached_user_bios", 0),
+            },
+            "uptime": format_uptime(uptime_sec),
+            "uptime_seconds": uptime_sec,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+        return web.json_response(response_payload)
 
     # Health check routes for Render Web Service
     app.router.add_get("/health", health_handler)
@@ -2183,6 +2254,21 @@ async def main() -> None:
     session = AiohttpSession(limit=10)
     bot = Bot(token=token.strip(), session=session)
     dp = Dispatcher()
+
+    # Dynamic bot identity resolution for health metrics
+    try:
+        if ":" in token:
+            BOT_IDENTITY["id"] = int(token.split(":")[0])
+    except Exception:
+        pass
+
+    try:
+        me = await bot.get_me()
+        BOT_IDENTITY["username"] = me.username or "personal_guardBot"
+        BOT_IDENTITY["id"] = me.id
+        BOT_IDENTITY["status"] = "ONLINE"
+    except Exception as e:
+        print(f"[BOT] Profile resolution notice: {e}")
 
     # Register high-speed Anti-Flood Middleware
     dp.message.middleware(AntiFloodMiddleware())

@@ -20,6 +20,8 @@ services:
         value: telegram_admin_bot
       - key: PORT
         value: "10000"
+      - key: SERVICE_NAME
+        value: "BioLinkChannelRestrictorBot"
       - key: PYTHON_VERSION
         value: "3.11.8"
       - key: PYTHONUNBUFFERED
