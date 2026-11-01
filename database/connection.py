@@ -39,12 +39,12 @@ class MongoDBManager:
         try:
             print(f"[DATABASE] Connecting to MongoDB instance ({database_name})...")
             # Resource-optimized Motor client tailored for Render Free/Hobby tiers:
-            # - minPoolSize=1 / maxPoolSize=5: minimizes idle connection sockets and heartbeat overhead
+            # - minPoolSize=1 / maxPoolSize=3: minimizes idle connection sockets and heartbeat overhead
             # - compressors='zlib': compresses BSON payloads over the wire by ~70% to conserve outbound bandwidth
             # - maxIdleTimeMS=45000: cleans up idle TCP sockets automatically
             cls._client = AsyncIOMotorClient(
                 mongo_uri,
-                maxPoolSize=5,
+                maxPoolSize=3,
                 minPoolSize=1,
                 maxIdleTimeMS=45000,
                 serverSelectionTimeoutMS=2500,

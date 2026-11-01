@@ -6,7 +6,7 @@ FROM python:3.11-slim
 # Memory & I/O optimization flags for low-RAM hosts (e.g. Render 512MB RAM)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    MALLOC_TRIM_THRESHOLD_=100000 \
+    MALLOC_TRIM_THRESHOLD_=65536 \
     MALLOC_ARENA_MAX=2 \
     PORT=10000
 

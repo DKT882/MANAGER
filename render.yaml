@@ -27,6 +27,6 @@ services:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: MALLOC_TRIM_THRESHOLD_
-        value: "100000" # Returns heap memory > 100KB directly back to the OS
+        value: "65536" # Returns heap memory > 64KB directly back to the OS
       - key: MALLOC_ARENA_MAX
         value: "2" # Constrains glibc memory arenas to prevent RAM bloat

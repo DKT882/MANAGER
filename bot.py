@@ -194,10 +194,13 @@ async def check_admin_rights(
             return required_permission in perms
 
     # 2. Fetch fresh native rights from Telegram API
-    # Enforce strict cache bounds (< 500 entries) to guarantee minimal memory usage
-    if len(ADMIN_CACHE) >= 500:
+    # Enforce strict cache bounds (<= 300 entries) to guarantee minimal memory usage (<30MB RAM)
+    if len(ADMIN_CACHE) >= 300:
         for k in list(ADMIN_CACHE.keys()):
             if now - ADMIN_CACHE[k][0] > ADMIN_CACHE_TTL:
+                ADMIN_CACHE.pop(k, None)
+        if len(ADMIN_CACHE) >= 300:
+            for k in list(ADMIN_CACHE.keys())[:50]:
                 ADMIN_CACHE.pop(k, None)
 
     try:
@@ -2676,7 +2679,7 @@ async def resource_optimizer_worker() -> None:
     """
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(45)
             now = time.monotonic()
 
             # 1. Purge expired ADMIN_CACHE entries
@@ -2684,12 +2687,12 @@ async def resource_optimizer_worker() -> None:
             for k in expired_admins:
                 ADMIN_CACHE.pop(k, None)
 
-            # 2. Purge stale FLOOD_CACHE entries
+            # 2. Purge stale FLOOD_CACHE entries (>15s idle)
             empty_chats = []
             for chat_id, user_dict in list(FLOOD_CACHE.items()):
                 inactive_users = [
                     uid for uid, dq in list(user_dict.items())
-                    if not dq or (now - dq[-1] > 30.0)
+                    if not dq or (now - dq[-1] > 15.0)
                 ]
                 for uid in inactive_users:
                     user_dict.pop(uid, None)
@@ -2717,7 +2720,15 @@ async def resource_optimizer_worker() -> None:
             # 5. Trigger Python garbage collection
             gc.collect()
 
-            # 6. Update internal heartbeat timestamp
+            # 6. Call Linux glibc malloc_trim(0) if running on Linux to return all free heap to OS
+            try:
+                import ctypes
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except Exception:
+                pass
+
+            # 7. Update internal heartbeat timestamp
             METRICS["last_heartbeat"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
 
         except asyncio.CancelledError:

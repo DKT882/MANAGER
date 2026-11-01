@@ -171,7 +171,12 @@ class DatabaseService:
                         "last_warned_at": now,
                         "updated_at": now,
                     },
-                    "$push": {"incidents": incident}
+                    "$push": {
+                        "incidents": {
+                            "$each": [incident],
+                            "$slice": -20
+                        }
+                    }
                 },
                 upsert=True
             )
