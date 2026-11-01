@@ -1041,9 +1041,10 @@ async def handle_get_warns(message: Message, command: CommandObject, bot: Bot) -
 # INTERACTIVE SETTINGS UI (MATCHING BIOLINK RESTRICTOR ARCHITECTURE)
 # ==============================================================================
 
-def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+def generate_settings_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
     """
     Renders high-speed inline keyboard representing current in-memory settings.
+    Supports in-group close and private DM navigation back to managed group list / main menu.
     """
     s = CHAT_SETTINGS[chat_id]
 
@@ -1112,12 +1113,64 @@ def generate_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
                 callback_data=f"set:view_excepted:{chat_id}"
             ),
         ],
-        [
+    ]
+
+    if is_dm:
+        buttons.append([
+            InlineKeyboardButton(text="🔄 Reload", callback_data=f"set:reload:{chat_id}"),
+            InlineKeyboardButton(text="⬅️ Back to Groups", callback_data="dm:manage_settings"),
+            InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu"),
+        ])
+    else:
+        buttons.append([
             InlineKeyboardButton(text="🔄 Reload", callback_data=f"set:reload:{chat_id}"),
             InlineKeyboardButton(text="✅ Close", callback_data=f"set:close:{chat_id}"),
-        ]
-    ]
+        ])
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def generate_dm_main_menu(bot_username: str) -> InlineKeyboardMarkup:
+    """
+    Renders Private DM main menu matching exact design specification:
+    - Row 1: ➕ Add me to a Group ➕
+    - Row 2: ⚙️ Manage group Settings ✍️
+    - Row 3: 👥 Support / Approval ↗️ | ℹ️ Information 💬
+    - Row 4: 📖 Commands Guide
+    """
+    support_url = os.getenv("SUPPORT_URL", f"https://t.me/{bot_username}")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Add me to a Group ➕",
+                    url=f"https://t.me/{bot_username}?startgroup=true"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Manage group Settings ✍️",
+                    callback_data="dm:manage_settings"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 Support / Approval ↗️",
+                    url=support_url
+                ),
+                InlineKeyboardButton(
+                    text="ℹ️ Information 💬",
+                    callback_data="dm:info"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📖 Commands Guide",
+                    callback_data="dm:help"
+                )
+            ]
+        ]
+    )
 
 
 def format_settings_text(chat_title: str, s: Dict[str, Any]) -> str:
@@ -1206,15 +1259,66 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
 
             text = format_settings_text(title, s)
             try:
-                await message.answer(text, reply_markup=generate_settings_keyboard(target_cid), parse_mode=ParseMode.HTML)
+                await message.answer(
+                    text,
+                    reply_markup=generate_settings_keyboard(target_cid, is_dm=True),
+                    parse_mode=ParseMode.HTML
+                )
                 return
             except Exception:
                 pass
 
-    # 2B. Scan known groups where user is an authorized admin
+    # 2B. Welcome Menu Card (Matching Exact User Screenshot Specification)
+    welcome_text = (
+        "👋 <b>Hello!</b>\n"
+        "<b>BioLink Restrictor</b> is the most complete Bot to help you manage your groups easily and safely!\n\n"
+        "👉 <b>Add me in a Supergroup and promote me as Admin to let me get in action!</b>\n\n"
+        "🔻 <b>WHICH ARE THE COMMANDS?</b> 🔻\n"
+        "Press /help to see all the commands and how they work!\n"
+        "📄 <i>Default protection is active automatically across all connected groups.</i>"
+    )
+    try:
+        await message.answer(
+            welcome_text,
+            reply_markup=generate_dm_main_menu(bot_user.username or "personal_guardBot"),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "dm:main_menu")
+async def handle_dm_main_menu(query: CallbackQuery, bot: Bot) -> None:
+    """Returns to the Private DM Welcome Card from any submenu."""
+    bot_user = await bot.get_me()
+    welcome_text = (
+        "👋 <b>Hello!</b>\n"
+        "<b>BioLink Restrictor</b> is the most complete Bot to help you manage your groups easily and safely!\n\n"
+        "👉 <b>Add me in a Supergroup and promote me as Admin to let me get in action!</b>\n\n"
+        "🔻 <b>WHICH ARE THE COMMANDS?</b> 🔻\n"
+        "Press /help to see all the commands and how they work!\n"
+        "📄 <i>Default protection is active automatically across all connected groups.</i>"
+    )
+    try:
+        await query.message.edit_text(
+            welcome_text,
+            reply_markup=generate_dm_main_menu(bot_user.username or "personal_guardBot"),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+    await query.answer()
+
+
+@router.callback_query(F.data.in_({"dm:manage_settings", "dm:refresh_groups"}))
+async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
+    """Displays authorized groups for configuration from private DM."""
+    user_id = query.from_user.id
+    bot_user = await bot.get_me()
+
     authorized_chats = []
     for cid in list(CHAT_SETTINGS.keys()):
-        if await check_can_setup_bot(bot, cid, user_id):
+        if cid < 0 and await check_can_setup_bot(bot, cid, user_id):
             try:
                 c = await bot.get_chat(cid)
                 authorized_chats.append((cid, c.title or f"Group {cid}"))
@@ -1226,35 +1330,49 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
             [InlineKeyboardButton(text=f"👥 {title}", callback_data=f"dmgroup:{cid}")]
             for cid, title in authorized_chats
         ]
-        group_buttons.append([InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups")])
+        group_buttons.append([
+            InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups"),
+            InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu"),
+        ])
         text = (
             "⚙️ <b>Manage Group Settings</b>\n"
             "👉 <i>Select the group whose settings you want to change:</i>\n\n"
             "<i>Note: Only groups where you are the Owner, Anonymous Admin, or Excepted Admin appear here.</i>"
         )
         try:
-            await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=group_buttons), parse_mode=ParseMode.HTML)
+            await query.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=group_buttons),
+                parse_mode=ParseMode.HTML
+            )
         except Exception:
             pass
+        await query.answer("Authorized groups loaded.")
     else:
-        # 2C. Generic Welcome Card (Image 2 style)
-        welcome_text = (
-            "👋 <b>Hello!</b>\n"
-            "<b>BioLink Restrictor & High-Speed Admin Bot</b> is active to help you manage your groups easily and safely!\n\n"
-            "👉 <i>Add me to a Supergroup and promote me as Admin to get in action!</i>\n\n"
-            "🔻 <b>WHICH ARE THE COMMANDS?</b>\n"
-            "Press <code>/help</code> to see all commands and permissions!\n"
-            "<i>Default protection is active automatically across all connected groups.</i>"
+        text = (
+            "⚙️ <b>Manage Group Settings</b>\n\n"
+            "❌ <b>No authorized groups found!</b>\n\n"
+            "To manage your group settings here:\n"
+            "1. Tap <b>➕ Add me to a Group ➕</b> below.\n"
+            "2. Promote the bot to <b>Administrator</b> with management permissions.\n"
+            "3. Return here and tap <b>🔄 Refresh List</b>!"
         )
-        welcome_buttons = [
-            [InlineKeyboardButton(text="➕ Add me to a Group", url=f"https://t.me/{bot_user.username}?startgroup=true")],
-            [InlineKeyboardButton(text="⚙️ Manage Group Settings", callback_data="dm:refresh_groups")],
-            [InlineKeyboardButton(text="📖 Commands Guide", callback_data="dm:help")],
+        no_group_buttons = [
+            [InlineKeyboardButton(text="➕ Add me to a Group ➕", url=f"https://t.me/{bot_user.username}?startgroup=true")],
+            [
+                InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups"),
+                InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu"),
+            ],
         ]
         try:
-            await message.answer(welcome_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=welcome_buttons), parse_mode=ParseMode.HTML)
+            await query.message.edit_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=no_group_buttons),
+                parse_mode=ParseMode.HTML
+            )
         except Exception:
             pass
+        await query.answer("No authorized groups found.", show_alert=False)
 
 
 @router.callback_query(F.data.startswith("dmgroup:"))
@@ -1275,62 +1393,71 @@ async def handle_dm_select_group(query: CallbackQuery, bot: Bot) -> None:
 
     text = format_settings_text(chat_title, s)
     try:
-        await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
+        await query.message.edit_text(
+            text,
+            reply_markup=generate_settings_keyboard(chat_id, is_dm=True),
+            parse_mode=ParseMode.HTML
+        )
     except Exception:
         pass
     await query.answer()
 
 
-@router.callback_query(F.data == "dm:refresh_groups")
-async def handle_dm_refresh_groups(query: CallbackQuery, bot: Bot) -> None:
-    user_id = query.from_user.id
-    authorized_chats = []
-    for cid in list(CHAT_SETTINGS.keys()):
-        if await check_can_setup_bot(bot, cid, user_id):
-            try:
-                c = await bot.get_chat(cid)
-                authorized_chats.append((cid, c.title or f"Group {cid}"))
-            except Exception:
-                authorized_chats.append((cid, f"Group {cid}"))
-
-    if authorized_chats:
-        group_buttons = [
-            [InlineKeyboardButton(text=f"👥 {title}", callback_data=f"dmgroup:{cid}")]
-            for cid, title in authorized_chats
-        ]
-        group_buttons.append([InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups")])
-        text = (
-            "⚙️ <b>Manage Group Settings</b>\n"
-            "👉 <i>Select the group whose settings you want to change:</i>"
-        )
-        try:
-            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=group_buttons), parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        await query.answer("List refreshed.")
-    else:
-        await query.answer("No authorized groups found yet. Ensure the bot is added to your group as an Admin.", show_alert=True)
+@router.callback_query(F.data == "dm:info")
+async def handle_dm_info(query: CallbackQuery, bot: Bot) -> None:
+    """Displays real-time bot information, runtime metrics, and protection capabilities."""
+    uptime_sec = int(time.time() - BOT_START_TIME)
+    active_groups_count = len([c for c in CHAT_SETTINGS.keys() if c < 0])
+    info_text = (
+        "ℹ️ <b>Information & Protection Status</b>\n\n"
+        "🛡️ <b>BioLink Restrictor & High-Speed Manager</b>\n"
+        "Engineered for sub-millisecond group moderation, real-time link/channel restrictions, and automated protection.\n\n"
+        "📊 <b>System Overview:</b>\n"
+        f"• <b>Status:</b> <code>ONLINE (UP)</code>\n"
+        f"• <b>Engine Loop:</b> <code>{LOOP_ENGINE}</code> (Near-C execution)\n"
+        f"• <b>Uptime:</b> <code>{format_uptime(uptime_sec)}</code>\n"
+        f"• <b>Active Groups:</b> <code>{active_groups_count}</code>\n"
+        f"• <b>Cached Admin Chats:</b> <code>{len({k[0] for k in ADMIN_CACHE.keys()})}</code>\n"
+        f"• <b>Violations Handled:</b> <code>{METRICS.get('violations_handled', 0)}</code>\n\n"
+        "🛡️ <b>Included Capabilities:</b>\n"
+        "• 🤖 <b>Anti-Bot:</b> Instantly bans unauthorized bots added to groups.\n"
+        "• 🧹 <b>Service Cleaner:</b> Automatically purges user join/left notifications.\n"
+        "• 🔗 <b>Link & Channel Restriction:</b> Real-time in-chat link blocking.\n"
+        "• 🎭 <b>Media Filter:</b> Blocks stickers, GIFs, voice, audio, and documents.\n"
+        "• ⚡ <b>Anti-Flood:</b> Windowed spam detection with instant mute.\n"
+        "• ⚠️ <b>Smart Warn:</b> Warning accumulation ceiling with automated ban/mute.\n"
+    )
+    back_markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu")]
+    ])
+    try:
+        await query.message.edit_text(info_text, reply_markup=back_markup, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await query.answer()
 
 
 @router.callback_query(F.data == "dm:help")
 async def handle_dm_help_callback(query: CallbackQuery) -> None:
     help_text = (
-        "⚡ <b>High-Speed Telegram Admin Engine Active</b>\n\n"
-        "<b>Available Admin Commands:</b>\n"
-        "• <code>/start</code> - Open group protection settings (Authorized admins only)\n"
+        "📖 <b>Commands Guide & Help</b>\n\n"
+        "⚡ <b>Available Admin Commands:</b>\n"
+        "• <code>/start</code> - Open group protection settings & private hub\n"
         "• <code>/mute &lt;time&gt; [reason]</code> - Restrict user send permissions\n"
         "• <code>/dmute &lt;time&gt; [reason]</code> - Wipe replied message + Mute user\n"
         "• <code>/unmute</code> - Restore user chat privileges\n"
         "• <code>/pin</code> - Silently pin message with zero notification\n"
         "• <code>/unpin</code> - Unpin replied message or all messages\n"
-        "• <code>/clear [count]</code> - Wipe recent messages instantly\n"
-        "• <code>/ban</code> - Permanently ban violator\n"
-        "• <code>/dban</code> - Delete replied message + Ban violator\n"
-        "• <code>/tban &lt;time&gt;</code> - Temporary ban with auto-unban\n"
+        "• <code>/clear [count]</code> - Wipe recent messages in chunks of 100\n"
+        "• <code>/ban [reason]</code> - Permanently ban violator\n"
+        "• <code>/dban [reason]</code> - Delete replied message + Ban violator\n"
+        "• <code>/tban &lt;time&gt; [reason]</code> - Temporary ban with auto-unban\n"
         "• <code>/unban</code> - Revoke member ban\n"
+        "• <code>/kick</code> - Remove user from group (allows rejoining)\n"
+        "• <code>/dkick</code> - Delete replied message + Remove user\n"
         "• <code>/promote</code> - Elevate to admin with 0 custom rights\n"
         "• <code>/demote</code> - Strip all administrator rights\n"
-        "• <code>/warn</code> - Issue warning increment with automated ceiling\n"
+        "• <code>/warn [reason]</code> - Issue warning increment with automated ceiling\n"
         "• <code>/resetwarn</code> - Clear user warning counter\n"
         "• <code>/report [reason]</code> - (Reply only) Publicly flag message for review\n"
         "• <code>/show [reason]</code> - (Reply only) Forward report to admins in PM\n"
@@ -1340,7 +1467,7 @@ async def handle_dm_help_callback(query: CallbackQuery) -> None:
         f"<i>Engine loop: <code>{LOOP_ENGINE}</code> | Sub-second latency active.</i>"
     )
     back_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Back", callback_data="dm:refresh_groups")]
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu")]
     ])
     try:
         await query.message.edit_text(help_text, reply_markup=back_markup, parse_mode=ParseMode.HTML)
@@ -1446,8 +1573,9 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
 
     # Re-render updated dashboard
     text = format_settings_text(chat_title, s)
+    is_dm = query.message.chat.type == ChatType.PRIVATE if query.message else False
     try:
-        await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
+        await query.message.edit_text(text, reply_markup=generate_settings_keyboard(chat_id, is_dm=is_dm), parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -1487,7 +1615,12 @@ async def handle_help(message: Message, bot: Bot) -> None:
     )
 
     try:
-        await message.answer(text, parse_mode=ParseMode.HTML)
+        reply_markup = None
+        if message.chat.type == ChatType.PRIVATE:
+            reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu")]
+            ])
+        await message.answer(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
