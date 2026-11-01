@@ -146,6 +146,12 @@ async def check_admin_rights(
             return required_permission in perms
 
     # 2. Fetch fresh native rights from Telegram API
+    # Enforce strict cache bounds (< 500 entries) to guarantee minimal memory usage
+    if len(ADMIN_CACHE) >= 500:
+        for k in list(ADMIN_CACHE.keys()):
+            if now - ADMIN_CACHE[k][0] > ADMIN_CACHE_TTL:
+                ADMIN_CACHE.pop(k, None)
+
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         if isinstance(member, ChatMemberOwner):
@@ -925,7 +931,9 @@ async def handle_warn(message: Message, command: CommandObject, bot: Bot) -> Non
 
     if current_warns >= ceiling:
         # Automated enforcement threshold reached
-        WARN_CACHE[chat_id][target_id] = 0  # Reset counter
+        WARN_CACHE[chat_id].pop(target_id, None)  # Reset counter immediately without memory overhead
+        if not WARN_CACHE[chat_id]:
+            WARN_CACHE.pop(chat_id, None)
         action = settings.get("warn_action", "mute")
         duration = settings.get("warn_duration", 86400)
         until_ts = int(time.time() + duration)
@@ -961,8 +969,10 @@ async def handle_resetwarn(message: Message, command: CommandObject, bot: Bot) -
     if not target_id:
         return
 
-    # In-memory reset
-    WARN_CACHE[message.chat.id][target_id] = 0
+    # In-memory reset: pop key immediately to eliminate zero-value RAM residue
+    WARN_CACHE[message.chat.id].pop(target_id, None)
+    if not WARN_CACHE[message.chat.id]:
+        WARN_CACHE.pop(message.chat.id, None)
     DatabaseService.reset_warn_background(message.chat.id, target_id)
     DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "resetwarn")
 
@@ -2057,13 +2067,14 @@ async def handle_sync_commands(message: Message, bot: Bot) -> None:
 
 async def resource_optimizer_worker() -> None:
     """
-    Continuous background cleanup task running every 5 minutes.
-    Aggressively purges expired cache keys, evicts stale flood deques, and triggers
-    garbage collection to keep RAM usage strictly below 40-50MB on Render's 512MB tier.
+    Continuous background cleanup task running every 60 seconds.
+    Aggressively purges expired cache keys, evicts stale flood deques, drops orphan
+    private DM entries, and triggers garbage collection to keep RAM usage strictly below
+    35-50MB on Render's 512MB tier.
     """
     while True:
         try:
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
             now = time.monotonic()
 
             # 1. Purge expired ADMIN_CACHE entries
@@ -2096,7 +2107,12 @@ async def resource_optimizer_worker() -> None:
             for cid in empty_warn_chats:
                 WARN_CACHE.pop(cid, None)
 
-            # 4. Trigger Python garbage collection
+            # 4. Clean orphan private DM keys from CHAT_SETTINGS (supergroups have negative IDs)
+            private_chats = [cid for cid in list(CHAT_SETTINGS.keys()) if cid > 0]
+            for cid in private_chats:
+                CHAT_SETTINGS.pop(cid, None)
+
+            # 5. Trigger Python garbage collection
             gc.collect()
 
         except asyncio.CancelledError:

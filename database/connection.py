@@ -93,13 +93,18 @@ class MongoDBManager:
                 name="idx_user_warnings_chat_user_unique"
             )
 
-            # 3. Moderation Audit Logs: Compound index for fast chronological group history
+            # 3. Moderation Audit Logs: Compound index + Auto-expiring TTL index (30 days) to prevent MongoDB storage exhaustion
             await cls._db.moderation_audit_logs.create_index(
                 [("chat_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)],
                 name="idx_audit_logs_chat_time"
             )
+            await cls._db.moderation_audit_logs.create_index(
+                [("timestamp", pymongo.ASCENDING)],
+                expireAfterSeconds=2592000,
+                name="idx_audit_logs_ttl_30d"
+            )
 
-            # 4. Reports: Query index for pending/resolved reports
+            # 4. Reports: Query index for pending/resolved reports + Auto-expiring TTL index (60 days)
             await cls._db.reports.create_index(
                 [("chat_id", pymongo.ASCENDING), ("status", pymongo.ASCENDING)],
                 name="idx_reports_chat_status"
@@ -108,6 +113,11 @@ class MongoDBManager:
                 [("report_id", pymongo.ASCENDING)],
                 unique=True,
                 name="idx_reports_id_unique"
+            )
+            await cls._db.reports.create_index(
+                [("created_at", pymongo.ASCENDING)],
+                expireAfterSeconds=5184000,
+                name="idx_reports_ttl_60d"
             )
 
             print("[DATABASE] Production database indexes successfully provisioned.")
