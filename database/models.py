@@ -151,7 +151,8 @@ class ChatSettingsModel(BaseModel):
         Flattens the document into the high-speed local dictionary structure
         used by bot.py's runtime engine to guarantee 0ms memory reads.
         """
-        return {
+        data = dict(self.custom_attributes) if self.custom_attributes else {}
+        data.update({
             "block_sticker": self.media.block_sticker,
             "block_animation": self.media.block_animation,
             "block_document": self.media.block_document,
@@ -178,7 +179,8 @@ class ChatSettingsModel(BaseModel):
             "clean_service_messages": self.clean_service_messages,
             "block_bots": self.block_bots,
             "bot_action": getattr(self, "bot_action", "ban"),
-        }
+        })
+        return data
 
     @classmethod
     def from_in_memory_dict(cls, chat_id: int, chat_title: str, mem_dict: Dict[str, Any]) -> ChatSettingsModel:
@@ -233,6 +235,7 @@ class ChatSettingsModel(BaseModel):
             excepted_admin_ids=list(mem_dict.get("excepted_admins", [])),
         )
 
+        custom_attrs = {k: v for k, v in mem_dict.items()}
         return cls(
             chat_id=chat_id,
             chat_title=chat_title,
@@ -244,6 +247,7 @@ class ChatSettingsModel(BaseModel):
             clean_service_messages=mem_dict.get("clean_service_messages", True),
             block_bots=mem_dict.get("block_bots", False),
             bot_action=mem_dict.get("bot_action", "ban"),
+            custom_attributes=custom_attrs,
         )
 
 

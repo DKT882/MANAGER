@@ -91,6 +91,14 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "admin_links_block": False,
     "block_channel_links": False,
     "link_action": "delete",   # 'delete' or 'warn'
+    # Anti-Spam (Image 5)
+    "block_telegram_links": False,
+    "block_forwarding": False,
+    "block_quote": False,
+    "block_total_links": False,
+    # Regulations / Rules (Image 4)
+    "rules_text": "",
+    "rules_perm": "all",       # 'all' or 'admins'
     # Anti-flood settings
     "flood_protection": True,
     "flood_window": 3.0,       # Frequency window in seconds
@@ -103,13 +111,68 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "warn_duration": 86400,    # Penalty duration in seconds (0 = permanent)
     "warn_cancel_btn": True,   # Attach inline Cancel Warn button to warn notices
     "custom_warn_msg": "",     # Custom warn notice template configured in private DM
-    # Reporting exception settings
-    "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
-    # Service messages cleanup (auto delete user join / left notifications)
-    "clean_service_messages": True,
-    # Anti-bot setting (auto-ban/auto-kick bots added to the group chat)
+    # Welcome & Goodbye
+    "welcome_enabled": False,
+    "welcome_msg": "👋 Welcome to <b>{chat_title}</b>, {mention}!",
+    "clean_welcome": True,
+    "goodbye_enabled": False,
+    "goodbye_msg": "👋 Goodbye, {mention}!",
+    # Alphabets Filter
+    "block_arabic": False,
+    "block_cyrillic": False,
+    "block_chinese": False,
+    "alphabet_action": "delete",
+    # Captcha
+    "captcha_mode": "off",     # 'off', 'button', 'math'
+    "captcha_timeout": 60,     # seconds
+    "captcha_action": "kick",  # 'kick' or 'ban'
+    # Checks (Profile)
+    "check_bio_links": True,
+    "check_avatar": False,
+    "check_username": False,
+    # Admin reporting (@Admin)
+    "admin_alert_enabled": True,
+    "admin_alert_pm": True,
+    # Blocks / Blacklist
+    "blacklist_enabled": True,
+    "blacklisted_users": [],
+    # NSFW / Porn Filter
+    "block_porn": False,
+    "porn_action": "delete",   # 'delete', 'warn', 'mute'
+    # Night Mode
+    "night_mode": False,
+    "night_start": 23,         # 23:00 UTC
+    "night_end": 7,            # 07:00 UTC
+    # Anti-Tag / Mass Mention
+    "tag_limit": 5,
+    "tag_protection": False,
+    "tag_action": "delete",
+    # Guardian Bot (Anti-Bot)
     "block_bots": False,
     "bot_action": "ban",       # Violation action: 'ban' or 'kick'
+    # Approval Mode (Join Requests)
+    "approval_auto": False,
+    # Deleting Messages Cleaners
+    "clean_service_messages": True,
+    "auto_clean_bot_cmds": False,
+    # Language
+    "lang": "en",
+    # Page 2 features
+    "strict_topic": False,
+    "banned_words_enabled": False,
+    "banned_words": [],
+    "banned_words_action": "delete",
+    "recurring_messages": [],
+    "slow_mode": 0,            # seconds (0 = off)
+    "readonly_mode": False,
+    "block_channels": False,   # restrict messages sent as channel
+    "discussion_autopin": False,
+    "custom_filters": {},      # trigger -> reply text
+    "magic_stickers_limit": 0, # max per minute (0 = off)
+    "max_message_length": 0,   # chars (0 = off)
+    "log_channel_id": None,    # audit log channel ID
+    # Reporting exception settings
+    "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
 }
 
 # CHAT_SETTINGS: chat_id -> configuration dict
@@ -128,6 +191,8 @@ ADMIN_CACHE_TTL = 60.0  # seconds
 
 # PENDING_CUSTOM_WARN: admin_user_id -> chat_id being configured in private DM
 PENDING_CUSTOM_WARN: Dict[int, int] = {}
+# PENDING_CUSTOM_INPUT: admin_user_id -> (chat_id, setting_type) for direct text updates in PM
+PENDING_CUSTOM_INPUT: Dict[int, Tuple[int, str]] = {}
 
 # CHAT_TITLES: chat_id -> cached group title (eliminates redundant getChat roundtrips)
 CHAT_TITLES: Dict[int, str] = {}
@@ -135,6 +200,12 @@ CHAT_TITLES: Dict[int, str] = {}
 # Pre-compiled high-performance regex patterns
 RE_DURATION = re.compile(r"^(\d+)([smhdw]?)$")
 RE_LINK = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
+RE_TG_LINK = re.compile(r"(t\.me/\S+|telegram\.me/\S+|telegram\.dog/\S+)", re.IGNORECASE)
+RE_ARABIC = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+RE_CYRILLIC = re.compile(r"[\u0400-\u04FF]")
+RE_CHINESE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u30FF]")
+RE_PORN = re.compile(r"\b(porn|xxx|nude|sex|hentai|onlyfans|nsfw|pussy|dick|boobs|erotic|milf)\b", re.IGNORECASE)
+RE_MENTION = re.compile(r"@[\w\d_]+")
 
 # ==============================================================================
 # SYSTEM HEALTH & PERFORMANCE METRICS REGISTRY
@@ -696,8 +767,35 @@ class AntiFloodMiddleware(BaseMiddleware):
 router = Router(name="high_speed_admin_router")
 
 # ==============================================================================
-# 0. SERVICE MESSAGE CLEANER (AUTO-DELETE JOIN / LEAVE NOTIFICATIONS)
 # ==============================================================================
+# 0. SERVICE MESSAGE CLEANER & MEMBER LIFECYCLE (WELCOME / GOODBYE / CAPTCHA)
+# ==============================================================================
+
+async def trigger_admin_alert(bot: Bot, message: Message, user: types.User, reason: str) -> None:
+    chat_id = message.chat.id
+    chat_title = CHAT_TITLES.get(chat_id, "Group")
+    settings = CHAT_SETTINGS[chat_id]
+    user_mention = user.mention_html()
+    alert_text = (
+        f"🚨 <b>ADMIN ALERT IN {html.escape(chat_title)}</b>\n\n"
+        f"👤 <b>Reported By:</b> {user_mention} (<code>{user.id}</code>)\n"
+        f"💬 <b>Reason:</b> {html.escape(reason)}\n"
+    )
+    if message.reply_to_message:
+        target = message.reply_to_message.from_user
+        if target:
+            alert_text += f"🎯 <b>Target:</b> {target.mention_html()} (<code>{target.id}</code>)\n"
+    if message.link:
+        alert_text += f"\n🔗 <a href='{message.link}'>Jump to Message</a>"
+
+    # Forward alert to PM of excepted admins if enabled
+    if settings.get("admin_alert_pm", True):
+        for aid in settings.get("excepted_admins", []):
+            try:
+                await bot.send_message(chat_id=aid, text=alert_text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
 
 @router.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
@@ -705,9 +803,10 @@ router = Router(name="high_speed_admin_router")
 )
 async def handle_service_messages(message: Message, bot: Bot) -> None:
     """
-    1. Anti-Bot: If block_bots is enabled, bans any newly added bot instantly.
-    2. Auto-deletes user join (new_chat_members) and leave (left_chat_member)
-       service notifications instantly when clean_service_messages is enabled.
+    1. Anti-Bot: Bans unauthorized bots added to group chat.
+    2. Welcome Greetings & Captcha: Welcomes new members or challenges with button captcha.
+    3. Goodbye: Sends departure notice when a member leaves.
+    4. Auto-deletes user join / leave service notifications when clean_service_messages is enabled.
     """
     chat_id = message.chat.id
     if message.chat and message.chat.title:
@@ -738,7 +837,72 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
                 except Exception:
                     pass
 
-    # 2. Service Message Cleanup
+    # 2. Welcome Greetings & Captcha Verification
+    if message.new_chat_members:
+        for member in message.new_chat_members:
+            if member.is_bot:
+                continue
+
+            # Captcha Verification
+            c_mode = settings.get("captcha_mode", "off")
+            if c_mode != "off":
+                try:
+                    await bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=member.id,
+                        permissions=ChatPermissions(can_send_messages=False)
+                    )
+                except Exception:
+                    pass
+                verify_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🤖 Click to Verify You're Human", callback_data=f"captcha:verify:{chat_id}:{member.id}")]
+                ])
+                try:
+                    await message.answer(
+                        f"👋 Welcome {member.mention_html()}!\n"
+                        f"⚠️ <b>Verification Required:</b> Please tap below to unlock chat privileges.",
+                        reply_markup=verify_kb,
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+
+            # Welcome Message
+            if settings.get("welcome_enabled"):
+                chat_title = CHAT_TITLES.get(chat_id, "this group")
+                template = settings.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
+                formatted = template.replace("{mention}", member.mention_html()) \
+                                    .replace("{name}", html.escape(member.full_name)) \
+                                    .replace("{chat_title}", html.escape(chat_title)) \
+                                    .replace("{id}", str(member.id))
+                try:
+                    last_msg_id = settings.get("_last_welcome_msg_id")
+                    if settings.get("clean_welcome") and last_msg_id:
+                        try:
+                            await bot.delete_message(chat_id=chat_id, message_id=last_msg_id)
+                        except Exception:
+                            pass
+                    w_msg = await message.answer(formatted, parse_mode=ParseMode.HTML)
+                    settings["_last_welcome_msg_id"] = w_msg.message_id
+                except Exception:
+                    pass
+
+    # 3. Goodbye Message
+    if message.left_chat_member and settings.get("goodbye_enabled"):
+        member = message.left_chat_member
+        if not member.is_bot:
+            chat_title = CHAT_TITLES.get(chat_id, "this group")
+            template = settings.get("goodbye_msg", "👋 Goodbye, {mention}!")
+            formatted = template.replace("{mention}", member.mention_html()) \
+                                .replace("{name}", html.escape(member.full_name)) \
+                                .replace("{chat_title}", html.escape(chat_title)) \
+                                .replace("{id}", str(member.id))
+            try:
+                await message.answer(formatted, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
+    # 4. Service Message Cleanup
     if settings.get("clean_service_messages", True):
         try:
             await message.delete()
@@ -747,7 +911,7 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
 
 
 # ==============================================================================
-# ASYNCHRONOUS MEDIA & LINK INTERCEPTOR (SUB-SECOND SCANNER)
+# ASYNCHRONOUS MEDIA, LINK, & CONTENT INTERCEPTOR (SUB-SECOND SCANNER)
 # ==============================================================================
 
 @router.message(
@@ -757,12 +921,14 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
 async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None:
     """
     Monitors all incoming group messages against local settings:
-    - Stickers
-    - Animations (GIF)
-    - Documents
-    - Audio
-    - Voice
-    - Links (In-chat URLs and Admin Links)
+    - Blacklists & Read-only mode
+    - Night mode (UTC scheduled lock)
+    - Anti-Spam (Forwards, Quotes, Telegram links, Total links)
+    - Media Filters (Stickers, GIFs, Audio, Voice, Documents, Photos, Videos)
+    - Content Filters (Banned words, Restricted alphabets, Porn/NSFW keywords)
+    - Anti-Tag / Mass Mention protection
+    - Message Length limits
+    - Custom keyword filters & @admin summon alerts
     """
     user = message.from_user
     if not user or user.is_bot:
@@ -774,7 +940,48 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
     settings = CHAT_SETTINGS[chat_id]
     is_admin = await check_admin_rights(bot, chat_id, user.id)
 
-    # 1. Media Type Interceptions
+    # 1. Blacklist Check
+    if not is_admin and settings.get("blacklist_enabled", True):
+        if user.id in settings.get("blacklisted_users", []):
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            try:
+                await bot.ban_chat_member(chat_id=chat_id, user_id=user.id)
+            except Exception:
+                pass
+            return
+
+    # 2. Readonly Mode Check
+    if not is_admin and settings.get("readonly_mode"):
+        await wipe_trigger(message)
+        return
+
+    # 3. Night Mode Check (UTC)
+    if not is_admin and settings.get("night_mode"):
+        cur_hour = datetime.now(timezone.utc).hour
+        n_start = settings.get("night_start", 23)
+        n_end = settings.get("night_end", 7)
+        in_night = False
+        if n_start > n_end:
+            in_night = cur_hour >= n_start or cur_hour < n_end
+        else:
+            in_night = n_start <= cur_hour < n_end
+        if in_night:
+            await wipe_trigger(message)
+            return
+
+    # 4. Anti-Spam: Forwarding & Quote checks
+    if not is_admin:
+        if settings.get("block_forwarding") and (message.forward_origin or message.forward_from or message.forward_from_chat):
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            return
+        if settings.get("block_quote") and message.quote:
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            return
+
+    # 5. Media Type Interceptions
     if not is_admin:
         media_violation = False
         if settings.get("block_sticker") and message.sticker:
@@ -799,37 +1006,118 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
                 await issue_warn_and_notify(bot, chat_id, user, bot.id, "Sent blocked media")
             return
 
-    # 2. Link Interceptions
+    # 6. Link Interceptions
     has_link = False
     is_channel_link = False
+    is_tg_link = False
     if message.entities:
         for entity in message.entities:
             if entity.type in ("url", "text_link"):
                 has_link = True
-                break
+                url_val = entity.url or ""
+                if "t.me" in url_val.lower() or "telegram.me" in url_val.lower():
+                    is_tg_link = True
             elif entity.type == "mention":
                 is_channel_link = True
 
-    if not has_link and message.text:
-        if RE_LINK.search(message.text):
+    raw_text = message.text or message.caption or ""
+    if not has_link and raw_text:
+        if RE_LINK.search(raw_text):
             has_link = True
+    if not is_tg_link and raw_text:
+        if RE_TG_LINK.search(raw_text):
+            is_tg_link = True
 
-    if has_link or (is_channel_link and settings.get("block_channel_links")):
-        # Check non-admin link block
-        if not is_admin and (settings.get("block_links") or (is_channel_link and settings.get("block_channel_links"))):
+    if not is_admin:
+        # Anti-spam: Telegram links & Total links
+        if settings.get("block_telegram_links") and is_tg_link:
             METRICS["violations_handled"] += 1
-            METRICS["chat_links_caught"] += 1
-            await wipe_trigger(message)
-            if settings.get("link_action") == "warn":
-                await issue_warn_and_notify(bot, chat_id, user, bot.id, "Sent blocked link")
-            return
-
-        # Check strict admin link block
-        if is_admin and settings.get("admin_links_block"):
-            METRICS["violations_handled"] += 1
-            METRICS["chat_links_caught"] += 1
             await wipe_trigger(message)
             return
+        if settings.get("block_total_links") and has_link:
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            return
+
+        # Core Link filter
+        if has_link or (is_channel_link and settings.get("block_channel_links")):
+            if settings.get("block_links") or (is_channel_link and settings.get("block_channel_links")):
+                METRICS["violations_handled"] += 1
+                METRICS["chat_links_caught"] += 1
+                await wipe_trigger(message)
+                if settings.get("link_action") == "warn":
+                    await issue_warn_and_notify(bot, chat_id, user, bot.id, "Sent blocked link")
+                return
+
+    # Admin strict link block
+    if is_admin and settings.get("admin_links_block") and has_link:
+        METRICS["violations_handled"] += 1
+        METRICS["chat_links_caught"] += 1
+        await wipe_trigger(message)
+        return
+
+    # 7. Text-Based Filters
+    if raw_text and not is_admin:
+        # A. Banned Words
+        if settings.get("banned_words_enabled"):
+            b_words = settings.get("banned_words", [])
+            lower_text = raw_text.lower()
+            if any(w in lower_text for w in b_words):
+                METRICS["violations_handled"] += 1
+                await wipe_trigger(message)
+                if settings.get("banned_words_action") == "warn":
+                    await issue_warn_and_notify(bot, chat_id, user, bot.id, "Used prohibited word")
+                return
+
+        # B. Alphabets Filter
+        if (settings.get("block_arabic") and RE_ARABIC.search(raw_text)) or \
+           (settings.get("block_cyrillic") and RE_CYRILLIC.search(raw_text)) or \
+           (settings.get("block_chinese") and RE_CHINESE.search(raw_text)):
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            if settings.get("alphabet_action") == "warn":
+                await issue_warn_and_notify(bot, chat_id, user, bot.id, "Used restricted script")
+            return
+
+        # C. Porn / NSFW Filter
+        if settings.get("block_porn") and RE_PORN.search(raw_text):
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            if settings.get("porn_action") == "warn":
+                await issue_warn_and_notify(bot, chat_id, user, bot.id, "Explicit content violation")
+            return
+
+        # D. Tag / Mass Mention Protection
+        if settings.get("tag_protection"):
+            m_count = len(RE_MENTION.findall(raw_text))
+            if m_count >= settings.get("tag_limit", 5):
+                METRICS["violations_handled"] += 1
+                await wipe_trigger(message)
+                if settings.get("tag_action") == "warn":
+                    await issue_warn_and_notify(bot, chat_id, user, bot.id, "Mass mention spam")
+                return
+
+        # E. Message Length Limit
+        max_len = settings.get("max_message_length", 0)
+        if max_len > 0 and len(raw_text) > max_len:
+            METRICS["violations_handled"] += 1
+            await wipe_trigger(message)
+            return
+
+    # 8. Custom Trigger Filters (/filter)
+    if raw_text and settings.get("custom_filters"):
+        clean_trig = raw_text.strip().lower()
+        if clean_trig in settings["custom_filters"]:
+            try:
+                await message.reply(settings["custom_filters"][clean_trig])
+            except Exception:
+                pass
+
+    # 9. @Admin Calling Report Trigger
+    if raw_text and settings.get("admin_alert_enabled", True):
+        if "@admin" in raw_text.lower():
+            reason = raw_text.replace("@admin", "").replace("@Admin", "").strip() or "Summoned via @admin"
+            await trigger_admin_alert(bot, message, user, reason)
 
 
 # ==============================================================================
@@ -1277,72 +1565,813 @@ async def handle_get_warns(message: Message, command: CommandObject, bot: Bot) -
 # INTERACTIVE SETTINGS UI (MATCHING BIOLINK RESTRICTOR ARCHITECTURE)
 # ==============================================================================
 
-def generate_settings_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+def generate_settings_choice_keyboard(chat_id: int, bot_username: str) -> InlineKeyboardMarkup:
     """
-    Renders high-speed modular settings hub with direct jump to feature customization submenus.
+    Renders choice menu in group matching Image 1:
+    '👥 Open here' | '👤 Open in Private Chat'
     """
-    s = CHAT_SETTINGS[chat_id]
-    warn_dur_str = format_duration(s.get("warn_duration", 86400))
-    flood_dur_str = format_duration(s.get("flood_duration", 900))
-    media_blocked = sum(1 for k in [
-        "block_sticker", "block_animation", "block_document",
-        "block_audio", "block_voice", "block_photo", "block_video"
-    ] if s.get(k))
+    clean_id = str(chat_id).replace("-", "m")
+    dm_url = f"https://t.me/{bot_username}?start=group_{clean_id}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Open here", callback_data=f"set:open_here:{chat_id}")],
+        [InlineKeyboardButton(text="👤 Open in Private Chat", url=dm_url)],
+    ])
 
+
+def format_settings_hub_text(chat_title: str) -> str:
+    """
+    Renders standardized header matching Image 2 & 3:
+    SETTINGS
+    Group: <group name>
+
+    Select one of the settings that you want to change.
+    """
+    return (
+        "<b>Manager</b>\n"
+        "<b>SETTINGS</b>\n"
+        f"<b>Group:</b> <code>{html.escape(chat_title)}</code>\n\n"
+        "<i>Select one of the settings that you want to change.</i>"
+    )
+
+
+def generate_settings_page1_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    """
+    Renders exact 2-column Page 1 Settings Menu as shown in reference Image 2.
+    """
+    prefix = "dm:" if is_dm else "set:"
     buttons = [
+        # Row 1
         [
-            InlineKeyboardButton(
-                text=f"⚠️ Warn Ceiling ({s.get('warn_limit', 3)} ➔ {s.get('warn_action', 'mute').upper()} {warn_dur_str})",
-                callback_data=f"set:menu:warn:{chat_id}"
-            )
+            InlineKeyboardButton(text="📜 Regulation", callback_data=f"{prefix}menu:regulation:{chat_id}"),
+            InlineKeyboardButton(text="✉️ Anti-Spam", callback_data=f"{prefix}menu:antispam:{chat_id}"),
         ],
+        # Row 2
         [
-            InlineKeyboardButton(
-                text=f"⚡ Anti-Flood ({'ON' if s.get('flood_protection') else 'OFF'} | {s.get('flood_limit', 5)}msg/{int(s.get('flood_window', 3))}s ➔ {s.get('flood_action', 'mute').upper()})",
-                callback_data=f"set:menu:flood:{chat_id}"
-            )
+            InlineKeyboardButton(text="💬 Welcome", callback_data=f"{prefix}menu:welcome:{chat_id}"),
+            InlineKeyboardButton(text="🗣️ Anti-Flood", callback_data=f"{prefix}menu:flood:{chat_id}"),
         ],
+        # Row 3
         [
-            InlineKeyboardButton(
-                text=f"🤖 Anti-Bot ({'ON' if s.get('block_bots') else 'OFF'} ➔ {s.get('bot_action', 'ban').upper()})",
-                callback_data=f"set:menu:bot:{chat_id}"
-            ),
-            InlineKeyboardButton(
-                text=f"🧹 Service Msgs ({'ON' if s.get('clean_service_messages', True) else 'OFF'})",
-                callback_data=f"set:menu:service:{chat_id}"
-            ),
+            InlineKeyboardButton(text="👋 Goodbye", callback_data=f"{prefix}menu:goodbye:{chat_id}"),
+            InlineKeyboardButton(text="🕉 Alphabets", callback_data=f"{prefix}menu:alphabets:{chat_id}"),
         ],
+        # Row 4
         [
-            InlineKeyboardButton(
-                text=f"🔗 Links & Invites ({'RESTRICTED' if s.get('block_links') or s.get('admin_links_block') else 'ALLOWED'})",
-                callback_data=f"set:menu:links:{chat_id}"
-            ),
-            InlineKeyboardButton(
-                text=f"🎭 Media Filters ({media_blocked}/7 Blocked)",
-                callback_data=f"set:menu:media:{chat_id}"
-            ),
+            InlineKeyboardButton(text="🧠 Captcha", callback_data=f"{prefix}menu:captcha:{chat_id}"),
+            InlineKeyboardButton(text="🔦 Checks", callback_data=f"{prefix}menu:checks:{chat_id}"),
         ],
+        # Row 5
         [
-            InlineKeyboardButton(
-                text=f"👥 Excepted Admins ({len(s.get('excepted_admins', []))} configured)",
-                callback_data=f"set:menu:excepted:{chat_id}"
-            )
+            InlineKeyboardButton(text="🆘 @Admin", callback_data=f"{prefix}menu:admincall:{chat_id}"),
+            InlineKeyboardButton(text="🔐 Blocks", callback_data=f"{prefix}menu:blocks:{chat_id}"),
+        ],
+        # Row 6
+        [
+            InlineKeyboardButton(text="📸 Media", callback_data=f"{prefix}menu:media:{chat_id}"),
+            InlineKeyboardButton(text="🔞 Porn", callback_data=f"{prefix}menu:porn:{chat_id}"),
+        ],
+        # Row 7
+        [
+            InlineKeyboardButton(text="❗ Warns", callback_data=f"{prefix}menu:warn:{chat_id}"),
+            InlineKeyboardButton(text="🌘 Night", callback_data=f"{prefix}menu:night:{chat_id}"),
+        ],
+        # Row 8
+        [
+            InlineKeyboardButton(text="🔔 Tag", callback_data=f"{prefix}menu:tag:{chat_id}"),
+            InlineKeyboardButton(text="🔗 Link", callback_data=f"{prefix}menu:links:{chat_id}"),
+        ],
+        # Row 9
+        [
+            InlineKeyboardButton(text="🕵️ Guardian Bot 🆕", callback_data=f"{prefix}menu:guardian:{chat_id}"),
+        ],
+        # Row 10
+        [
+            InlineKeyboardButton(text="📭 Approval mode", callback_data=f"{prefix}menu:approval:{chat_id}"),
+        ],
+        # Row 11
+        [
+            InlineKeyboardButton(text="🗑️ Deleting Messages", callback_data=f"{prefix}menu:delmsgs:{chat_id}"),
+        ],
+        # Row 12
+        [
+            InlineKeyboardButton(text="🇬🇧 Lang", callback_data=f"{prefix}menu:lang:{chat_id}"),
+            InlineKeyboardButton(text="✅ Close", callback_data=f"{prefix}close:{chat_id}"),
+            InlineKeyboardButton(text="▶️ Other", callback_data=f"{prefix}page:2:{chat_id}"),
         ],
     ]
-
-    if is_dm:
-        buttons.append([
-            InlineKeyboardButton(text="🔄 Reload", callback_data=f"set:reload:{chat_id}"),
-            InlineKeyboardButton(text="⬅️ Back to Groups", callback_data="dm:manage_settings"),
-            InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu"),
-        ])
-    else:
-        buttons.append([
-            InlineKeyboardButton(text="🔄 Reload", callback_data=f"set:reload:{chat_id}"),
-            InlineKeyboardButton(text="✅ Close", callback_data=f"set:close:{chat_id}"),
-        ])
-
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def generate_settings_page2_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    """
+    Renders exact Page 2 Settings Menu as shown in reference Image 3.
+    """
+    prefix = "dm:" if is_dm else "set:"
+    buttons = [
+        # Row 1
+        [InlineKeyboardButton(text="📁 Topic", callback_data=f"{prefix}menu:topic:{chat_id}")],
+        # Row 2
+        [InlineKeyboardButton(text="🔤 Banned Words", callback_data=f"{prefix}menu:bannedwords:{chat_id}")],
+        # Row 3
+        [InlineKeyboardButton(text="🕒 Recurring messages", callback_data=f"{prefix}menu:recurring:{chat_id}")],
+        # Row 4
+        [InlineKeyboardButton(text="👥 Members Management", callback_data=f"{prefix}menu:members:{chat_id}")],
+        # Row 5
+        [InlineKeyboardButton(text="🧕 Masked users", callback_data=f"{prefix}menu:masked:{chat_id}")],
+        # Row 6
+        [InlineKeyboardButton(text="📣 Discussion group 🆕", callback_data=f"{prefix}menu:discussion:{chat_id}")],
+        # Row 7
+        [InlineKeyboardButton(text="📱 Personal Commands", callback_data=f"{prefix}menu:personalcmds:{chat_id}")],
+        # Row 8
+        [InlineKeyboardButton(text="🎭 Magic Stickers&GIFs", callback_data=f"{prefix}menu:magicstickers:{chat_id}")],
+        # Row 9
+        [InlineKeyboardButton(text="📏 Message length", callback_data=f"{prefix}menu:msglength:{chat_id}")],
+        # Row 10
+        [InlineKeyboardButton(text="📢 Channels management 🆕", callback_data=f"{prefix}menu:channels:{chat_id}")],
+        # Row 11
+        [
+            InlineKeyboardButton(text="🖋 Permissions", callback_data=f"{prefix}menu:permissions:{chat_id}"),
+            InlineKeyboardButton(text="🔍 Log Channel", callback_data=f"{prefix}menu:logchannel:{chat_id}"),
+        ],
+        # Row 12
+        [
+            InlineKeyboardButton(text="◀️ Back", callback_data=f"{prefix}page:1:{chat_id}"),
+            InlineKeyboardButton(text="✅ Close", callback_data=f"{prefix}close:{chat_id}"),
+            InlineKeyboardButton(text="🇬🇧 Lang", callback_data=f"{prefix}menu:lang:{chat_id}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def generate_settings_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    return generate_settings_page1_keyboard(chat_id, is_dm=is_dm)
+
+
+def format_regulation_text(chat_title: str, s: Dict[str, Any]) -> str:
+    rules = s.get("rules_text", "").strip()
+    perm_label = "👥 Everyone" if s.get("rules_perm", "all") == "all" else "👮 Admins Only"
+    rules_preview = f"\n\n<b>Current regulations:</b>\n<i>{html.escape(rules[:250])}{'...' if len(rules) > 250 else ''}</i>" if rules else "\n\n<i>No regulations defined yet. Click '✍️ Customize message' or send /setrules &lt;text&gt;</i>"
+    return (
+        "<b>Manager</b>\n"
+        "📜 <b>Group's regulations</b>\n"
+        "From this menu you can manage the group's regulations, that will be shown with the command /rules.\n\n"
+        "<i>To edit who can use the /rules command, go to the \"Commands permissions\" section.</i>\n\n"
+        f"<b>Who can use /rules:</b> {perm_label}"
+        f"{rules_preview}"
+    )
+
+
+def generate_regulation_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    perm = s.get("rules_perm", "all")
+    perm_label = "🕹️ Permissions: Everyone" if perm == "all" else "🕹️ Permissions: Admins"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Customize message", callback_data=f"{prefix}cust:rules:{chat_id}")],
+        [InlineKeyboardButton(text=perm_label, callback_data=f"{prefix}toggle_rules_perm:{chat_id}")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_antispam_text(chat_title: str, s: Dict[str, Any]) -> str:
+    tg_icon = "🟢 Blocked" if s.get("block_telegram_links") else "⚪ Allowed"
+    fwd_icon = "🟢 Blocked" if s.get("block_forwarding") else "⚪ Allowed"
+    quote_icon = "🟢 Blocked" if s.get("block_quote") else "⚪ Allowed"
+    tot_icon = "🟢 Blocked" if s.get("block_total_links") else "⚪ Allowed"
+    return (
+        "<b>Manager</b>\n"
+        "✉️ <b>Anti-Spam</b>\n"
+        "In this menu you can decide whether to protect your groups from unnecessary links, forwards, and quotes.\n\n"
+        f"• <b>Telegram links:</b> {tg_icon}\n"
+        f"• <b>Forwarding:</b> {fwd_icon}\n"
+        f"• <b>Quote:</b> {quote_icon}\n"
+        f"• <b>Total links block:</b> {tot_icon}"
+    )
+
+
+def generate_antispam_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    tg = "🟢" if s.get("block_telegram_links") else "⚪"
+    fwd = "🟢" if s.get("block_forwarding") else "⚪"
+    quote = "🟢" if s.get("block_quote") else "⚪"
+    tot = "🟢" if s.get("block_total_links") else "⚪"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📘 Telegram links {tg}", callback_data=f"{prefix}toggle:block_telegram_links:{chat_id}:antispam")],
+        [
+            InlineKeyboardButton(text=f"📨 Forwarding {fwd}", callback_data=f"{prefix}toggle:block_forwarding:{chat_id}:antispam"),
+            InlineKeyboardButton(text=f"💭 Quote {quote}", callback_data=f"{prefix}toggle:block_quote:{chat_id}:antispam"),
+        ],
+        [InlineKeyboardButton(text=f"🔗 Total links block {tot}", callback_data=f"{prefix}toggle:block_total_links:{chat_id}:antispam")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_welcome_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Enabled" if s.get("welcome_enabled") else "🔴 Disabled"
+    cl = "🟢 Yes" if s.get("clean_welcome") else "⚪ No"
+    msg = s.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
+    return (
+        "<b>Manager</b>\n"
+        "💬 <b>Welcome Message</b>\n"
+        "Configure automated greetings for new members joining the group.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Clean Previous Welcome:</b> {cl}\n\n"
+        f"<b>Current Template:</b>\n<code>{html.escape(msg)}</code>\n\n"
+        "<i>Placeholders: {mention}, {name}, {chat_title}, {id}</i>"
+    )
+
+
+def generate_welcome_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st_btn = f"⚡ State: {'ON' if s.get('welcome_enabled') else 'OFF'}"
+    cl_btn = f"🧹 Clean Previous: {'ON' if s.get('clean_welcome') else 'OFF'}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=st_btn, callback_data=f"{prefix}toggle:welcome_enabled:{chat_id}:welcome")],
+        [InlineKeyboardButton(text=cl_btn, callback_data=f"{prefix}toggle:clean_welcome:{chat_id}:welcome")],
+        [InlineKeyboardButton(text="✍️ Customize message", callback_data=f"{prefix}cust:welcome:{chat_id}")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_goodbye_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Enabled" if s.get("goodbye_enabled") else "🔴 Disabled"
+    msg = s.get("goodbye_msg", "👋 Goodbye, {mention}!")
+    return (
+        "<b>Manager</b>\n"
+        "👋 <b>Goodbye Message</b>\n"
+        "Send farewell notifications when a member leaves the group.\n\n"
+        f"<b>Status:</b> {st}\n\n"
+        f"<b>Current Template:</b>\n<code>{html.escape(msg)}</code>\n\n"
+        "<i>Placeholders: {mention}, {name}, {chat_title}, {id}</i>"
+    )
+
+
+def generate_goodbye_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st_btn = f"⚡ State: {'ON' if s.get('goodbye_enabled') else 'OFF'}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=st_btn, callback_data=f"{prefix}toggle:goodbye_enabled:{chat_id}:goodbye")],
+        [InlineKeyboardButton(text="✍️ Customize message", callback_data=f"{prefix}cust:goodbye:{chat_id}")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_alphabets_text(chat_title: str, s: Dict[str, Any]) -> str:
+    ar = "🟢 Blocked" if s.get("block_arabic") else "⚪ Allowed"
+    cy = "🟢 Blocked" if s.get("block_cyrillic") else "⚪ Allowed"
+    ch = "🟢 Blocked" if s.get("block_chinese") else "⚪ Allowed"
+    act = s.get("alphabet_action", "delete").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🕉 <b>Alphabets Filter</b>\n"
+        "Block messages containing specific scripts to combat international spam.\n\n"
+        f"• <b>Arabic / Persian:</b> {ar}\n"
+        f"• <b>Cyrillic (Russian):</b> {cy}\n"
+        f"• <b>Chinese / Asian:</b> {ch}\n"
+        f"• <b>Action:</b> <code>{act}</code>"
+    )
+
+
+def generate_alphabets_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    ar = "🟢" if s.get("block_arabic") else "⚪"
+    cy = "🟢" if s.get("block_cyrillic") else "⚪"
+    ch = "🟢" if s.get("block_chinese") else "⚪"
+    act = s.get("alphabet_action", "delete").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🇸🇦 Arabic {ar}", callback_data=f"{prefix}toggle:block_arabic:{chat_id}:alphabets")],
+        [InlineKeyboardButton(text=f"🇷🇺 Cyrillic {cy}", callback_data=f"{prefix}toggle:block_cyrillic:{chat_id}:alphabets")],
+        [InlineKeyboardButton(text=f"🇨🇳 Chinese {ch}", callback_data=f"{prefix}toggle:block_chinese:{chat_id}:alphabets")],
+        [InlineKeyboardButton(text=f"🔨 Action: {act}", callback_data=f"{prefix}cycle:alphabet_action:{chat_id}:alphabets")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_captcha_text(chat_title: str, s: Dict[str, Any]) -> str:
+    mode = s.get("captcha_mode", "off").upper()
+    to = s.get("captcha_timeout", 60)
+    act = s.get("captcha_action", "kick").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🧠 <b>Captcha Verification</b>\n"
+        "Require new members to verify themselves before sending messages.\n\n"
+        f"<b>Mode:</b> <code>{mode}</code>\n"
+        f"<b>Timeout:</b> <code>{to}s</code>\n"
+        f"<b>Fail Action:</b> <code>{act}</code>"
+    )
+
+
+def generate_captcha_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    mode = s.get("captcha_mode", "off").upper()
+    to = s.get("captcha_timeout", 60)
+    act = s.get("captcha_action", "kick").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔘 Mode: {mode}", callback_data=f"{prefix}cycle:captcha_mode:{chat_id}:captcha")],
+        [InlineKeyboardButton(text=f"⏱ Timeout: {to}s", callback_data=f"{prefix}cycle:captcha_timeout:{chat_id}:captcha")],
+        [InlineKeyboardButton(text=f"🔨 Action: {act}", callback_data=f"{prefix}cycle:captcha_action:{chat_id}:captcha")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_checks_text(chat_title: str, s: Dict[str, Any]) -> str:
+    bio = "🟢 Active" if s.get("check_bio_links", True) else "🔴 Disabled"
+    av = "🟢 Required" if s.get("check_avatar") else "⚪ Disabled"
+    un = "🟢 Required" if s.get("check_username") else "⚪ Disabled"
+    return (
+        "<b>Manager</b>\n"
+        "🔦 <b>Member Profile Checks</b>\n"
+        "Screen incoming accounts to block bots, self-promoters, and blank profiles.\n\n"
+        f"• <b>Bio Links Check:</b> {bio}\n"
+        f"• <b>Require Profile Avatar:</b> {av}\n"
+        f"• <b>Require @Username:</b> {un}"
+    )
+
+
+def generate_checks_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    bio = "🟢 ON" if s.get("check_bio_links", True) else "⚪ OFF"
+    av = "🟢 ON" if s.get("check_avatar") else "⚪ OFF"
+    un = "🟢 ON" if s.get("check_username") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔗 Bio Links: {bio}", callback_data=f"{prefix}toggle:check_bio_links:{chat_id}:checks")],
+        [InlineKeyboardButton(text=f"👤 Require Avatar: {av}", callback_data=f"{prefix}toggle:check_avatar:{chat_id}:checks")],
+        [InlineKeyboardButton(text=f"📛 Require Username: {un}", callback_data=f"{prefix}toggle:check_username:{chat_id}:checks")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_admincall_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Enabled" if s.get("admin_alert_enabled", True) else "🔴 Disabled"
+    pm = "🟢 Enabled" if s.get("admin_alert_pm", True) else "🔴 Disabled"
+    cnt = len(s.get("excepted_admins", []))
+    return (
+        "<b>Manager</b>\n"
+        "🆘 <b>@Admin Summon & Reports</b>\n"
+        "Members can alert administrators about violations by typing @admin or /admin.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Forward to Admin PMs:</b> {pm}\n"
+        f"<b>Configured Excepted Admins:</b> <code>{cnt}</code>"
+    )
+
+
+def generate_admincall_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("admin_alert_enabled", True) else "⚪ OFF"
+    pm = "🟢 ON" if s.get("admin_alert_pm", True) else "⚪ OFF"
+    cnt = len(s.get("excepted_admins", []))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔔 State: {st}", callback_data=f"{prefix}toggle:admin_alert_enabled:{chat_id}:admincall")],
+        [InlineKeyboardButton(text=f"📩 PM Alerts: {pm}", callback_data=f"{prefix}toggle:admin_alert_pm:{chat_id}:admincall")],
+        [InlineKeyboardButton(text=f"👥 Excepted Admins ({cnt})", callback_data=f"{prefix}menu:excepted:{chat_id}")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_blocks_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Enabled" if s.get("blacklist_enabled", True) else "🔴 Disabled"
+    cnt = len(s.get("blacklisted_users", []))
+    return (
+        "<b>Manager</b>\n"
+        "🔐 <b>User Blocks & Blacklists</b>\n"
+        "Automatically ban violators listed on the group blacklist.\n\n"
+        f"<b>Protection Status:</b> {st}\n"
+        f"<b>Blacklisted Users:</b> <code>{cnt}</code>\n\n"
+        "<i>Use /ban &lt;user&gt; to ban and add users to the blacklist.</i>"
+    )
+
+
+def generate_blocks_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("blacklist_enabled", True) else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🛡️ Blacklist: {st}", callback_data=f"{prefix}toggle:blacklist_enabled:{chat_id}:blocks")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_porn_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Active" if s.get("block_porn") else "🔴 Disabled"
+    act = s.get("porn_action", "delete").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🔞 <b>Porn & Adult Content Filter</b>\n"
+        "Purges adult media, links, and explicit NSFW keywords.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Action:</b> <code>{act}</code>"
+    )
+
+
+def generate_porn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("block_porn") else "⚪ OFF"
+    act = s.get("porn_action", "delete").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔞 State: {st}", callback_data=f"{prefix}toggle:block_porn:{chat_id}:porn")],
+        [InlineKeyboardButton(text=f"🔨 Action: {act}", callback_data=f"{prefix}cycle:porn_action:{chat_id}:porn")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_night_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Active" if s.get("night_mode") else "🔴 Disabled"
+    n_start = s.get("night_start", 23)
+    n_end = s.get("night_end", 7)
+    return (
+        "<b>Manager</b>\n"
+        "🌘 <b>Night Mode</b>\n"
+        "Automatically restrict non-admin messages during night hours.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Schedule:</b> <code>{n_start:02d}:00 - {n_end:02d}:00 UTC</code>"
+    )
+
+
+def generate_night_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("night_mode") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🌘 State: {st}", callback_data=f"{prefix}toggle:night_mode:{chat_id}:night")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_tag_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Active" if s.get("tag_protection") else "🔴 Disabled"
+    lim = s.get("tag_limit", 5)
+    act = s.get("tag_action", "delete").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🔔 <b>Anti-Tag / Mass Mention Protection</b>\n"
+        "Prevents mass mention raids by blocking messages with too many user tags.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Limit:</b> <code>{lim} mentions</code>\n"
+        f"<b>Action:</b> <code>{act}</code>"
+    )
+
+
+def generate_tag_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("tag_protection") else "⚪ OFF"
+    lim = s.get("tag_limit", 5)
+    act = s.get("tag_action", "delete").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⚡ State: {st}", callback_data=f"{prefix}toggle:tag_protection:{chat_id}:tag")],
+        [InlineKeyboardButton(text=f"🔢 Limit: {lim}", callback_data=f"{prefix}cycle:tag_limit:{chat_id}:tag")],
+        [InlineKeyboardButton(text=f"🔨 Action: {act}", callback_data=f"{prefix}cycle:tag_action:{chat_id}:tag")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_guardian_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Active" if s.get("block_bots") else "🔴 Disabled"
+    act = s.get("bot_action", "ban").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🕵️ <b>Guardian Bot (Anti-Bot)</b>\n"
+        "Protect your group against bot raids. Regular members adding bots are instantly penalized.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Action:</b> <code>{act}</code>"
+    )
+
+
+def generate_guardian_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("block_bots") else "⚪ OFF"
+    act = s.get("bot_action", "ban").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🛡️ Anti-Bot: {st}", callback_data=f"{prefix}toggle:block_bots:{chat_id}:guardian")],
+        [InlineKeyboardButton(text=f"🔨 Action: {act}", callback_data=f"{prefix}cycle:bot_action:{chat_id}:guardian")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_approval_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Auto-Approve" if s.get("approval_auto") else "🔴 Manual Admin Review"
+    return (
+        "<b>Manager</b>\n"
+        "📭 <b>Join Request Approval Mode</b>\n"
+        "Manage how incoming join requests are handled.\n\n"
+        f"<b>Mode:</b> <code>{st}</code>"
+    )
+
+
+def generate_approval_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("approval_auto") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⚡ Auto-Approve: {st}", callback_data=f"{prefix}toggle:approval_auto:{chat_id}:approval")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_delmsgs_text(chat_title: str, s: Dict[str, Any]) -> str:
+    srv = "🟢 Cleaned" if s.get("clean_service_messages", True) else "⚪ Kept"
+    cmd = "🟢 60s" if s.get("auto_clean_bot_cmds") else "⚪ OFF"
+    return (
+        "<b>Manager</b>\n"
+        "🗑️ <b>Deleting Messages & Cleaners</b>\n"
+        "Keep the chat clean and free from clutter.\n\n"
+        f"• <b>Service Messages (Join/Left):</b> {srv}\n"
+        f"• <b>Auto-delete Bot Commands:</b> {cmd}"
+    )
+
+
+def generate_delmsgs_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    srv = "🟢 ON" if s.get("clean_service_messages", True) else "⚪ OFF"
+    cmd = "🟢 ON" if s.get("auto_clean_bot_cmds") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🧹 Service Messages: {srv}", callback_data=f"{prefix}toggle:clean_service_messages:{chat_id}:delmsgs")],
+        [InlineKeyboardButton(text=f"⏱ Auto-delete Cmds: {cmd}", callback_data=f"{prefix}toggle:auto_clean_bot_cmds:{chat_id}:delmsgs")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+def format_lang_text(chat_title: str, s: Dict[str, Any]) -> str:
+    lang = s.get("lang", "en").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🇬🇧 <b>Language Selection</b>\n"
+        "Select the language used for bot interfaces and alerts.\n\n"
+        f"<b>Current Language:</b> <code>{lang}</code>"
+    )
+
+
+def generate_lang_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🇬🇧 English", callback_data=f"{prefix}setlang:en:{chat_id}"),
+            InlineKeyboardButton(text="🇪🇸 Español", callback_data=f"{prefix}setlang:es:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🇮🇳 Hindi", callback_data=f"{prefix}setlang:hi:{chat_id}"),
+            InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"{prefix}setlang:ru:{chat_id}"),
+        ],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
+    ])
+
+
+# ---------------- PAGE 2 SUBMENUS ----------------
+
+
+def format_topic_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Active" if s.get("strict_topic") else "🔴 Disabled"
+    return (
+        "<b>Manager</b>\n"
+        "📁 <b>Topic Settings</b>\n"
+        "Settings for forum supergroup topics.\n\n"
+        f"<b>Strict Topic Posting:</b> <code>{st}</code>"
+    )
+
+
+def generate_topic_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("strict_topic") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⚡ Strict Topics: {st}", callback_data=f"{prefix}toggle:strict_topic:{chat_id}:topic")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_bannedwords_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Enabled" if s.get("banned_words_enabled") else "🔴 Disabled"
+    cnt = len(s.get("banned_words", []))
+    act = s.get("banned_words_action", "delete").upper()
+    return (
+        "<b>Manager</b>\n"
+        "🔤 <b>Banned Words & Profanity Filter</b>\n"
+        "Automatically delete or penalize messages containing blacklisted words.\n\n"
+        f"<b>Status:</b> {st}\n"
+        f"<b>Configured Words:</b> <code>{cnt}</code>\n"
+        f"<b>Action:</b> <code>{act}</code>\n\n"
+        "<i>Use /addword &lt;word&gt; to add and /delword &lt;word&gt; to remove.</i>"
+    )
+
+
+def generate_bannedwords_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("banned_words_enabled") else "⚪ OFF"
+    act = s.get("banned_words_action", "delete").upper()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⚡ State: {st}", callback_data=f"{prefix}toggle:banned_words_enabled:{chat_id}:bannedwords")],
+        [InlineKeyboardButton(text=f"🔨 Action: {act}", callback_data=f"{prefix}cycle:banned_words_action:{chat_id}:bannedwords")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_recurring_text(chat_title: str, s: Dict[str, Any]) -> str:
+    cnt = len(s.get("recurring_messages", []))
+    return (
+        "<b>Manager</b>\n"
+        "🕒 <b>Recurring Messages</b>\n"
+        "Automated scheduled broadcasts to keep your group engaged.\n\n"
+        f"<b>Active Broadcasts:</b> <code>{cnt}</code>"
+    )
+
+
+def generate_recurring_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_members_text(chat_title: str, s: Dict[str, Any]) -> str:
+    ro = "🟢 Active" if s.get("readonly_mode") else "⚪ Disabled"
+    sm = f"{s.get('slow_mode', 0)}s" if s.get('slow_mode', 0) > 0 else "OFF"
+    return (
+        "<b>Manager</b>\n"
+        "👥 <b>Members Management</b>\n"
+        "Group-wide restrictions and crowd control.\n\n"
+        f"• <b>Read-Only Mode:</b> {ro}\n"
+        f"• <b>Slow Mode:</b> <code>{sm}</code>"
+    )
+
+
+def generate_members_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    ro = "🟢 ON" if s.get("readonly_mode") else "⚪ OFF"
+    sm = f"{s.get('slow_mode', 0)}s" if s.get('slow_mode', 0) > 0 else "OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔒 Read-Only: {ro}", callback_data=f"{prefix}toggle:readonly_mode:{chat_id}:members")],
+        [InlineKeyboardButton(text=f"⏱ Slow Mode: {sm}", callback_data=f"{prefix}cycle:slow_mode:{chat_id}:members")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_masked_text(chat_title: str, s: Dict[str, Any]) -> str:
+    bc = "🟢 Blocked" if s.get("block_channels") else "⚪ Allowed"
+    return (
+        "<b>Manager</b>\n"
+        "🧕 <b>Masked Users & Channel Senders</b>\n"
+        "Control messages sent on behalf of Telegram channels.\n\n"
+        f"<b>Channel Senders:</b> {bc}"
+    )
+
+
+def generate_masked_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    bc = "🟢 Blocked" if s.get("block_channels") else "⚪ Allowed"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🚫 Channel Senders: {bc}", callback_data=f"{prefix}toggle:block_channels:{chat_id}:masked")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_discussion_text(chat_title: str, s: Dict[str, Any]) -> str:
+    ap = "🟢 ON" if s.get("discussion_autopin") else "⚪ OFF"
+    return (
+        "<b>Manager</b>\n"
+        "📣 <b>Discussion Group</b>\n"
+        "Settings for discussion groups connected to a channel.\n\n"
+        f"<b>Auto-Pin Channel Posts:</b> {ap}"
+    )
+
+
+def generate_discussion_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    ap = "🟢 ON" if s.get("discussion_autopin") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📌 Auto-Pin Posts: {ap}", callback_data=f"{prefix}toggle:discussion_autopin:{chat_id}:discussion")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_personalcmds_text(chat_title: str, s: Dict[str, Any]) -> str:
+    cnt = len(s.get("custom_filters", {}))
+    return (
+        "<b>Manager</b>\n"
+        "📱 <b>Personal Commands & Custom Filters</b>\n"
+        "Custom keyword triggers with automated replies.\n\n"
+        f"<b>Active Filters:</b> <code>{cnt}</code>\n\n"
+        "<i>Use /filter &lt;trigger&gt; &lt;reply&gt; to create and /stop &lt;trigger&gt; to delete.</i>"
+    )
+
+
+def generate_personalcmds_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_magicstickers_text(chat_title: str, s: Dict[str, Any]) -> str:
+    lim = s.get("magic_stickers_limit", 0)
+    lim_str = f"{lim}/min" if lim > 0 else "Unlimited"
+    return (
+        "<b>Manager</b>\n"
+        "🎭 <b>Magic Stickers & GIFs</b>\n"
+        "Limit sticker frequency to prevent sticker flooding.\n\n"
+        f"<b>Max Stickers:</b> <code>{lim_str}</code>"
+    )
+
+
+def generate_magicstickers_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    lim = s.get("magic_stickers_limit", 0)
+    lim_str = f"{lim}/min" if lim > 0 else "Unlimited"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🎭 Limit: {lim_str}", callback_data=f"{prefix}cycle:magic_stickers_limit:{chat_id}:magicstickers")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_msglength_text(chat_title: str, s: Dict[str, Any]) -> str:
+    lim = s.get("max_message_length", 0)
+    lim_str = f"{lim} chars" if lim > 0 else "Unlimited"
+    return (
+        "<b>Manager</b>\n"
+        "📏 <b>Message Length Limit</b>\n"
+        "Restrict wall-of-text spam messages.\n\n"
+        f"<b>Max Allowed Length:</b> <code>{lim_str}</code>"
+    )
+
+
+def generate_msglength_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    lim = s.get("max_message_length", 0)
+    lim_str = f"{lim} chars" if lim > 0 else "Unlimited"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📏 Limit: {lim_str}", callback_data=f"{prefix}cycle:max_message_length:{chat_id}:msglength")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_channels_text(chat_title: str, s: Dict[str, Any]) -> str:
+    st = "🟢 Active" if s.get("block_channel_links") else "🔴 Disabled"
+    return (
+        "<b>Manager</b>\n"
+        "📢 <b>Channels Management</b>\n"
+        "Restrict Telegram channel links, mentions, and connected channel bios.\n\n"
+        f"<b>Channel Restrictions:</b> <code>{st}</code>"
+    )
+
+
+def generate_channels_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    st = "🟢 ON" if s.get("block_channel_links") else "⚪ OFF"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📢 Channel Block: {st}", callback_data=f"{prefix}toggle:block_channel_links:{chat_id}:channels")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_permissions_text(chat_title: str, s: Dict[str, Any]) -> str:
+    return (
+        "<b>Manager</b>\n"
+        "🖋 <b>Default Permissions</b>\n"
+        "Default member send permissions overview.\n\n"
+        "<i>To restrict media or links, visit the Media and Links sections in Page 1.</i>"
+    )
+
+
+def generate_permissions_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
+
+
+def format_logchannel_text(chat_title: str, s: Dict[str, Any]) -> str:
+    cid = s.get("log_channel_id")
+    c_str = f"<code>{cid}</code>" if cid else "<i>None configured</i>"
+    return (
+        "<b>Manager</b>\n"
+        "🔍 <b>Log Channel</b>\n"
+        "Forward all moderation actions and violations to an audit channel.\n\n"
+        f"<b>Audit Channel ID:</b> {c_str}\n\n"
+        "<i>Set with command: /setlog &lt;channel_id&gt;</i>"
+    )
+
+
+def generate_logchannel_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+    ])
 
 
 def generate_warn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
@@ -1764,13 +2793,18 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
             return
 
         chat_id = message.chat.id
-        chat_title = message.chat.title or "This Chat"
-        s = CHAT_SETTINGS[chat_id]
-
-        text = format_settings_text(chat_title, s)
-
+        bot_user = await bot.get_me()
+        bot_name = bot_user.first_name or "Manager"
+        choice_text = (
+            f"<b>{html.escape(bot_name)}</b>\n"
+            "Where do you want to open the settings menu?"
+        )
         try:
-            await message.answer(text, reply_markup=generate_settings_keyboard(chat_id), parse_mode=ParseMode.HTML)
+            await message.answer(
+                choice_text,
+                reply_markup=generate_settings_choice_keyboard(chat_id, bot_user.username or "personal_guardBot"),
+                parse_mode=ParseMode.HTML
+            )
         except Exception:
             pass
         return
@@ -1787,7 +2821,22 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
         target_cid = None
         if arg.startswith("group_"):
             try:
-                target_cid = int(arg.replace("group_", ""))
+                raw_val = arg.replace("group_", "")
+                if raw_val.startswith("m"):
+                    target_cid = -int(raw_val[1:])
+                else:
+                    v = int(raw_val)
+                    target_cid = -v if v > 0 else v
+            except ValueError:
+                pass
+        elif arg.startswith("settings_"):
+            try:
+                raw_val = arg.replace("settings_", "")
+                if raw_val.startswith("m"):
+                    target_cid = -int(raw_val[1:])
+                else:
+                    v = int(raw_val)
+                    target_cid = -v if v > 0 else v
             except ValueError:
                 pass
         elif arg.startswith("-100"):
@@ -1814,13 +2863,12 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                     pass
 
         if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
-            s = CHAT_SETTINGS[target_cid]
             title = await get_cached_chat_title(bot, target_cid)
-            text = format_settings_text(title, s)
+            text = format_settings_hub_text(title)
             try:
                 await message.answer(
                     text,
-                    reply_markup=generate_settings_keyboard(target_cid, is_dm=True),
+                    reply_markup=generate_settings_page1_keyboard(target_cid, is_dm=True),
                     parse_mode=ParseMode.HTML
                 )
                 return
@@ -1961,13 +3009,12 @@ async def handle_dm_select_group(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("❌ You are not an authorized admin for this group.", show_alert=True)
         return
 
-    s = CHAT_SETTINGS[chat_id]
     chat_title = await get_cached_chat_title(bot, chat_id)
-    text = format_settings_text(chat_title, s)
+    text = format_settings_hub_text(chat_title)
     try:
         await query.message.edit_text(
             text,
-            reply_markup=generate_settings_keyboard(chat_id, is_dm=True),
+            reply_markup=generate_settings_page1_keyboard(chat_id, is_dm=True),
             parse_mode=ParseMode.HTML
         )
     except Exception:
@@ -2048,7 +3095,81 @@ async def handle_dm_help_callback(query: CallbackQuery) -> None:
     await query.answer()
 
 
-@router.callback_query(F.data.startswith("set:"))
+def render_submenu(subname: str, chat_title: str, s: Dict[str, Any], chat_id: int, is_dm: bool) -> Tuple[str, InlineKeyboardMarkup]:
+    """
+    Submenu rendering router. Returns the formatted text and inline keyboard for any requested submenu.
+    """
+    if subname == "regulation":
+        return format_regulation_text(chat_title, s), generate_regulation_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "antispam":
+        return format_antispam_text(chat_title, s), generate_antispam_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "welcome":
+        return format_welcome_text(chat_title, s), generate_welcome_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "goodbye":
+        return format_goodbye_text(chat_title, s), generate_goodbye_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "alphabets":
+        return format_alphabets_text(chat_title, s), generate_alphabets_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "captcha":
+        return format_captcha_text(chat_title, s), generate_captcha_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "checks":
+        return format_checks_text(chat_title, s), generate_checks_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "admincall":
+        return format_admincall_text(chat_title, s), generate_admincall_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "blocks":
+        return format_blocks_text(chat_title, s), generate_blocks_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "media":
+        return format_media_text(chat_title, s), generate_media_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "porn":
+        return format_porn_text(chat_title, s), generate_porn_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "warn":
+        return format_warn_text(chat_title, s), generate_warn_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "night":
+        return format_night_text(chat_title, s), generate_night_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "tag":
+        return format_tag_text(chat_title, s), generate_tag_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "links":
+        return format_links_text(chat_title, s), generate_links_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "guardian" or subname == "bot":
+        return format_guardian_text(chat_title, s), generate_guardian_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "approval":
+        return format_approval_text(chat_title, s), generate_approval_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "delmsgs" or subname == "service":
+        return format_delmsgs_text(chat_title, s), generate_delmsgs_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "lang":
+        return format_lang_text(chat_title, s), generate_lang_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "flood":
+        return format_flood_text(chat_title, s), generate_flood_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "excepted":
+        return format_excepted_text(chat_title, s), generate_excepted_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "topic":
+        return format_topic_text(chat_title, s), generate_topic_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "bannedwords":
+        return format_bannedwords_text(chat_title, s), generate_bannedwords_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "recurring":
+        return format_recurring_text(chat_title, s), generate_recurring_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "members":
+        return format_members_text(chat_title, s), generate_members_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "masked":
+        return format_masked_text(chat_title, s), generate_masked_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "discussion":
+        return format_discussion_text(chat_title, s), generate_discussion_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "personalcmds":
+        return format_personalcmds_text(chat_title, s), generate_personalcmds_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "magicstickers":
+        return format_magicstickers_text(chat_title, s), generate_magicstickers_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "msglength":
+        return format_msglength_text(chat_title, s), generate_msglength_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "channels":
+        return format_channels_text(chat_title, s), generate_channels_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "permissions":
+        return format_permissions_text(chat_title, s), generate_permissions_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "logchannel":
+        return format_logchannel_text(chat_title, s), generate_logchannel_keyboard(chat_id, is_dm=is_dm)
+    else:
+        return format_settings_hub_text(chat_title), generate_settings_page1_keyboard(chat_id, is_dm=is_dm)
+
+
+@router.callback_query(F.data.regexp(r"^(set|dm|cfg):"))
 async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     """
     Handles interactive settings configuration clicks (both in-group and from private DMs).
@@ -2061,16 +3182,41 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         return
 
     action = parts[1]
-    # For nested menu callbacks: set:menu:<submenu>:<chat_id>
-    if action == "menu" and len(parts) >= 4:
-        sub = parts[2]
+    subname = None
+    chat_id = 0
+
+    # Parse parameters based on action type
+    if action in ("open_here", "close", "toggle_rules_perm"):
+        try:
+            chat_id = int(parts[2])
+        except ValueError:
+            await query.answer()
+            return
+    elif action in ("page", "menu", "cust"):
+        subname = parts[2]
+        try:
+            chat_id = int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+    elif action in ("toggle", "cycle"):
+        # e.g. set:toggle:<key>:<chat_id>:<subname>
+        key = parts[2]
+        try:
+            chat_id = int(parts[3])
+        except ValueError:
+            await query.answer()
+            return
+        subname = parts[4] if len(parts) >= 5 else "main"
+    elif action == "setlang":
+        subname = parts[2]
         try:
             chat_id = int(parts[3])
         except ValueError:
             await query.answer()
             return
     else:
-        sub = None
+        # Legacy action: e.g. set:warn_inc:<chat_id>
         try:
             chat_id = int(parts[2])
         except ValueError:
@@ -2089,7 +3235,18 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     is_dm = query.message.chat.type == ChatType.PRIVATE if query.message else False
     chat_title = await get_cached_chat_title(bot, chat_id)
 
-    # 1. Close Menu Action
+    # 1. Open Here (Group inline expansion)
+    if action == "open_here":
+        text = format_settings_hub_text(chat_title)
+        kb = generate_settings_page1_keyboard(chat_id, is_dm=False)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer()
+        return
+
+    # 2. Close Menu Action
     if action == "close":
         try:
             await query.message.delete()
@@ -2098,36 +3255,13 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("Closed.")
         return
 
-    # 2. Category Submenu Navigation
-    if action == "menu":
-        if sub == "main":
-            text = format_settings_text(chat_title, s)
-            kb = generate_settings_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "warn":
-            text = format_warn_text(chat_title, s)
-            kb = generate_warn_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "flood":
-            text = format_flood_text(chat_title, s)
-            kb = generate_flood_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "bot":
-            text = format_bot_text(chat_title, s)
-            kb = generate_bot_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "service":
-            text = format_service_text(chat_title, s)
-            kb = generate_service_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "links":
-            text = format_links_text(chat_title, s)
-            kb = generate_links_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "media":
-            text = format_media_text(chat_title, s)
-            kb = generate_media_keyboard(chat_id, is_dm=is_dm)
-        elif sub == "excepted":
-            text = format_excepted_text(chat_title, s)
-            kb = generate_excepted_keyboard(chat_id, is_dm=is_dm)
+    # 3. Page Flipping (Page 1 <-> Page 2)
+    if action == "page":
+        text = format_settings_hub_text(chat_title)
+        if subname == "2":
+            kb = generate_settings_page2_keyboard(chat_id, is_dm=is_dm)
         else:
-            text = format_settings_text(chat_title, s)
-            kb = generate_settings_keyboard(chat_id, is_dm=is_dm)
-
+            kb = generate_settings_page1_keyboard(chat_id, is_dm=is_dm)
         try:
             await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         except Exception:
@@ -2135,7 +3269,99 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer()
         return
 
-    # 3. Warn Ceiling & Punishment Mutations
+    # 4. Submenu Navigation
+    if action == "menu":
+        text, kb = render_submenu(subname, chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer()
+        return
+
+    # 5. Generic Boolean Toggle
+    if action == "toggle":
+        s[key] = not s.get(key, False)
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu(subname, chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        status_str = "ENABLED" if s[key] else "DISABLED"
+        await query.answer(f"{key}: {status_str}")
+        return
+
+    # 6. Generic Cycle Option
+    if action == "cycle":
+        cycles = {
+            "alphabet_action": ["delete", "warn"],
+            "captcha_mode": ["off", "button", "math"],
+            "captcha_timeout": [60, 120, 300],
+            "captcha_action": ["kick", "ban"],
+            "porn_action": ["delete", "warn", "mute"],
+            "tag_limit": [3, 5, 10],
+            "tag_action": ["delete", "warn", "mute"],
+            "bot_action": ["ban", "kick"],
+            "slow_mode": [0, 10, 30, 60],
+            "magic_stickers_limit": [0, 3, 5],
+            "max_message_length": [0, 500, 1000, 2000],
+            "banned_words_action": ["delete", "warn"],
+        }
+        options = cycles.get(key, ["delete", "warn"])
+        cur = s.get(key, options[0])
+        idx = options.index(cur) if cur in options else 0
+        s[key] = options[(idx + 1) % len(options)]
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu(subname, chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer(f"{key}: {s[key]}")
+        return
+
+    # 7. Customize Text in PM
+    if action == "cust":
+        if is_dm:
+            PENDING_CUSTOM_INPUT[user_id] = (chat_id, subname)
+            await query.message.answer(
+                f"✍️ <b>Please send your custom {subname} message now:</b>\n"
+                f"<i>Placeholders like {{mention}}, {{name}}, {{chat_title}} are supported.\nSend /cancel to abort.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            await query.answer("Waiting for text...")
+        else:
+            bot_me = await bot.get_me()
+            dm_link = f"https://t.me/{bot_me.username}?start=group_{abs(chat_id)}"
+            await query.answer("Please open settings in Private DM to customize text!", show_alert=True)
+        return
+
+    # 8. Rules Permission Toggle
+    if action == "toggle_rules_perm":
+        s["rules_perm"] = "admins" if s.get("rules_perm", "all") == "all" else "all"
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu("regulation", chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer(f"Rules permission: {s['rules_perm']}")
+        return
+
+    # 9. Language Switcher
+    if action == "setlang":
+        s["lang"] = subname
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu("lang", chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer(f"Language set to {subname.upper()}")
+        return
+
+    # 10. Legacy Warn Actions
     if action == "warn_inc":
         s["warn_limit"] = min(10, int(s.get("warn_limit", 3)) + 1)
         await query.answer(f"Warn Ceiling: {s['warn_limit']} violations")
@@ -2187,7 +3413,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         DatabaseService.save_settings_background(chat_id, chat_title, s)
         return
 
-    # 4. Anti-Flood Tuning & Punishment Mutations
+    # 11. Legacy Anti-Flood Actions
     elif action == "flood_toggle":
         s["flood_protection"] = not s.get("flood_protection", True)
         await query.answer(f"Anti-Flood: {'ACTIVE' if s['flood_protection'] else 'DISABLED'}")
@@ -2228,20 +3454,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         s["flood_duration"] = durations[(idx + 1) % len(durations)]
         await query.answer(f"Mute Duration: {format_duration(s['flood_duration'])}")
 
-    # 5. Anti-Bot Protection & Punishment
-    elif action == "bot_toggle":
-        s["block_bots"] = not s.get("block_bots", False)
-        await query.answer(f"Anti-Bot: {'ACTIVE' if s['block_bots'] else 'DISABLED'}")
-    elif action == "bot_action":
-        s["bot_action"] = "kick" if s.get("bot_action", "ban") == "ban" else "ban"
-        await query.answer(f"Anti-Bot Punishment: {s['bot_action'].upper()}")
-
-    # 6. Service Messages Cleaner
-    elif action == "service_toggle":
-        s["clean_service_messages"] = not s.get("clean_service_messages", True)
-        await query.answer(f"Join/Left Cleaner: {'ACTIVE' if s['clean_service_messages'] else 'DISABLED'}")
-
-    # 7. Links & Invites Restrictions
+    # 12. Legacy Links Actions
     elif action == "links_member":
         s["block_links"] = not s.get("block_links", False)
         await query.answer(f"Member Links: {'Blocked' if s['block_links'] else 'Allowed'}")
@@ -2255,7 +3468,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         s["link_action"] = "warn" if s.get("link_action", "delete") == "delete" else "delete"
         await query.answer(f"Link Action: {s['link_action'].upper()}")
 
-    # 8. Media Restrictions
+    # 13. Legacy Media Actions
     elif action == "media_sticker":
         s["block_sticker"] = not s.get("block_sticker", False)
         await query.answer(f"Stickers: {'Blocked' if s['block_sticker'] else 'Allowed'}")
@@ -2281,7 +3494,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         s["media_action"] = "warn" if s.get("media_action", "delete") == "delete" else "delete"
         await query.answer(f"Media Action: {s['media_action'].upper()}")
 
-    # 9. Excepted Admins Management
+    # 14. Legacy Excepted Actions
     elif action == "excepted_clear":
         s["excepted_admins"] = []
         await query.answer("All Excepted Admins cleared.", show_alert=True)
@@ -2291,19 +3504,13 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     # Background MongoDB persistence (write-behind non-blocking)
     DatabaseService.save_settings_background(chat_id, chat_title, s)
 
-    # Re-render appropriate screen
+    # Re-render appropriate screen for legacy actions
     if action.startswith("warn_"):
         text = format_warn_text(chat_title, s)
         kb = generate_warn_keyboard(chat_id, is_dm=is_dm)
     elif action.startswith("flood_"):
         text = format_flood_text(chat_title, s)
         kb = generate_flood_keyboard(chat_id, is_dm=is_dm)
-    elif action.startswith("bot_"):
-        text = format_bot_text(chat_title, s)
-        kb = generate_bot_keyboard(chat_id, is_dm=is_dm)
-    elif action.startswith("service_"):
-        text = format_service_text(chat_title, s)
-        kb = generate_service_keyboard(chat_id, is_dm=is_dm)
     elif action.startswith("links_"):
         text = format_links_text(chat_title, s)
         kb = generate_links_keyboard(chat_id, is_dm=is_dm)
@@ -2314,8 +3521,8 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         text = format_excepted_text(chat_title, s)
         kb = generate_excepted_keyboard(chat_id, is_dm=is_dm)
     else:
-        text = format_settings_text(chat_title, s)
-        kb = generate_settings_keyboard(chat_id, is_dm=is_dm)
+        text = format_settings_hub_text(chat_title)
+        kb = generate_settings_page1_keyboard(chat_id, is_dm=is_dm)
 
     try:
         await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -2391,15 +3598,414 @@ async def handle_cancel_warn_callback(query: CallbackQuery, bot: Bot) -> None:
 
 
 # ==============================================================================
-# PRIVATE DM CUSTOM WARN MESSAGE LISTENER & CANCEL ENGINE
+# CAPTCHA VERIFICATION CALLBACK HANDLER
+# ==============================================================================
+
+@router.callback_query(F.data.startswith("captcha:verify:"))
+async def handle_captcha_verify(query: CallbackQuery, bot: Bot) -> None:
+    """
+    Handles inline Captcha verification button clicks.
+    Unrestricts new members and clears the verification prompt immediately.
+    """
+    parts = query.data.split(":")
+    if len(parts) < 4:
+        await query.answer()
+        return
+
+    try:
+        target_chat_id = int(parts[2])
+        target_user_id = int(parts[3])
+    except ValueError:
+        await query.answer()
+        return
+
+    if query.from_user.id != target_user_id:
+        await query.answer("⚠️ This verification button is only for the newly joined member!", show_alert=True)
+        return
+
+    # Unrestrict member privileges
+    try:
+        await bot.restrict_chat_member(
+            chat_id=target_chat_id,
+            user_id=target_user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+    except Exception as e:
+        print(f"[CAPTCHA WARNING] Could not unrestrict member: {e}")
+
+    try:
+        await query.message.delete()
+    except Exception:
+        try:
+            await query.message.edit_text(
+                f"✅ {query.from_user.mention_html()} has been verified successfully! Welcome!",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+    await query.answer("✅ Verification successful! You can now participate in chat.", show_alert=False)
+
+
+# ==============================================================================
+# SUBMENU COMMAND HANDLERS (/rules, /welcome, /goodbye, /words, /filters, etc.)
+# ==============================================================================
+
+@router.message(Command("rules"))
+async def handle_rules(message: Message, bot: Bot) -> None:
+    """Displays the group regulations matching the permissions setting."""
+    chat_id = message.chat.id
+    if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        s = CHAT_SETTINGS[chat_id]
+        perm = s.get("rules_perm", "all")
+        if perm == "admins":
+            user_id = message.from_user.id if message.from_user else 0
+            sender_chat_id = message.sender_chat.id if message.sender_chat else None
+            if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+                await wipe_trigger(message)
+                return
+
+        chat_title = await get_cached_chat_title(bot, chat_id)
+        rules = s.get("rules_text", "").strip()
+        if rules:
+            text = f"📜 <b>Regulations of {html.escape(chat_title)}:</b>\n\n{rules}"
+        else:
+            text = f"📜 <i>No regulations have been defined for <b>{html.escape(chat_title)}</b> yet.\nAdmins can configure them with <code>/setrules &lt;text&gt;</code> or in <code>/settings</code>.</i>"
+
+        await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    else:
+        await message.answer("📜 Use <code>/rules</code> inside a group to view its regulations, or configure them via <b>⚙️ Manage group Settings</b>.")
+
+
+@router.message(Command("setrules"))
+async def handle_setrules(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Configures group regulations."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await message.answer("❌ This command can only be used in groups.")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/setrules &lt;regulations text&gt;</code>\n<i>You can also configure regulations interactively in /settings.</i>", parse_mode=ParseMode.HTML)
+        return
+
+    new_rules = command.args.strip()
+    s = CHAT_SETTINGS[chat_id]
+    s["rules_text"] = new_rules
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    await message.answer(f"✅ <b>Regulations updated successfully for {html.escape(chat_title)}!</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("welcome"))
+async def handle_preview_welcome(message: Message, bot: Bot) -> None:
+    """Previews the active welcome greeting."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    st = "🟢 Enabled" if s.get("welcome_enabled") else "🔴 Disabled"
+    template = s.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
+    sample = template.replace("{mention}", message.from_user.mention_html()) \
+                     .replace("{name}", html.escape(message.from_user.full_name)) \
+                     .replace("{chat_title}", html.escape(chat_title)) \
+                     .replace("{id}", str(user_id))
+
+    await message.answer(
+        f"💬 <b>Welcome Status:</b> {st}\n\n"
+        f"<b>Preview:</b>\n{sample}\n\n"
+        f"<i>To change template, use <code>/setwelcome &lt;text&gt;</code> or configure in <code>/settings</code>.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setwelcome"))
+async def handle_setwelcome(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Configures the welcome message template."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/setwelcome &lt;welcome text&gt;</code>\nPlaceholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+    s["welcome_msg"] = command.args.strip()
+    s["welcome_enabled"] = True
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    await message.answer("✅ <b>Welcome message updated and enabled!</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("goodbye"))
+async def handle_preview_goodbye(message: Message, bot: Bot) -> None:
+    """Previews the active goodbye farewell."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    st = "🟢 Enabled" if s.get("goodbye_enabled") else "🔴 Disabled"
+    template = s.get("goodbye_msg", "👋 Goodbye, {mention}!")
+    sample = template.replace("{mention}", message.from_user.mention_html()) \
+                     .replace("{name}", html.escape(message.from_user.full_name)) \
+                     .replace("{chat_title}", html.escape(chat_title)) \
+                     .replace("{id}", str(user_id))
+
+    await message.answer(
+        f"👋 <b>Goodbye Status:</b> {st}\n\n"
+        f"<b>Preview:</b>\n{sample}\n\n"
+        f"<i>To change template, use <code>/setgoodbye &lt;text&gt;</code> or configure in <code>/settings</code>.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setgoodbye"))
+async def handle_setgoodbye(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Configures the goodbye message template."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/setgoodbye &lt;farewell text&gt;</code>\nPlaceholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+    s["goodbye_msg"] = command.args.strip()
+    s["goodbye_enabled"] = True
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    await message.answer("✅ <b>Goodbye message updated and enabled!</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("addword"))
+async def handle_addword(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Adds a prohibited word to the banned words filter."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/addword &lt;word or phrase&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    word = command.args.strip().lower()
+    s = CHAT_SETTINGS[chat_id]
+    words_list = s.get("banned_words", [])
+    if word not in words_list:
+        words_list.append(word)
+        s["banned_words"] = words_list
+        chat_title = await get_cached_chat_title(bot, chat_id)
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        await message.answer(f"✅ Added <code>{html.escape(word)}</code> to banned words list.", parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(f"ℹ️ <code>{html.escape(word)}</code> is already in the banned words list.", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("delword"))
+async def handle_delword(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Removes a word from the banned words filter."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/delword &lt;word or phrase&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    word = command.args.strip().lower()
+    s = CHAT_SETTINGS[chat_id]
+    words_list = s.get("banned_words", [])
+    if word in words_list:
+        words_list.remove(word)
+        s["banned_words"] = words_list
+        chat_title = await get_cached_chat_title(bot, chat_id)
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        await message.answer(f"✅ Removed <code>{html.escape(word)}</code> from banned words list.", parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(f"ℹ️ <code>{html.escape(word)}</code> was not in the banned words list.", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("words"))
+async def handle_words(message: Message, bot: Bot) -> None:
+    """Lists currently prohibited words in the group."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    s = CHAT_SETTINGS[chat_id]
+    words_list = s.get("banned_words", [])
+    if not words_list:
+        await message.answer("🔤 No banned words currently configured. Add words using <code>/addword &lt;word&gt;</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    items = "\n".join(f"• <code>{html.escape(w)}</code>" for w in words_list[:50])
+    await message.answer(f"🔤 <b>Banned Words ({len(words_list)}):</b>\n\n{items}", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("filter"))
+async def handle_add_filter(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Adds a custom keyword trigger and reply filter."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/filter &lt;keyword&gt; &lt;reply text&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    parts = command.args.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("⚠️ Please provide both a keyword trigger and a reply text.\nUsage: <code>/filter &lt;keyword&gt; &lt;reply text&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    trigger, reply_text = parts[0].lower(), parts[1]
+    s = CHAT_SETTINGS[chat_id]
+    filters_dict = s.get("custom_filters", {})
+    filters_dict[trigger] = reply_text
+    s["custom_filters"] = filters_dict
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    await message.answer(f"✅ Filter added for <code>{html.escape(trigger)}</code>!", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("stop"))
+async def handle_stop_filter(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Removes a custom keyword reply filter."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/stop &lt;keyword&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    trigger = command.args.strip().lower()
+    s = CHAT_SETTINGS[chat_id]
+    filters_dict = s.get("custom_filters", {})
+    if trigger in filters_dict:
+        del filters_dict[trigger]
+        s["custom_filters"] = filters_dict
+        chat_title = await get_cached_chat_title(bot, chat_id)
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        await message.answer(f"✅ Stopped filter for <code>{html.escape(trigger)}</code>.", parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(f"ℹ️ No active filter found for <code>{html.escape(trigger)}</code>.", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("filters"))
+async def handle_list_filters(message: Message, bot: Bot) -> None:
+    """Lists all active custom keyword filters in the group."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    s = CHAT_SETTINGS[chat_id]
+    filters_dict = s.get("custom_filters", {})
+    if not filters_dict:
+        await message.answer("📱 No custom personal filters active in this group.\nAdd one with <code>/filter &lt;word&gt; &lt;reply&gt;</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    items = "\n".join(f"• <code>{html.escape(k)}</code>" for k in sorted(filters_dict.keys())[:30])
+    await message.answer(f"📱 <b>Active Filters ({len(filters_dict)}):</b>\n\n{items}", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("setlog"))
+async def handle_setlog(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Designates a channel for security audit logging."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await message.answer("⚠️ Usage: <code>/setlog &lt;channel_id or @channel_username&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    target_channel = command.args.strip()
+    s = CHAT_SETTINGS[chat_id]
+    s["log_channel"] = target_channel
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    await message.answer(f"✅ <b>Audit Log Channel set to:</b> <code>{html.escape(target_channel)}</code>", parse_mode=ParseMode.HTML)
+
+
+# ==============================================================================
+# PRIVATE DM CUSTOM TEXT LISTENER & CANCEL ENGINE
 # ==============================================================================
 
 @router.message(Command("cancel"), F.chat.type == ChatType.PRIVATE)
 async def handle_dm_cancel_input(message: Message) -> None:
-    """Cancels active custom warning message editing in private DM."""
+    """Cancels active custom text editing in private DM."""
     user_id = message.from_user.id if message.from_user else 0
+    cancelled = False
+
     if user_id in PENDING_CUSTOM_WARN:
         chat_id = PENDING_CUSTOM_WARN.pop(user_id)
+        cancelled = True
         await message.answer(
             "❌ Custom warning message configuration cancelled.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2408,50 +4014,119 @@ async def handle_dm_cancel_input(message: Message) -> None:
             ])
         )
 
+    if user_id in PENDING_CUSTOM_INPUT:
+        chat_id, subname = PENDING_CUSTOM_INPUT.pop(user_id)
+        cancelled = True
+        back_data = f"set:menu:{subname}:{chat_id}" if subname != "main" else f"set:page:1:{chat_id}"
+        await message.answer(
+            f"❌ Custom {subname} configuration cancelled.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"⚙️ Return to {subname.capitalize()} Settings", callback_data=back_data)],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+            ])
+        )
+
+    if not cancelled:
+        await message.answer("ℹ️ No active configuration to cancel.")
+
 
 @router.message(F.chat.type == ChatType.PRIVATE, ~F.text.startswith("/"))
-async def handle_dm_custom_warn_text(message: Message, bot: Bot) -> None:
+async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
     """
-    Listens for custom warning message template input sent by an authorized admin in private DM.
-    Saves the template to chat settings and MongoDB and shows a live preview.
+    Listens for custom configuration text sent by an authorized admin in private DM:
+    - Custom warning templates (PENDING_CUSTOM_WARN)
+    - Custom rules, welcome, goodbye, or other templates (PENDING_CUSTOM_INPUT)
     """
     user_id = message.from_user.id if message.from_user else 0
-    if user_id not in PENDING_CUSTOM_WARN:
+
+    # 1. Handle PENDING_CUSTOM_INPUT (Rules, Welcome, Goodbye, etc.)
+    if user_id in PENDING_CUSTOM_INPUT:
+        chat_id, subname = PENDING_CUSTOM_INPUT.pop(user_id)
+        if not await check_can_setup_bot(bot, chat_id, user_id):
+            await message.answer("❌ You are no longer authorized to manage settings for this group.")
+            return
+
+        custom_text = message.text.strip()
+        if len(custom_text) > 2000:
+            PENDING_CUSTOM_INPUT[user_id] = (chat_id, subname)
+            await message.answer("❌ Text too long (maximum 2000 characters). Please send a shorter text.")
+            return
+
+        s = CHAT_SETTINGS[chat_id]
+        chat_title = await get_cached_chat_title(bot, chat_id)
+
+        if subname in ("rules", "regulation"):
+            s["rules_text"] = custom_text
+            back_key = "regulation"
+            label = "Regulation"
+        elif subname == "welcome":
+            s["welcome_msg"] = custom_text
+            s["welcome_enabled"] = True
+            back_key = "welcome"
+            label = "Welcome Message"
+        elif subname == "goodbye":
+            s["goodbye_msg"] = custom_text
+            s["goodbye_enabled"] = True
+            back_key = "goodbye"
+            label = "Goodbye Message"
+        else:
+            back_key = "main"
+            label = subname.capitalize()
+
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"⚙️ Return to {label} Settings", callback_data=f"set:menu:{back_key}:{chat_id}")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+        ])
+
+        await message.answer(
+            f"✅ <b>Custom {label} Saved!</b>\n\n"
+            f"<b>Group:</b> <code>{html.escape(chat_title)}</code>\n\n"
+            f"<b>Preview:</b>\n\n"
+            f"{html.escape(custom_text)}\n\n"
+            f"<i>Your updated configuration is live immediately across the group.</i>",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
+        )
         return
 
-    chat_id = PENDING_CUSTOM_WARN.pop(user_id)
-    if not await check_can_setup_bot(bot, chat_id, user_id):
-        await message.answer("❌ You are no longer authorized to manage settings for this group.")
+    # 2. Handle PENDING_CUSTOM_WARN
+    if user_id in PENDING_CUSTOM_WARN:
+        chat_id = PENDING_CUSTOM_WARN.pop(user_id)
+        if not await check_can_setup_bot(bot, chat_id, user_id):
+            await message.answer("❌ You are no longer authorized to manage settings for this group.")
+            return
+
+        custom_text = message.text.strip()
+        if len(custom_text) > 1000:
+            PENDING_CUSTOM_WARN[user_id] = chat_id
+            await message.answer("❌ Message template too long (maximum 1000 characters). Please send a shorter template.")
+            return
+
+        s = CHAT_SETTINGS[chat_id]
+        s["custom_warn_msg"] = custom_text
+        chat_title = await get_cached_chat_title(bot, chat_id)
+
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+
+        preview = format_warn_notice(chat_id, message.from_user, "Blocked Link Violation", count=1, ceiling=int(s.get("warn_limit", 3)), chat_title=chat_title)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Return to Warn Settings", callback_data=f"set:menu:warn:{chat_id}")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+        ])
+
+        await message.answer(
+            f"✅ <b>Custom Warning Message Saved!</b>\n\n"
+            f"<b>Group:</b> <code>{chat_title}</code>\n\n"
+            f"<b>Live Notice Preview:</b>\n\n"
+            f"{preview}\n\n"
+            f"<i>This custom message will now be used for all warning notices in {chat_title}.</i>",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML
+        )
         return
-
-    custom_text = message.text.strip()
-    if len(custom_text) > 1000:
-        PENDING_CUSTOM_WARN[user_id] = chat_id
-        await message.answer("❌ Message template too long (maximum 1000 characters). Please send a shorter template.")
-        return
-
-    s = CHAT_SETTINGS[chat_id]
-    s["custom_warn_msg"] = custom_text
-    chat_title = await get_cached_chat_title(bot, chat_id)
-
-    DatabaseService.save_settings_background(chat_id, chat_title, s)
-
-    preview = format_warn_notice(chat_id, message.from_user, "Blocked Link Violation", count=1, ceiling=int(s.get("warn_limit", 3)), chat_title=chat_title)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Return to Warn Settings", callback_data=f"set:menu:warn:{chat_id}")],
-        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
-    ])
-
-    await message.answer(
-        f"✅ <b>Custom Warning Message Saved!</b>\n\n"
-        f"<b>Group:</b> <code>{chat_title}</code>\n\n"
-        f"<b>Live Notice Preview:</b>\n\n"
-        f"{preview}\n\n"
-        f"<i>This custom message will now be used for all warning notices in {chat_title}.</i>",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML
-    )
 
 
 @router.message(Command("help"))
@@ -2465,7 +4140,20 @@ async def handle_help(message: Message, bot: Bot) -> None:
     text = (
         "⚡ <b>High-Speed Telegram Admin Engine Active</b>\n\n"
         "<b>Available Admin Commands:</b>\n"
-        "• <code>/start</code> - Open group protection settings (Authorized admins only)\n"
+        "• <code>/start</code> or <code>/settings</code> - Open group protection settings\n"
+        "• <code>/rules</code> - Show group regulations\n"
+        "• <code>/setrules &lt;text&gt;</code> - Configure group regulations\n"
+        "• <code>/welcome</code> - Preview welcome message\n"
+        "• <code>/setwelcome &lt;text&gt;</code> - Configure welcome greeting template\n"
+        "• <code>/goodbye</code> - Preview goodbye message\n"
+        "• <code>/setgoodbye &lt;text&gt;</code> - Configure goodbye farewell template\n"
+        "• <code>/words</code> - List prohibited banned words\n"
+        "• <code>/addword &lt;word&gt;</code> - Add word to prohibited list\n"
+        "• <code>/delword &lt;word&gt;</code> - Remove word from prohibited list\n"
+        "• <code>/filters</code> - List active custom keyword filters\n"
+        "• <code>/filter &lt;word&gt; &lt;reply&gt;</code> - Add custom keyword filter\n"
+        "• <code>/stop &lt;word&gt;</code> - Remove custom keyword filter\n"
+        "• <code>/setlog &lt;channel&gt;</code> - Designate security audit log channel\n"
         "• <code>/mute &lt;time&gt; [reason]</code> - Restrict user send permissions\n"
         "• <code>/dmute &lt;time&gt; [reason]</code> - Wipe replied message + Mute user\n"
         "• <code>/unmute</code> - Restore user chat privileges\n"
@@ -3098,6 +4786,19 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="warn", description="Issue warning with auto-enforcement"),
         BotCommand(command="resetwarn", description="Clear user warning counter"),
         BotCommand(command="warns", description="Check user warning status"),
+        BotCommand(command="rules", description="View group regulations"),
+        BotCommand(command="setrules", description="Configure regulations"),
+        BotCommand(command="welcome", description="Preview welcome greeting"),
+        BotCommand(command="setwelcome", description="Configure welcome message"),
+        BotCommand(command="goodbye", description="Preview goodbye message"),
+        BotCommand(command="setgoodbye", description="Configure goodbye message"),
+        BotCommand(command="words", description="List prohibited words"),
+        BotCommand(command="addword", description="Add banned word"),
+        BotCommand(command="delword", description="Remove banned word"),
+        BotCommand(command="filters", description="List personal keyword filters"),
+        BotCommand(command="filter", description="Add keyword reply filter"),
+        BotCommand(command="stop", description="Remove keyword filter"),
+        BotCommand(command="setlog", description="Set audit log channel"),
         BotCommand(command="report", description="(Reply only) Report message publicly"),
         BotCommand(command="show", description="(Reply only) Report message to admins in PM"),
         BotCommand(command="addexcept", description="Designate admin to receive reports"),
@@ -3110,6 +4811,7 @@ async def setup_bot_commands(bot: Bot) -> None:
 
     # Commands visible to regular members inside group chats
     group_member_commands = [
+        BotCommand(command="rules", description="View group regulations"),
         BotCommand(command="report", description="(Reply only) Report message publicly"),
         BotCommand(command="show", description="(Reply only) Report message to admins in PM"),
     ]
@@ -3340,6 +5042,7 @@ async def resource_optimizer_worker() -> None:
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
+                PENDING_CUSTOM_INPUT.clear()
                 CHAT_TITLES.clear()
 
             if rss_mb > 400.0:
@@ -3348,6 +5051,7 @@ async def resource_optimizer_worker() -> None:
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
+                PENDING_CUSTOM_INPUT.clear()
                 CHAT_TITLES.clear()
                 print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
 
