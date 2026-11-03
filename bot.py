@@ -13,6 +13,16 @@ import os
 import re
 import sys
 import time
+
+# Configure stdout and stderr for immediate line-buffering so Render / Docker live logs stream instantly
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+os.environ["PYTHONUNBUFFERED"] = "1"
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -3429,10 +3439,10 @@ async def start_render_health_server() -> Optional[web.AppRunner]:
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        print(f"[RENDER] Health check route /health active on 0.0.0.0:{port}")
+        print(f"[RENDER] Health check route /health active on 0.0.0.0:{port}", flush=True)
         return runner
     except Exception as e:
-        print(f"[RENDER WARNING] Could not bind health server to port {port}: {e}")
+        print(f"[RENDER WARNING] Could not bind health server to port {port}: {e}", flush=True)
         return None
 
 
@@ -3441,20 +3451,39 @@ async def start_render_health_server() -> Optional[web.AppRunner]:
 # ==============================================================================
 
 async def main() -> None:
-    token = os.getenv("BOT_TOKEN")
-    if not token or token.strip() == "YOUR_BOT_TOKEN_HERE":
-        print("=" * 70)
-        print("[CRITICAL] BOT_TOKEN is not configured!")
-        print("Please set the BOT_TOKEN environment variable or populate it in your .env file.")
-        print("Example: set BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ")
-        print("=" * 70)
-        # Still validate initialization for syntax testing
-        if len(sys.argv) > 1 and sys.argv[1] == "--check-syntax":
-            print("[STATUS] Syntax and logic compilation verified successfully.")
-            return
-        sys.exit(1)
+    # 1. Immediately bind HTTP health check server on $PORT (default 10000).
+    # This satisfies Render Web Service's port-binding check instantly (<0.05s)
+    # so the deployment is immediately acknowledged as healthy and marked LIVE.
+    health_runner = await start_render_health_server()
 
-    print(f"[INITIALIZING] Launching Ultra-Optimized Admin Bot with {LOOP_ENGINE}...")
+    token = os.getenv("BOT_TOKEN")
+    if not token or token.strip() in ("", "YOUR_BOT_TOKEN_HERE"):
+        print("=" * 70, flush=True)
+        print("[CRITICAL] BOT_TOKEN is not configured in Render Environment Variables!", flush=True)
+        print("To complete deployment:", flush=True)
+        print("1. Go to Render Dashboard -> This Web Service -> 'Environment'.", flush=True)
+        print("2. Add Key: BOT_TOKEN, Value: <your_telegram_bot_token>", flush=True)
+        print("3. Click 'Save Changes' - the bot will start immediately!", flush=True)
+        print("=" * 70, flush=True)
+        BOT_IDENTITY["status"] = "BOT_TOKEN_MISSING"
+
+        if len(sys.argv) > 1 and sys.argv[1] == "--check-syntax":
+            print("[STATUS] Syntax and logic compilation verified successfully.", flush=True)
+            if health_runner:
+                await health_runner.cleanup()
+            return
+
+        # Keep HTTP health check server alive so Render marks the service LIVE
+        # and displays this actionable diagnostic message instead of failing with a 20-minute port timeout!
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            if health_runner:
+                await health_runner.cleanup()
+        return
+
+    print(f"[INITIALIZING] Launching Ultra-Optimized Admin Bot with {LOOP_ENGINE}...", flush=True)
 
     # High-efficiency metered session connector with DNS caching & socket limit (Render RAM & Bandwidth optimization)
     session = MeteredAiohttpSession(limit=10)
@@ -3473,8 +3502,10 @@ async def main() -> None:
         BOT_IDENTITY["username"] = me.username or "personal_guardBot"
         BOT_IDENTITY["id"] = me.id
         BOT_IDENTITY["status"] = "ONLINE"
+        print(f"[BOT] Connected as @{BOT_IDENTITY['username']} (ID: {BOT_IDENTITY['id']})", flush=True)
     except Exception as e:
-        print(f"[BOT] Profile resolution notice: {e}")
+        print(f"[BOT WARNING] Profile resolution notice: {e}", flush=True)
+        BOT_IDENTITY["status"] = "OFFLINE"
 
     # Register high-speed Anti-Flood Middleware
     dp.message.middleware(AntiFloodMiddleware())
@@ -3483,7 +3514,10 @@ async def main() -> None:
     dp.include_router(router)
 
     # Delete existing webhook to guarantee clean fast long-polling
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print(f"[BOT WARNING] delete_webhook notice: {e}", flush=True)
 
     # Connect to MongoDB & hydrate in-memory caches
     await MongoDBManager.connect()
@@ -3492,15 +3526,15 @@ async def main() -> None:
         await DatabaseService.hydrate_warn_cache(WARN_CACHE)
 
     # Register admin-only command catalog with Telegram API
-    await setup_bot_commands(bot)
+    try:
+        await setup_bot_commands(bot)
+    except Exception as e:
+        print(f"[BOT WARNING] Command setup notice: {e}", flush=True)
 
     # Start background RAM & cache resource optimizer task
     optimizer_task = asyncio.create_task(resource_optimizer_worker())
 
-    # Start Render health server if PORT is assigned
-    health_runner = await start_render_health_server()
-
-    print(f"[READY] Listening for commands with zero DB roundtrips. Engine: {LOOP_ENGINE}")
+    print(f"[READY] Listening for commands with zero DB roundtrips. Engine: {LOOP_ENGINE}", flush=True)
 
     try:
         # Polling timeout set to 50s: holds long-polling socket up to 50s on Telegram server.
