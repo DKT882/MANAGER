@@ -68,9 +68,53 @@ Command autocomplete and menus in Telegram are strictly scoped:
 | `/addexcept`| `/addexcept [target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report alerts. |
 | `/remexcept`| `/remexcept [target]` | Owner / Anon / Excepted | Removes an admin from the Excepted Admin report notification list. |
 | `/excepted` | `/excepted` | Owner / Anon / Excepted | Displays all currently configured Excepted Admins in the chat. |
+| `/rules` | `/rules` | Configurable (All / Admins) | Displays group regulations in chat. |
+| `/setrules` | `/setrules <text>` | Owner / Anon / Excepted | Configures the group regulations template. |
+| `/welcome` | `/welcome` | Administrators | Previews current welcome greeting template. |
+| `/setwelcome` | `/setwelcome <text>` | Owner / Anon / Excepted | Configures welcome greeting (supports `{mention}`, `{name}`, `{chat_title}`, `{id}`). |
+| `/goodbye` | `/goodbye` | Administrators | Previews current goodbye farewell template. |
+| `/setgoodbye` | `/setgoodbye <text>` | Owner / Anon / Excepted | Configures goodbye farewell template. |
+| `/words` | `/words` | Administrators | Lists prohibited banned words. |
+| `/addword` | `/addword <word>` | Owner / Anon / Excepted | Adds word or phrase to prohibited words filter. |
+| `/delword` | `/delword <word>` | Owner / Anon / Excepted | Removes word from prohibited words filter. |
+| `/filters` | `/filters` | Administrators | Lists all active personal keyword reply filters. |
+| `/filter` | `/filter <word> <reply>` | Owner / Anon / Excepted | Adds personal trigger keyword and auto-reply. |
+| `/stop` | `/stop <word>` | Owner / Anon / Excepted | Deactivates personal trigger keyword. |
+| `/setlog` | `/setlog <channel>` | Owner / Anon / Excepted | Designates audit log channel for administrative records. |
 | `/start` | `/start` | Owner / Anon / Excepted | Launches the bot and immediately displays group settings (strictly visible to authorized admins only). In DM: opens multi-group management hub. |
 | `/settings` | `/settings` | Owner / Anon / Excepted | Alias to `/start` group settings dashboard. |
 | `/setcommands`| `/setcommands` | Owner / Anon / Excepted | Forces synchronization of scoped command menus with Telegram. |
+
+---
+
+## 🎛️ Rose / Group Help Style Settings Architecture
+
+### 1. Group Execution Prompt
+When `/settings` is sent in a group chat by an authorized admin (Owner, Anonymous Admin, or Excepted Admin):
+- **`👥 Open here`**: Opens the interactive 2-column settings dashboard directly within the group.
+- **`👤 Open in Private Chat`**: Deep links to the bot's private chat to configure the group confidentially.
+
+### 2. Settings Grid (Page 1 & Page 2)
+- **Page 1 (2-Column Grid):**
+  - `📜 Regulation` | `✉️ Anti-Spam`
+  - `💬 Welcome` | `🗣️ Anti-Flood`
+  - `👋 Goodbye` | `🕉 Alphabets`
+  - `🧠 Captcha` | `🔦 Checks`
+  - `🆘 @Admin` | `🔐 Blocks`
+  - `📸 Media` | `🔞 Porn`
+  - `❗ Warns` | `🌘 Night`
+  - `🔔 Tag` | `🔗 Link`
+  - `🕵️ Guardian Bot 🆕` (Full width)
+  - `📭 Approval mode` (Full width)
+  - `🗑️ Deleting Messages` (Full width)
+  - Navigation: `🇬🇧 Lang` | `✅ Close` | `▶️ Other`
+- **Page 2 ("Other"):**
+  - `📁 Topic`, `🔤 Banned Words`, `🕒 Recurring messages`, `👥 Members Management`, `🧕 Masked users`, `📣 Discussion group 🆕`, `📱 Personal Commands`, `🎭 Magic Stickers&GIFs`, `📏 Message length`, `📢 Channels management 🆕`, `🖋 Permissions` | `🔍 Log Channel`, and `◀️ Back` | `✅ Close` | `🇬🇧 Lang`.
+
+### 3. Inline Warning Cancellation
+- Warning notices feature an inline **`❌ Cancel Warning`** button.
+- Strictly validated: Any group administrator can cancel/forgive warnings.
+- The button can be toggled on/off in the Warn settings submenu.
 
 ---
 

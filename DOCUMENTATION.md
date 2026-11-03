@@ -100,6 +100,19 @@ The engine validates the native administrator custom privileges:
 | `/addexcept` | `[target]` | Owner / Anon / Excepted | Designates an admin as an Excepted Admin to receive report notifications. |
 | `/remexcept` | `[target]` | Owner / Anon / Excepted | Removes an admin from the Excepted Admin report notification list. |
 | `/excepted` | None | Owner / Anon / Excepted | Lists all currently configured Excepted Admins in the chat. |
+| `/rules` | None | Configurable (All / Admins) | Displays group regulations in chat. |
+| `/setrules` | `<regulations text>` | Owner / Anon / Excepted | Configures group regulations. |
+| `/welcome` | None | Administrators | Previews active welcome greeting. |
+| `/setwelcome` | `<welcome text>` | Owner / Anon / Excepted | Configures welcome message with `{mention}`, `{name}`, `{chat_title}`, `{id}`. |
+| `/goodbye` | None | Administrators | Previews active goodbye farewell. |
+| `/setgoodbye` | `<farewell text>` | Owner / Anon / Excepted | Configures goodbye message. |
+| `/words` | None | Administrators | Lists prohibited banned words. |
+| `/addword` | `<word>` | Owner / Anon / Excepted | Adds word or phrase to prohibited filter. |
+| `/delword` | `<word>` | Owner / Anon / Excepted | Removes word from prohibited filter. |
+| `/filters` | None | Administrators | Lists all active personal keyword reply filters. |
+| `/filter` | `<keyword> <reply>` | Owner / Anon / Excepted | Adds keyword trigger and auto-reply. |
+| `/stop` | `<keyword>` | Owner / Anon / Excepted | Deactivates keyword trigger. |
+| `/setlog` | `<channel_id or @username>` | Owner / Anon / Excepted | Designates security audit log channel. |
 | `/start` | None | Owner / Anon / Excepted | Launches the bot and immediately displays group settings (strictly visible to authorized admins only). In DM: opens multi-group management hub. |
 | `/settings` | None | Owner / Anon / Excepted | Alias to `/start` for backward compatibility. |
 | `/setcommands` | None | Owner / Anon / Excepted | Force synchronizes the scoped admin-only command menu. |
