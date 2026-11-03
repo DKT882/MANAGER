@@ -283,34 +283,62 @@ async def wipe_trigger(message: Message) -> None:
         pass
 
 
+async def _delayed_delete(msg: Message, delay: int) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def send_ephemeral(message: Message, text: str, delay: int = 5) -> None:
+    """Sends an ephemeral notice and auto-deletes it after delay seconds to keep chat clean."""
+    try:
+        msg = await message.answer(text, parse_mode=ParseMode.HTML)
+        if delay > 0:
+            asyncio.create_task(_delayed_delete(msg, delay))
+    except Exception:
+        pass
+
+
 async def check_admin_rights(
     bot: Bot,
     chat_id: int,
     user_id: int,
-    required_permission: Optional[str] = None
+    required_permission: Optional[str] = None,
+    sender_chat_id: Optional[int] = None
 ) -> bool:
     """
     Strict parallel validation against native Telegram administrator custom rights.
-    Utilizes local high-speed TTL cache. If user lacks explicit rights, returns False quietly.
+    Supports Anonymous Admins (sender_chat_id == chat_id or user_id in (1087968824, 777000)).
+    Utilizes local high-speed TTL cache.
     """
-    if not user_id or not chat_id:
+    if not chat_id:
+        return False
+
+    # 1. Anonymous admin speaking as the group itself
+    if sender_chat_id and sender_chat_id == chat_id:
+        return True
+    if user_id in (1087968824, 777000):  # GroupAnonymousBot / Telegram Service
+        return True
+
+    if not user_id:
         return False
 
     now = time.monotonic()
     cache_key = (chat_id, user_id)
 
-    # 1. Inspect local memory cache
+    # 2. Inspect local memory cache
     if cache_key in ADMIN_CACHE:
-        cached_time, perms, is_owner, _ = ADMIN_CACHE[cache_key]
+        cached_time, perms, is_owner, is_anon = ADMIN_CACHE[cache_key]
         if now - cached_time < ADMIN_CACHE_TTL:
-            if is_owner:
+            if is_owner or is_anon:
                 return True
             if required_permission is None:
                 return len(perms) > 0 or "is_admin" in perms
             return required_permission in perms
 
-    # 2. Fetch fresh native rights from Telegram API
-    # Enforce strict cache bounds (<= 300 entries) to guarantee minimal memory usage (<30MB RAM)
+    # 3. Enforce strict cache bounds (<= 300 entries) to guarantee minimal memory usage (<30MB RAM)
     if len(ADMIN_CACHE) >= 300:
         for k in list(ADMIN_CACHE.keys()):
             if now - ADMIN_CACHE[k][0] > ADMIN_CACHE_TTL:
@@ -319,10 +347,11 @@ async def check_admin_rights(
             for k in list(ADMIN_CACHE.keys())[:50]:
                 ADMIN_CACHE.pop(k, None)
 
+    # 4. Fetch fresh native rights from Telegram API
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         if isinstance(member, ChatMemberOwner):
-            ADMIN_CACHE[cache_key] = (now, set(), True, False)
+            ADMIN_CACHE[cache_key] = (now, {"is_admin", "owner"}, True, False)
             return True
         elif isinstance(member, ChatMemberAdministrator):
             is_anon = getattr(member, "is_anonymous", False)
@@ -343,14 +372,27 @@ async def check_admin_rights(
                 perms.add("can_invite_users")
 
             ADMIN_CACHE[cache_key] = (now, perms, False, is_anon)
+            if is_anon or is_owner:
+                return True
             if required_permission is None:
                 return True
             return required_permission in perms
         else:
             ADMIN_CACHE[cache_key] = (now, set(), False, False)
             return False
-    except Exception:
+    except Exception as e:
+        print(f"[ADMIN CHECK NOTICE] get_chat_member failed: {e}")
         return False
+
+
+async def is_user_admin(
+    bot: Bot,
+    chat_id: int,
+    user_id: int,
+    sender_chat_id: Optional[int] = None
+) -> bool:
+    """Convenience alias for general admin validation."""
+    return await check_admin_rights(bot, chat_id, user_id, sender_chat_id=sender_chat_id)
 
 
 async def check_can_setup_bot(
@@ -489,10 +531,15 @@ async def resolve_target(
     Returns: (target_user_id, target_user_name, extra_arguments_string)
     """
     # 1. Target from replied message
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target_user = message.reply_to_message.from_user
-        extra_args = command.args if command and command.args else ""
-        return target_user.id, target_user.full_name, extra_args.strip()
+    if message.reply_to_message:
+        if message.reply_to_message.from_user:
+            target_user = message.reply_to_message.from_user
+            extra_args = command.args if command and command.args else ""
+            return target_user.id, target_user.full_name, extra_args.strip()
+        elif message.reply_to_message.sender_chat:
+            sc = message.reply_to_message.sender_chat
+            extra_args = command.args if command and command.args else ""
+            return sc.id, sc.title or f"Channel {sc.id}", extra_args.strip()
 
     # 2. Target from command arguments (user ID or @username)
     if command and command.args:
@@ -1129,30 +1176,35 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
 # ------------------------------------------------------------------------------
 @router.message(Command("mute", "dmute"))
 async def handle_mute(message: Message, command: CommandObject, bot: Bot) -> None:
-    # RULE: Immediate async call to message.delete() BEFORE anything else
     await wipe_trigger(message)
 
-    # Parallel Native Administrator Rights Validation
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can restrict members.")
         return
 
-    target_id, target_name, remaining_args = await resolve_target(message, command)
+    target_id, target_name, remaining_args = await resolve_target(message, command, bot=bot)
+    cmd_name = command.command if command else "mute"
     if not target_id:
+        await send_ephemeral(
+            message,
+            f"⚠️ <b>Usage:</b> Reply to a user's message or specify User ID / @username:\n"
+            f"<code>/{cmd_name} [time] [reason]</code> (e.g. <code>/{cmd_name} 10m flood</code>)"
+        )
         return
 
-    # Check if target is an admin (cannot restrict admins)
     if await check_admin_rights(bot, message.chat.id, target_id):
+        await send_ephemeral(message, "⚠️ Cannot restrict another administrator.")
         return
 
     # If /dmute, wipe target replied-to message as well
-    if command.command.lower() == "dmute" and message.reply_to_message:
+    if command and command.command.lower() == "dmute" and message.reply_to_message:
         try:
             await message.reply_to_message.delete()
         except Exception:
             pass
 
-    # Parse duration (e.g. /mute 10m flood)
     parts = remaining_args.split(maxsplit=1) if remaining_args else []
     duration_str = parts[0] if parts else None
     reason = parts[1] if len(parts) > 1 else "No reason specified"
@@ -1172,8 +1224,17 @@ async def handle_mute(message: Message, command: CommandObject, bot: Bot) -> Non
             ),
             until_date=until_ts if until_ts > 0 else None
         )
-    except Exception:
-        pass
+        mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+        label = "Muted & Deleted" if command and command.command.lower() == "dmute" else "Muted"
+        await message.answer(
+            f"🔇 <b>{label}:</b> {mention}\n"
+            f"⏱️ <b>Duration:</b> <code>{duration_label}</code>\n"
+            f"📝 <b>Reason:</b> <i>{html.escape(reason)}</i>",
+            parse_mode=ParseMode.HTML
+        )
+        DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "mute", reason)
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to mute member: <code>{html.escape(str(e))}</code>. Please ensure the bot is an Administrator with 'Restrict Members' right.")
 
 
 @router.message(Command("unmute"))
@@ -1181,11 +1242,14 @@ async def handle_unmute(message: Message, command: CommandObject, bot: Bot) -> N
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can unmute members.")
         return
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, target_name, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a message or pass User ID / @username with <code>/unmute</code>.")
         return
 
     try:
@@ -1199,8 +1263,11 @@ async def handle_unmute(message: Message, command: CommandObject, bot: Bot) -> N
                 can_add_web_page_previews=True,
             )
         )
-    except Exception:
-        pass
+        mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+        await message.answer(f"🔊 <b>Unmuted:</b> {mention}. Chat permissions restored.", parse_mode=ParseMode.HTML)
+        DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "unmute")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to unmute: <code>{html.escape(str(e))}</code>.")
 
 
 # ------------------------------------------------------------------------------
@@ -1208,25 +1275,28 @@ async def handle_unmute(message: Message, command: CommandObject, bot: Bot) -> N
 # ------------------------------------------------------------------------------
 @router.message(Command("pin"))
 async def handle_pin(message: Message, bot: Bot) -> None:
-    # RULE: Immediate async call to message.delete()
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_pin_messages"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_pin_messages", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can pin messages.")
         return
 
     if not message.reply_to_message:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to the message you want to pin with <code>/pin</code>.")
         return
 
     try:
-        # Notification suppression: disable_notification=True
         await bot.pin_chat_message(
             chat_id=message.chat.id,
             message_id=message.reply_to_message.message_id,
             disable_notification=True
         )
-    except Exception:
-        pass
+        await send_ephemeral(message, "📌 <b>Message pinned silently.</b>", delay=4)
+        DatabaseService.log_moderation_background(message.chat.id, user_id, message.reply_to_message.message_id, "pin")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to pin message: <code>{html.escape(str(e))}</code>.")
 
 
 @router.message(Command("unpin"))
@@ -1234,7 +1304,9 @@ async def handle_unpin(message: Message, bot: Bot) -> None:
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_pin_messages"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_pin_messages", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can unpin messages.")
         return
 
     try:
@@ -1243,22 +1315,26 @@ async def handle_unpin(message: Message, bot: Bot) -> None:
                 chat_id=message.chat.id,
                 message_id=message.reply_to_message.message_id
             )
+            await send_ephemeral(message, "📌 <b>Message unpinned.</b>", delay=4)
         else:
             await bot.unpin_all_chat_messages(chat_id=message.chat.id)
-    except Exception:
-        pass
+            await send_ephemeral(message, "📌 <b>All pinned messages unpinned.</b>", delay=4)
+        DatabaseService.log_moderation_background(message.chat.id, user_id, 0, "unpin")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to unpin: <code>{html.escape(str(e))}</code>.")
 
 
 # ------------------------------------------------------------------------------
-# 3. /clear
+# 3. /clear & /purge
 # ------------------------------------------------------------------------------
 @router.message(Command("clear", "purge"))
 async def handle_clear(message: Message, command: CommandObject, bot: Bot) -> None:
-    # RULE: Immediate wipe trigger
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_delete_messages"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_delete_messages", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can clear messages.")
         return
 
     chat_id = message.chat.id
@@ -1269,22 +1345,22 @@ async def handle_clear(message: Message, command: CommandObject, bot: Bot) -> No
         end_id = message.message_id
         msg_ids = list(range(start_id, end_id))
         if msg_ids:
-            # Batch delete in chunks of 100 (Telegram limit)
             for i in range(0, len(msg_ids), 100):
                 chunk = msg_ids[i:i + 100]
                 try:
                     await bot.delete_messages(chat_id=chat_id, message_ids=chunk)
                 except Exception:
-                    # Fallback single message deletion
                     for mid in chunk:
                         try:
                             await bot.delete_message(chat_id=chat_id, message_id=mid)
                         except Exception:
                             pass
+            await send_ephemeral(message, f"🗑️ <b>Purged {len(msg_ids)} messages.</b>", delay=4)
+            DatabaseService.log_moderation_background(chat_id, user_id, len(msg_ids), "purge")
         return
 
     # If numeric count provided: e.g. /clear 20
-    if command.args and command.args.strip().isdigit():
+    if command and command.args and command.args.strip().isdigit():
         count = min(int(command.args.strip()), 100)
         curr_id = message.message_id
         target_ids = [curr_id - i for i in range(1, count + 1) if (curr_id - i) > 0]
@@ -1296,6 +1372,11 @@ async def handle_clear(message: Message, command: CommandObject, bot: Bot) -> No
                     await bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception:
                     pass
+        await send_ephemeral(message, f"🗑️ <b>Cleared {count} messages.</b>", delay=4)
+        DatabaseService.log_moderation_background(chat_id, user_id, count, "clear")
+        return
+
+    await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a message with <code>/clear</code> to purge up to it, or use <code>/clear &lt;number&gt;</code> (e.g. <code>/clear 20</code>).")
 
 
 # ------------------------------------------------------------------------------
@@ -1303,35 +1384,38 @@ async def handle_clear(message: Message, command: CommandObject, bot: Bot) -> No
 # ------------------------------------------------------------------------------
 @router.message(Command("ban", "dban", "tban"))
 async def handle_ban_matrix(message: Message, command: CommandObject, bot: Bot) -> None:
-    # RULE: Immediate wipe trigger
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can ban members.")
         return
 
-    target_id, _, remaining_args = await resolve_target(message, command)
+    target_id, target_name, remaining_args = await resolve_target(message, command, bot=bot)
+    cmd = command.command.lower() if command else "ban"
     if not target_id:
+        await send_ephemeral(message, f"⚠️ <b>Usage:</b> Reply to a user's message or pass User ID / @username:\n<code>/{cmd} [user] [reason]</code>")
         return
 
     if await check_admin_rights(bot, message.chat.id, target_id):
+        await send_ephemeral(message, "⚠️ Cannot ban another administrator.")
         return
 
-    cmd = command.command.lower()
-
-    # /dban: absolute wipe of target replied message
+    # /dban: wipe target replied message
     if cmd == "dban" and message.reply_to_message:
         try:
             await message.reply_to_message.delete()
         except Exception:
             pass
 
-    # /tban: parse duration
     until_ts = None
+    duration_label = "indefinitely"
     if cmd == "tban":
         parts = remaining_args.split(maxsplit=1) if remaining_args else []
         duration_str = parts[0] if parts else "1h"
-        seconds, _ = parse_time_duration(duration_str)
+        remaining_args = parts[1] if len(parts) > 1 else "Temporary ban"
+        seconds, duration_label = parse_time_duration(duration_str)
         if seconds > 0:
             until_ts = int(time.time() + seconds)
 
@@ -1341,8 +1425,17 @@ async def handle_ban_matrix(message: Message, command: CommandObject, bot: Bot) 
             user_id=target_id,
             until_date=until_ts
         )
-    except Exception:
-        pass
+        mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+        label = "Banned & Deleted" if cmd == "dban" else ("Temporarily Banned" if cmd == "tban" else "Banned")
+        dur_line = f"\n⏱️ <b>Duration:</b> <code>{duration_label}</code>" if cmd == "tban" else ""
+        await message.answer(
+            f"🔨 <b>{label}:</b> {mention}{dur_line}\n"
+            f"📝 <b>Reason:</b> <i>{html.escape(remaining_args or 'Rule violation')}</i>",
+            parse_mode=ParseMode.HTML
+        )
+        DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, cmd, remaining_args or "")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to ban: <code>{html.escape(str(e))}</code>. Please ensure the bot is an Admin with 'Ban Users' permission.")
 
 
 @router.message(Command("unban"))
@@ -1350,11 +1443,14 @@ async def handle_unban(message: Message, command: CommandObject, bot: Bot) -> No
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can unban members.")
         return
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, target_name, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a message or pass User ID / @username with <code>/unban</code>.")
         return
 
     try:
@@ -1363,8 +1459,11 @@ async def handle_unban(message: Message, command: CommandObject, bot: Bot) -> No
             user_id=target_id,
             only_if_banned=True
         )
-    except Exception:
-        pass
+        mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+        await message.answer(f"✅ <b>Unbanned:</b> {mention}. Member can now rejoin.", parse_mode=ParseMode.HTML)
+        DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "unban")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to unban: <code>{html.escape(str(e))}</code>.")
 
 
 # ------------------------------------------------------------------------------
@@ -1372,17 +1471,9 @@ async def handle_unban(message: Message, command: CommandObject, bot: Bot) -> No
 # ------------------------------------------------------------------------------
 @router.message(Command("kickme"))
 async def handle_kickme(message: Message, bot: Bot) -> None:
-    """
-    /kickme:
-    Instantly kicks the sending member from the group.
-    - Intentionally omitted from command catalogs (hidden command).
-    - Immediate trigger wipe (<1ms).
-    - Performs ban + unban to eject member without a permanent blacklist.
-    """
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
 
-    # Instant wipe of trigger message
     await wipe_trigger(message)
 
     user = message.from_user
@@ -1392,23 +1483,14 @@ async def handle_kickme(message: Message, bot: Bot) -> None:
     chat_id = message.chat.id
     user_id = user.id
 
-    # Telegram Bot API prevents kicking chat owners or administrators
     if await check_admin_rights(bot, chat_id, user_id):
+        await send_ephemeral(message, "⚠️ Administrators cannot use /kickme.")
         return
 
     try:
-        # Standard Telegram kick: ban + unban to immediately eject from the chat
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-
-        # Background audit logging
-        DatabaseService.log_moderation_background(
-            chat_id=chat_id,
-            admin_id=user_id,
-            target_id=user_id,
-            action="kickme",
-            reason="Self-kick request"
-        )
+        DatabaseService.log_moderation_background(chat_id, user_id, user_id, "kickme", "Self-kick request")
     except Exception:
         pass
 
@@ -1418,21 +1500,20 @@ async def handle_kickme(message: Message, bot: Bot) -> None:
 # ------------------------------------------------------------------------------
 @router.message(Command("promote"))
 async def handle_promote(message: Message, command: CommandObject, bot: Bot) -> None:
-    """
-    Instantly lifts target to admin status with exactly 0 custom permissions.
-    """
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can promote members.")
         return
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, target_name, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a user's message or specify their User ID with <code>/promote</code>.")
         return
 
     try:
-        # Lifts to admin with 0 custom permissions
         await bot.promote_chat_member(
             chat_id=message.chat.id,
             user_id=target_id,
@@ -1448,25 +1529,27 @@ async def handle_promote(message: Message, command: CommandObject, bot: Bot) -> 
             can_invite_users=False,
             can_pin_messages=False,
         )
-        # Invalidate target's cached rights
         ADMIN_CACHE.pop((message.chat.id, target_id), None)
-    except Exception:
-        pass
+        mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+        await message.answer(f"⭐ <b>Promoted:</b> {mention} is now an Administrator.", parse_mode=ParseMode.HTML)
+        DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "promote")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to promote: <code>{html.escape(str(e))}</code>. Please ensure the bot is an Admin with 'Add New Admins' right.")
 
 
 @router.message(Command("demote"))
 async def handle_demote(message: Message, command: CommandObject, bot: Bot) -> None:
-    """
-    Instantly strips all admin privileges from the target user.
-    """
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_promote_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can demote members.")
         return
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, target_name, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a user's message or specify their User ID with <code>/demote</code>.")
         return
 
     try:
@@ -1486,8 +1569,11 @@ async def handle_demote(message: Message, command: CommandObject, bot: Bot) -> N
             can_pin_messages=False,
         )
         ADMIN_CACHE.pop((message.chat.id, target_id), None)
-    except Exception:
-        pass
+        mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+        await message.answer(f"👤 <b>Demoted:</b> {mention}. Administrator privileges revoked.", parse_mode=ParseMode.HTML)
+        DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "demote")
+    except Exception as e:
+        await send_ephemeral(message, f"❌ Failed to demote: <code>{html.escape(str(e))}</code>.")
 
 
 # ------------------------------------------------------------------------------
@@ -1495,20 +1581,21 @@ async def handle_demote(message: Message, command: CommandObject, bot: Bot) -> N
 # ------------------------------------------------------------------------------
 @router.message(Command("warn"))
 async def handle_warn(message: Message, command: CommandObject, bot: Bot) -> None:
-    """
-    Increments local counter and triggers automated enforcement upon hitting ceiling.
-    """
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can warn members.")
         return
 
-    target_id, target_name, remaining_args = await resolve_target(message, command)
+    target_id, target_name, remaining_args = await resolve_target(message, command, bot=bot)
     if not target_id:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a user's message or pass their User ID / @username:\n<code>/warn [reason]</code>")
         return
 
     if await check_admin_rights(bot, message.chat.id, target_id):
+        await send_ephemeral(message, "⚠️ Cannot warn another administrator.")
         return
 
     target_user = None
@@ -1526,36 +1613,39 @@ async def handle_resetwarn(message: Message, command: CommandObject, bot: Bot) -
     await wipe_trigger(message)
 
     user_id = message.from_user.id if message.from_user else 0
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members"):
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can reset warnings.")
         return
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, target_name, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        await send_ephemeral(message, "⚠️ <b>Usage:</b> Reply to a message or pass User ID / @username with <code>/resetwarn</code>.")
         return
 
-    # In-memory reset: pop key immediately to eliminate zero-value RAM residue
     WARN_CACHE[message.chat.id].pop(target_id, None)
     if not WARN_CACHE[message.chat.id]:
         WARN_CACHE.pop(message.chat.id, None)
     DatabaseService.reset_warn_background(message.chat.id, target_id)
     DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "resetwarn")
+    mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
+    await message.answer(f"✅ <b>Warnings reset to 0</b> for {mention}.", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("warns"))
 async def handle_get_warns(message: Message, command: CommandObject, bot: Bot) -> None:
     await wipe_trigger(message)
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, _, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
         target_id = message.from_user.id if message.from_user else 0
 
     count = WARN_CACHE[message.chat.id].get(target_id, 0)
     ceiling = CHAT_SETTINGS[message.chat.id].get("warn_limit", 3)
 
-    # Send ephemeral warning status (deleted after 5s to keep chat pristine)
     try:
         notice = await message.answer(f"⚠️ User Warning Count: <b>{count}/{ceiling}</b>", parse_mode=ParseMode.HTML)
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
         await notice.delete()
     except Exception:
         pass
@@ -2790,6 +2880,11 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
 
         # STRICT RULE: Settings are sent and visible ONLY to authorized admins
         if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
+            await send_ephemeral(
+                message,
+                "❌ <b>Settings Access Restricted:</b> Only the Chat Owner, Anonymous Admins, or Excepted Admins can configure settings.",
+                delay=5
+            )
             return
 
         chat_id = message.chat.id
@@ -2805,8 +2900,8 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 reply_markup=generate_settings_choice_keyboard(chat_id, bot_user.username or "personal_guardBot"),
                 parse_mode=ParseMode.HTML
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SETTINGS ERROR] Could not send settings choice: {e}")
         return
 
     # --------------------------------------------------------------------------
@@ -3694,11 +3789,12 @@ async def handle_setrules(message: Message, command: CommandObject, bot: Bot) ->
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
 
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only the Owner, Anonymous Admins, or Excepted Admins can configure regulations.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/setrules &lt;regulations text&gt;</code>\n<i>You can also configure regulations interactively in /settings.</i>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/setrules &lt;regulations text&gt;</code>\n<i>You can also configure regulations interactively in /settings.</i>")
         return
 
     new_rules = command.args.strip()
@@ -3718,6 +3814,7 @@ async def handle_preview_welcome(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can preview welcome settings.")
         return
 
     s = CHAT_SETTINGS[chat_id]
@@ -3746,11 +3843,12 @@ async def handle_setwelcome(message: Message, command: CommandObject, bot: Bot) 
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can configure the welcome message.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/setwelcome &lt;welcome text&gt;</code>\nPlaceholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/setwelcome &lt;welcome text&gt;</code>\nPlaceholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>")
         return
 
     s = CHAT_SETTINGS[chat_id]
@@ -3770,6 +3868,7 @@ async def handle_preview_goodbye(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can preview goodbye settings.")
         return
 
     s = CHAT_SETTINGS[chat_id]
@@ -3798,11 +3897,12 @@ async def handle_setgoodbye(message: Message, command: CommandObject, bot: Bot) 
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can configure the goodbye message.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/setgoodbye &lt;farewell text&gt;</code>\nPlaceholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/setgoodbye &lt;farewell text&gt;</code>\nPlaceholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>")
         return
 
     s = CHAT_SETTINGS[chat_id]
@@ -3822,11 +3922,12 @@ async def handle_addword(message: Message, command: CommandObject, bot: Bot) -> 
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can manage banned words.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/addword &lt;word or phrase&gt;</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/addword &lt;word or phrase&gt;</code>")
         return
 
     word = command.args.strip().lower()
@@ -3851,11 +3952,12 @@ async def handle_delword(message: Message, command: CommandObject, bot: Bot) -> 
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can manage banned words.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/delword &lt;word or phrase&gt;</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/delword &lt;word or phrase&gt;</code>")
         return
 
     word = command.args.strip().lower()
@@ -3880,6 +3982,7 @@ async def handle_words(message: Message, bot: Bot) -> None:
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can view the banned words list.")
         return
 
     await wipe_trigger(message)
@@ -3902,16 +4005,17 @@ async def handle_add_filter(message: Message, command: CommandObject, bot: Bot) 
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can configure filters.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/filter &lt;keyword&gt; &lt;reply text&gt;</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/filter &lt;keyword&gt; &lt;reply text&gt;</code>")
         return
 
     parts = command.args.strip().split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("⚠️ Please provide both a keyword trigger and a reply text.\nUsage: <code>/filter &lt;keyword&gt; &lt;reply text&gt;</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Please provide both a keyword trigger and a reply text.\nUsage: <code>/filter &lt;keyword&gt; &lt;reply text&gt;</code>")
         return
 
     trigger, reply_text = parts[0].lower(), parts[1]
@@ -3933,11 +4037,12 @@ async def handle_stop_filter(message: Message, command: CommandObject, bot: Bot)
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can manage filters.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/stop &lt;keyword&gt;</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/stop &lt;keyword&gt;</code>")
         return
 
     trigger = command.args.strip().lower()
@@ -3978,11 +4083,12 @@ async def handle_setlog(message: Message, command: CommandObject, bot: Bot) -> N
     user_id = message.from_user.id if message.from_user else 0
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can configure the audit log channel.")
         return
 
     await wipe_trigger(message)
     if not command or not command.args:
-        await message.answer("⚠️ Usage: <code>/setlog &lt;channel_id or @channel_username&gt;</code>", parse_mode=ParseMode.HTML)
+        await send_ephemeral(message, "⚠️ Usage: <code>/setlog &lt;channel_id or @channel_username&gt;</code>")
         return
 
     target_channel = command.args.strip()
