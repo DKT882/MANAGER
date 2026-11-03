@@ -296,15 +296,42 @@ async def check_can_setup_bot(
     if not user_id:
         return False
 
+    try:
+        user_id_int = int(user_id)
+    except (ValueError, TypeError):
+        return False
+
     # 1. Check Excepted / Exempted Admins in in-memory settings (0ms)
     settings = CHAT_SETTINGS[chat_id]
-    excepted_ids = set(settings.get("excepted_admins", []))
-    if user_id in excepted_ids:
+    raw_excepted = settings.get("excepted_admins", [])
+    excepted_ids_int = {int(x) for x in raw_excepted if str(x).lstrip('-').isdigit()}
+    if user_id_int in excepted_ids_int:
         return True
+
+    # 1B. Fallback: Check MongoDB if not yet hydrated in memory
+    if MongoDBManager.is_connected():
+        try:
+            db = MongoDBManager.get_database()
+            if db is not None:
+                doc = await db.chat_settings.find_one(
+                    {"chat_id": chat_id},
+                    {"reporting.excepted_admin_ids": 1, "chat_title": 1, "_id": 0}
+                )
+                if doc:
+                    db_excepted = doc.get("reporting", {}).get("excepted_admin_ids", [])
+                    db_excepted_ints = {int(x) for x in db_excepted if str(x).lstrip('-').isdigit()}
+                    if user_id_int in db_excepted_ints:
+                        # Rehydrate in-memory settings
+                        cur_set = set(settings.get("excepted_admins", []))
+                        cur_set.update(db_excepted_ints)
+                        settings["excepted_admins"] = list(cur_set)
+                        return True
+        except Exception:
+            pass
 
     # 2. Check local Admin Cache (TTL 60s)
     now = time.monotonic()
-    cache_key = (chat_id, user_id)
+    cache_key = (chat_id, user_id_int)
     if cache_key in ADMIN_CACHE:
         cached_time, perms, is_owner, is_anon = ADMIN_CACHE[cache_key]
         if now - cached_time < ADMIN_CACHE_TTL:
@@ -313,7 +340,7 @@ async def check_can_setup_bot(
 
     # 3. Fetch Telegram member status
     try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id_int)
         if isinstance(member, ChatMemberOwner):
             ADMIN_CACHE[cache_key] = (now, set(), True, False)
             return True
@@ -373,10 +400,11 @@ def parse_time_duration(duration_str: Optional[str]) -> Tuple[int, str]:
 
 async def resolve_target(
     message: Message,
-    command: Optional[CommandObject] = None
+    command: Optional[CommandObject] = None,
+    bot: Optional[Bot] = None
 ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
-    Resolves target user from reply or text parameters.
+    Resolves target user from replied message, numeric ID, mention entity, or @username.
     Returns: (target_user_id, target_user_name, extra_arguments_string)
     """
     # 1. Target from replied message
@@ -391,15 +419,27 @@ async def resolve_target(
         first_arg = parts[0]
         remaining = parts[1] if len(parts) > 1 else ""
 
-        # Numeric user ID
-        if first_arg.isdigit() or (first_arg.startswith("-") and first_arg[1:].isdigit()):
-            return int(first_arg), f"User {first_arg}", remaining.strip()
+        # Clean numeric user ID (e.g. 123456789 or -100123)
+        clean_arg = first_arg.lstrip("@")
+        if clean_arg.isdigit() or (clean_arg.startswith("-") and clean_arg[1:].isdigit()):
+            return int(clean_arg), f"User {clean_arg}", remaining.strip()
 
-        # Target mention via entities
+        # Target mention via entities (text_mention)
         if message.entities:
             for entity in message.entities:
                 if entity.type == "text_mention" and entity.user:
                     return entity.user.id, entity.user.full_name, remaining.strip()
+
+        # Target @username resolution via chat administrators list
+        if first_arg.startswith("@") and bot and message.chat:
+            target_handle = first_arg.lstrip("@").lower()
+            try:
+                admins = await bot.get_chat_administrators(message.chat.id)
+                for admin in admins:
+                    if admin.user and admin.user.username and admin.user.username.lower() == target_handle:
+                        return admin.user.id, admin.user.full_name, remaining.strip()
+            except Exception:
+                pass
 
     return None, None, None
 
@@ -1605,12 +1645,14 @@ def format_excepted_text(chat_title: str, s: Dict[str, Any]) -> str:
         list_str = "\n".join(f"• <code>{eid}</code>" for eid in excepted)
     else:
         list_str = "<i>No Excepted Admins designated yet.</i>"
+    bot_name = BOT_IDENTITY.get("username", "personal_guardBot")
     return (
         f"👥 <b>EXCEPTED ADMINISTRATORS</b>\n"
         f"Group: <code>{chat_title}</code>\n\n"
         f"Designated administrators who have full setup permissions and receive confidential <code>/show</code> reports:\n"
         f"{list_str}\n\n"
-        f"<i>To add an administrator, reply to their message in the group with <code>/addexcept</code>.</i>"
+        f"👉 <b>How to add:</b> Reply to the admin's message with <code>/addexcept</code> or send <code>/addexcept @admin</code>.\n"
+        f"👉 <b>Private DM access:</b> Once added, they can manage settings in Private DM via @{bot_name}."
     )
 
 
@@ -1824,8 +1866,29 @@ async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
     bot_user = await bot.get_me()
 
     authorized_chats = []
-    for cid in list(CHAT_SETTINGS.keys()):
-        if cid < 0 and await check_can_setup_bot(bot, cid, user_id):
+    known_cids = {cid for cid in CHAT_SETTINGS.keys() if cid < 0}
+    if MongoDBManager.is_connected():
+        try:
+            db = MongoDBManager.get_database()
+            if db is not None:
+                cursor = db.chat_settings.find({}, {"chat_id": 1, "chat_title": 1, "reporting.excepted_admin_ids": 1, "_id": 0})
+                async for doc in cursor:
+                    c_id = doc.get("chat_id")
+                    if c_id and c_id < 0:
+                        known_cids.add(c_id)
+                        if doc.get("chat_title"):
+                            CHAT_TITLES[c_id] = doc["chat_title"]
+                        db_excepted = doc.get("reporting", {}).get("excepted_admin_ids", [])
+                        if db_excepted:
+                            s = CHAT_SETTINGS[c_id]
+                            cur = set(s.get("excepted_admins", []))
+                            cur.update(int(x) for x in db_excepted if str(x).lstrip('-').isdigit())
+                            s["excepted_admins"] = list(cur)
+        except Exception as e:
+            print(f"[DM SETTINGS NOTICE] MongoDB lookup: {e}")
+
+    for cid in known_cids:
+        if await check_can_setup_bot(bot, cid, user_id):
             title = await get_cached_chat_title(bot, cid)
             authorized_chats.append((cid, title))
 
@@ -2861,35 +2924,56 @@ async def handle_pm_report_action_callback(query: CallbackQuery, bot: Bot) -> No
 # ------------------------------------------------------------------------------
 @router.message(Command("addexcept", "exceptadmin"))
 async def handle_add_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
-    """Designates an admin as an Excepted Admin to receive report notifications."""
+    """Designates an admin as an Excepted Admin to receive report notifications and access settings."""
     await wipe_trigger(message)
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
     # Rule: ONLY Owner, Anonymous Admins, or Excepted Admins can setup the bot
     if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
+        try:
+            notice = await message.answer("❌ Only the Group Owner, Anonymous Admins, or Excepted Admins can add Excepted Admins.")
+            await asyncio.sleep(5)
+            await notice.delete()
+        except Exception:
+            pass
         return
 
-    target_id, target_name, _ = await resolve_target(message, command)
+    target_id, target_name, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        try:
+            notice = await message.answer(
+                "⚠️ <b>How to add an Exempted Admin:</b>\n"
+                "• <b>Reply:</b> Reply to the admin's message with <code>/addexcept</code>\n"
+                "• <b>Username:</b> <code>/addexcept @admin_username</code>\n"
+                "• <b>User ID:</b> <code>/addexcept 123456789</code>",
+                parse_mode=ParseMode.HTML
+            )
+            await asyncio.sleep(8)
+            await notice.delete()
+        except Exception:
+            pass
         return
 
     chat_id = message.chat.id
     if message.chat and message.chat.title:
         CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
-    current_excepted = set(settings.get("excepted_admins", []))
-    current_excepted.add(target_id)
+    current_excepted = {int(x) for x in settings.get("excepted_admins", []) if str(x).lstrip('-').isdigit()}
+    current_excepted.add(int(target_id))
     settings["excepted_admins"] = list(current_excepted)
 
     chat_title = message.chat.title or "This Chat"
     DatabaseService.save_settings_background(chat_id, chat_title, settings)
 
+    name_label = f" (<b>{html.escape(target_name)}</b>)" if target_name else ""
+    bot_name = BOT_IDENTITY.get("username", "personal_guardBot")
     try:
         notice = await message.answer(
-            f"✅ User <code>{target_id}</code> designated as an <b>Excepted Admin</b> (will receive confidential reports).",
+            f"✅ Admin <code>{target_id}</code>{name_label} is now an <b>Exempted Admin</b>!\n"
+            f"<i>They can now access and manage group settings in Private DM via @{bot_name}.</i>",
             parse_mode=ParseMode.HTML
         )
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
         await notice.delete()
     except Exception:
         pass
@@ -2897,23 +2981,29 @@ async def handle_add_except_admin(message: Message, command: CommandObject, bot:
 
 @router.message(Command("remexcept", "unexceptadmin"))
 async def handle_rem_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
-    """Removes an admin from the Excepted Admins report recipient list."""
+    """Removes an admin from the Excepted Admins list."""
     await wipe_trigger(message)
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else 0
     if not await check_can_setup_bot(bot, message.chat.id, user_id, sender_chat_id):
         return
 
-    target_id, _, _ = await resolve_target(message, command)
+    target_id, _, _ = await resolve_target(message, command, bot=bot)
     if not target_id:
+        try:
+            notice = await message.answer("⚠️ Please reply to the admin's message or specify their username/ID: <code>/remexcept @admin</code>", parse_mode=ParseMode.HTML)
+            await asyncio.sleep(5)
+            await notice.delete()
+        except Exception:
+            pass
         return
 
     chat_id = message.chat.id
     if message.chat and message.chat.title:
         CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
-    current_excepted = set(settings.get("excepted_admins", []))
-    current_excepted.discard(target_id)
+    current_excepted = {int(x) for x in settings.get("excepted_admins", []) if str(x).lstrip('-').isdigit()}
+    current_excepted.discard(int(target_id))
     settings["excepted_admins"] = list(current_excepted)
 
     chat_title = message.chat.title or "This Chat"
@@ -2921,7 +3011,7 @@ async def handle_rem_except_admin(message: Message, command: CommandObject, bot:
 
     try:
         notice = await message.answer(
-            f"✅ User <code>{target_id}</code> removed from <b>Excepted Admins</b>.",
+            f"✅ User <code>{target_id}</code> removed from <b>Exempted Admins</b>.",
             parse_mode=ParseMode.HTML
         )
         await asyncio.sleep(5)
@@ -2943,23 +3033,30 @@ async def handle_list_excepted_admins(message: Message, bot: Bot) -> None:
     if message.chat and message.chat.title:
         CHAT_TITLES[chat_id] = message.chat.title
     settings = CHAT_SETTINGS[chat_id]
-    excepted_ids = settings.get("excepted_admins", [])
+    raw_excepted = settings.get("excepted_admins", [])
+    excepted_ids = [int(x) for x in raw_excepted if str(x).lstrip('-').isdigit()]
+
+    bot_user = await bot.get_me()
+    bot_name = bot_user.username or "personal_guardBot"
 
     if excepted_ids:
-        formatted = "\n".join(f"• <code>{uid}</code>" for uid in excepted_ids)
+        formatted = "\n".join(f"• <code>{uid}</code> (<a href='tg://user?id={uid}'>Profile</a>)" for uid in excepted_ids)
         text = (
-            f"👥 <b>Excepted Admins for Reports:</b>\n{formatted}\n\n"
-            f"<i>Note: Owner of the GC & Anonymous Admins always receive reports automatically.</i>"
+            f"👥 <b>Exempted Admins with Setup Access:</b>\n\n"
+            f"{formatted}\n\n"
+            f"<i>These admins can configure settings in Private DM via @{bot_name} or direct link:</i>\n"
+            f"https://t.me/{bot_name}?start=group_{abs(chat_id)}"
         )
     else:
         text = (
-            "👥 <b>Excepted Admins for Reports:</b> <i>None configured.</i>\n\n"
-            "<i>Currently, reports are delivered strictly to the Owner of the GC & Anonymous Admins. Use <code>/addexcept &lt;id&gt;</code> to designate additional admins.</i>"
+            "👥 <b>Exempted Admins:</b> <i>None configured.</i>\n\n"
+            "<i>Currently, settings and reports are restricted to the Group Owner & Anonymous Admins.</i>\n\n"
+            "👉 To add an admin, reply to their message with <code>/addexcept</code> or send: <code>/addexcept @admin</code>"
         )
 
     try:
-        notice = await message.answer(text, parse_mode=ParseMode.HTML)
-        await asyncio.sleep(8)
+        notice = await message.answer(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await asyncio.sleep(12)
         await notice.delete()
     except Exception:
         pass
