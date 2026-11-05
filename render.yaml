@@ -11,6 +11,7 @@ services:
     plan: free # Change to 'starter' or 'hobby' if desired
     region: frankfurt # Frankfurt/Europe is directly adjacent to Telegram Data Centers for sub-50ms latency!
     autoDeploy: true
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false # Set securely in Render dashboard

@@ -92,6 +92,10 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         self.assertIn("/api/broadcast", html)
         self.assertIn("Send Broadcast", html)
 
+    def test_cors_headers_defined(self):
+        self.assertIn("Access-Control-Allow-Origin", bot.CORS_HEADERS)
+        self.assertEqual(bot.CORS_HEADERS["Access-Control-Allow-Origin"], "*")
+
 
 if __name__ == "__main__":
     unittest.main()

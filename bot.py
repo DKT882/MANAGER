@@ -5916,6 +5916,7 @@ def render_members_dashboard_html() -> str:
       <div class="stat-badge">👥 Total Members: <span id="stat-total" class="stat-val">0</span></div>
       <div class="stat-badge">🏷️ Groups: <span id="stat-groups" class="stat-val">0</span></div>
       <div class="stat-badge">⚡ Status: <span class="stat-val" style="color:var(--success)">ONLINE</span></div>
+      <button class="stat-badge" onclick="promptSetBackendUrl()" style="cursor:pointer;background:#242f3d;color:#fff;" title="Configure Backend API Server (for Vercel deployment)">⚙️ API Config</button>
     </div>
   </header>
 
@@ -6012,9 +6013,27 @@ let allMembers = [];
 let filteredMembers = [];
 let selectedUserIds = new Set();
 
+function getApiBaseUrl() {
+  const custom = localStorage.getItem('bot_backend_url');
+  if (custom) return custom.replace(/\/$/, '');
+  if (window.location.hostname.includes('vercel.app')) {
+    return 'https://manager-f6vd.onrender.com';
+  }
+  return '';
+}
+
+function promptSetBackendUrl() {
+  const current = getApiBaseUrl() || window.location.origin;
+  const val = prompt('Enter your Render Bot Backend URL:', current);
+  if (val !== null) {
+    localStorage.setItem('bot_backend_url', val.trim());
+    fetchMembers();
+  }
+}
+
 async function fetchMembers() {
   try {
-    const res = await fetch('/api/members');
+    const res = await fetch(getApiBaseUrl() + '/api/members');
     const data = await res.json();
     allMembers = data.members || [];
     document.getElementById('stat-total').textContent = allMembers.length;
@@ -6199,7 +6218,7 @@ async function submitBroadcast() {
   pFill.style.width = '25%';
 
   try {
-    const res = await fetch('/api/broadcast', {
+    const res = await fetch(getApiBaseUrl() + '/api/broadcast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -6270,29 +6289,45 @@ async def api_get_members_handler(request: web.Request) -> web.Response:
         "status": "ok",
         "total": len(members_list),
         "members": members_list
+    }, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
     })
     if resp.body is not None:
         BANDWIDTH_MONITOR.add_outbound_bytes(len(resp.body) + 150)
     return resp
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+}
+
+
+async def api_options_handler(request: web.Request) -> web.Response:
+    """Handles CORS preflight requests for external frontends (e.g. Vercel)."""
+    return web.Response(status=200, headers=CORS_HEADERS)
+
+
 async def api_post_broadcast_handler(request: web.Request) -> web.Response:
     """REST JSON endpoint receiving broadcast dispatch requests from web frontend."""
     global GLOBAL_BOT
     if not GLOBAL_BOT:
-        return web.json_response({"status": "error", "message": "Bot is not connected yet."}, status=503)
+        return web.json_response({"status": "error", "message": "Bot is not connected yet."}, status=503, headers=CORS_HEADERS)
 
     try:
         data = await request.json()
     except Exception:
-        return web.json_response({"status": "error", "message": "Invalid JSON payload."}, status=400)
+        return web.json_response({"status": "error", "message": "Invalid JSON payload."}, status=400, headers=CORS_HEADERS)
 
     user_ids = data.get("user_ids", [])
     send_all = data.get("all", False)
     message_text = data.get("message", "").strip()
 
     if not message_text:
-        return web.json_response({"status": "error", "message": "Broadcast message cannot be empty."}, status=400)
+        return web.json_response({"status": "error", "message": "Broadcast message cannot be empty."}, status=400, headers=CORS_HEADERS)
 
     if send_all or not user_ids:
         target_ids = list(ACCEPTED_MEMBERS_CACHE.keys())
@@ -6305,7 +6340,7 @@ async def api_post_broadcast_handler(request: web.Request) -> web.Response:
                 pass
 
     if not target_ids:
-        return web.json_response({"status": "error", "message": "No valid recipients selected."}, status=400)
+        return web.json_response({"status": "error", "message": "No valid recipients selected."}, status=400, headers=CORS_HEADERS)
 
     task_id = str(uuid.uuid4())[:8]
     asyncio.create_task(run_background_broadcast(GLOBAL_BOT, target_ids, message_text, task_id))
@@ -6315,7 +6350,7 @@ async def api_post_broadcast_handler(request: web.Request) -> web.Response:
         "task_id": task_id,
         "recipient_count": len(target_ids),
         "message": f"Broadcast queued successfully for {len(target_ids)} members."
-    })
+    }, headers=CORS_HEADERS)
 
 
 async def start_render_health_server() -> Optional[web.AppRunner]:
@@ -6377,15 +6412,19 @@ async def start_render_health_server() -> Optional[web.AppRunner]:
             BANDWIDTH_MONITOR.add_outbound_bytes(len(resp.body) + 200)
         return resp
 
-    # Health check routes for Render Web Service
+    # Dedicated health check route for Render Web Service (returns JSON status)
     app.router.add_get("/health", health_handler)
-    app.router.add_get("/", health_handler)
 
-    # Web Dashboard routes for Accepted Members & Broadcast
+    # Main Web Dashboard routes for Accepted Members & Broadcast GUI (Root / loads GUI directly)
+    app.router.add_get("/", members_dashboard_handler)
     app.router.add_get("/members", members_dashboard_handler)
     app.router.add_get("/dashboard", members_dashboard_handler)
+
+    # REST APIs with full CORS support (enables direct Vercel frontend deployments)
     app.router.add_get("/api/members", api_get_members_handler)
     app.router.add_post("/api/broadcast", api_post_broadcast_handler)
+    app.router.add_options("/api/members", api_options_handler)
+    app.router.add_options("/api/broadcast", api_options_handler)
 
     try:
         runner = web.AppRunner(app)

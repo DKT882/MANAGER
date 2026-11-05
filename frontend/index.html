@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manager — Accepted Members & Broadcast</title>
+<style>
+  :root {
+    --bg-dark: #0e1621;
+    --card-bg: #17212b;
+    --card-header: #242f3d;
+    --accent: #2b5278;
+    --accent-hover: #3a6d9b;
+    --accent-blue: #5288c1;
+    --text-primary: #f5f5f5;
+    --text-secondary: #7f91a4;
+    --border-color: #242f3d;
+    --success: #4fae4e;
+    --danger: #e53935;
+    --badge-bg: rgba(82, 136, 193, 0.15);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  body { background: var(--bg-dark); color: var(--text-primary); padding: 20px; min-height: 100vh; }
+  .container { max-width: 1280px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-icon { font-size: 30px; }
+  .brand-title { font-size: 20px; font-weight: 700; color: #fff; }
+  .brand-sub { font-size: 12px; color: var(--text-secondary); }
+  .stats-badges { display: flex; gap: 10px; flex-wrap: wrap; }
+  .stat-badge { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 14px; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .stat-val { font-weight: 700; color: var(--accent-blue); }
+  .grid { display: grid; grid-template-columns: 380px 1fr; gap: 20px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
+  .card-header { background: var(--card-header); padding: 12px 18px; font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+  .card-body { padding: 16px; flex: 1; display: flex; flex-direction: column; }
+  .form-group { margin-bottom: 14px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  textarea, input[type="text"], select { width: 100%; background: #0e1621; border: 1px solid var(--border-color); border-radius: 8px; padding: 10px 12px; color: #fff; font-size: 13px; outline: none; transition: border-color .2s; }
+  textarea:focus, input[type="text"]:focus, select:focus { border-color: var(--accent-blue); }
+  textarea { resize: vertical; min-height: 130px; line-height: 1.4; font-family: monospace; }
+  .tag-btns { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tag-btn { background: #242f3d; border: 1px solid #3a4756; color: #7f91a4; font-size: 11px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+  .tag-btn:hover { color: #fff; border-color: var(--accent-blue); }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; font-weight: 600; padding: 10px 18px; border-radius: 8px; border: none; cursor: pointer; transition: background .2s, opacity .2s; }
+  .btn-primary { background: var(--accent); color: #fff; width: 100%; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary { background: #242f3d; color: var(--text-primary); padding: 6px 12px; font-size: 12px; }
+  .btn-secondary:hover { background: #313f52; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+  .search-wrap { display: flex; gap: 8px; flex: 1; min-width: 260px; }
+  .actions-wrap { display: flex; gap: 8px; align-items: center; }
+  .table-container { max-height: 580px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: #0e1621; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+  th { background: #1c2734; padding: 10px 12px; position: sticky; top: 0; z-index: 2; border-bottom: 1px solid var(--border-color); font-weight: 600; color: var(--text-secondary); font-size: 12px; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
+  tr:hover td { background: rgba(82, 136, 193, 0.05); }
+  .avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; color: #fff; margin-right: 8px; flex-shrink: 0; }
+  .user-cell { display: flex; align-items: center; }
+  .user-name { font-weight: 600; color: #fff; }
+  .user-id { font-size: 11px; color: var(--text-secondary); font-family: monospace; }
+  .group-pill { display: inline-block; background: var(--badge-bg); color: var(--accent-blue); padding: 2px 6px; border-radius: 4px; font-size: 11px; margin: 1px 2px; }
+  .progress-box { display: none; margin-top: 14px; background: #0e1621; border-radius: 8px; padding: 12px; }
+  .progress-bar-bg { width: 100%; height: 8px; background: #242f3d; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .progress-bar-fill { width: 0%; height: 100%; background: var(--accent-blue); transition: width .3s; }
+  .status-text { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; }
+  .empty-msg { text-align: center; padding: 40px; color: var(--text-secondary); }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #1c2734; border: 1px solid var(--accent-blue); color: #fff; padding: 12px 18px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); z-index: 100; font-size: 13px; display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="brand">
+      <div class="brand-icon">🛡️</div>
+      <div>
+        <div class="brand-title">Manager Bot Console</div>
+        <div class="brand-sub">Global Unified Accepted Members Registry & Broadcast</div>
+      </div>
+    </div>
+    <div class="stats-badges">
+      <div class="stat-badge">👥 Total Members: <span id="stat-total" class="stat-val">0</span></div>
+      <div class="stat-badge">🏷️ Groups: <span id="stat-groups" class="stat-val">0</span></div>
+      <div class="stat-badge">⚡ Status: <span id="stat-status" class="stat-val" style="color:var(--success)">CONNECTING</span></div>
+      <button class="stat-badge" onclick="promptSetBackendUrl()" style="cursor:pointer;background:#242f3d;color:#fff;" title="Configure Backend API Server (for Vercel deployment)">⚙️ API Config</button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- BROADCAST COMPOSER -->
+    <div class="card">
+      <div class="card-header">
+        <span>📢 Compose Broadcast Message</span>
+        <span id="selected-badge" style="font-size:12px;color:var(--accent-blue)">0 Selected</span>
+      </div>
+      <div class="card-body">
+        <div class="form-group">
+          <label>Target Audience</label>
+          <select id="target-mode" onchange="updateTargetMode()">
+            <option value="selected">Selected Members (<span id="opt-sel-count">0</span>)</option>
+            <option value="filtered">All Filtered Members</option>
+            <option value="all">All Global Members</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Message Content (HTML Supported)</label>
+          <div class="tag-btns">
+            <button class="tag-btn" onclick="insertTag('b')">&lt;b&gt;Bold&lt;/b&gt;</button>
+            <button class="tag-btn" onclick="insertTag('i')">&lt;i&gt;Italic&lt;/i&gt;</button>
+            <button class="tag-btn" onclick="insertTag('code')">&lt;code&gt;Code&lt;/code&gt;</button>
+            <button class="tag-btn" onclick="insertLink()">&lt;a&gt;Link&lt;/a&gt;</button>
+          </div>
+          <textarea id="broadcast-msg" placeholder="Type your broadcast announcement here...&#10;&#10;Supports {name}, {chat_title}, HTML tags like &lt;b&gt;bold&lt;/b&gt;, &lt;a href='...'&gt;links&lt;/a&gt;."></textarea>
+        </div>
+
+        <button id="send-btn" class="btn btn-primary" onclick="submitBroadcast()">
+          🚀 Send Broadcast
+        </button>
+
+        <div id="progress-box" class="progress-box">
+          <div class="status-text">
+            <span id="progress-status">Dispatching messages...</span>
+            <span id="progress-percent">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div id="progress-bar-fill" class="progress-bar-fill"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MEMBERS REGISTRY & SELECTOR -->
+    <div class="card">
+      <div class="card-header">
+        <span>👥 Request-Accepted Members Registry</span>
+        <button class="btn btn-secondary" onclick="fetchMembers()">🔄 Refresh</button>
+      </div>
+      <div class="card-body">
+        <div class="toolbar">
+          <div class="search-wrap">
+            <input type="text" id="search-input" placeholder="🔍 Search by name, @username, or User ID..." oninput="filterTable()">
+            <select id="group-filter" style="max-width:180px;" onchange="filterTable()">
+              <option value="">All Groups</option>
+            </select>
+          </div>
+          <div class="actions-wrap">
+            <button class="btn btn-secondary" onclick="selectAllFiltered(true)">Select All</button>
+            <button class="btn btn-secondary" onclick="selectAllFiltered(false)">Clear</button>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:36px;"><input type="checkbox" id="master-checkbox" onchange="toggleMasterCheckbox(this)"></th>
+                <th>Member</th>
+                <th>Username</th>
+                <th>Groups</th>
+                <th>Last Accepted</th>
+                <th>Approvals</th>
+              </tr>
+            </thead>
+            <tbody id="members-table-body">
+              <tr><td colspan="6" class="empty-msg">Loading accepted members registry...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let allMembers = [];
+let filteredMembers = [];
+let selectedUserIds = new Set();
+
+function getApiBaseUrl() {
+  const custom = localStorage.getItem('bot_backend_url');
+  if (custom) return custom.replace(/\/$/, '');
+  if (window.location.hostname.includes('vercel.app')) {
+    return 'https://manager-f6vd.onrender.com';
+  }
+  return '';
+}
+
+function promptSetBackendUrl() {
+  const current = getApiBaseUrl() || window.location.origin;
+  const val = prompt('Enter your Render Bot Backend URL (e.g. https://manager-f6vd.onrender.com):', current);
+  if (val !== null) {
+    localStorage.setItem('bot_backend_url', val.trim());
+    fetchMembers();
+  }
+}
+
+async function fetchMembers() {
+  const statusEl = document.getElementById('stat-status');
+  try {
+    const res = await fetch(getApiBaseUrl() + '/api/members');
+    const data = await res.json();
+    allMembers = data.members || [];
+    document.getElementById('stat-total').textContent = allMembers.length;
+    statusEl.textContent = 'ONLINE';
+    statusEl.style.color = 'var(--success)';
+
+    const groupsSet = new Set();
+    allMembers.forEach(m => (m.chat_titles || []).forEach(t => groupsSet.add(t)));
+    document.getElementById('stat-groups').textContent = groupsSet.size;
+
+    const groupFilter = document.getElementById('group-filter');
+    const curVal = groupFilter.value;
+    groupFilter.innerHTML = '<option value="">All Groups</option>';
+    groupsSet.forEach(g => {
+      const opt = document.createElement('option');
+      opt.value = g;
+      opt.textContent = g;
+      groupFilter.appendChild(opt);
+    });
+    groupFilter.value = curVal;
+
+    filterTable();
+  } catch (e) {
+    statusEl.textContent = 'DISCONNECTED';
+    statusEl.style.color = 'var(--danger)';
+    showToast('Failed to connect to backend: ' + e.message, true);
+  }
+}
+
+function filterTable() {
+  const query = document.getElementById('search-input').value.trim().toLowerCase();
+  const group = document.getElementById('group-filter').value;
+
+  filteredMembers = allMembers.filter(m => {
+    const matchQuery = !query ||
+      (m.full_name && m.full_name.toLowerCase().includes(query)) ||
+      (m.username && m.username.toLowerCase().includes(query)) ||
+      String(m.user_id).includes(query);
+
+    const matchGroup = !group || (m.chat_titles && m.chat_titles.includes(group));
+    return matchQuery && matchGroup;
+  });
+
+  renderTable();
+  updateTargetMode();
+}
+
+function renderTable() {
+  const tbody = document.getElementById('members-table-body');
+  if (!filteredMembers.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-msg">No accepted members found.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filteredMembers.map(m => {
+    const isChecked = selectedUserIds.has(m.user_id);
+    const initials = (m.first_name ? m.first_name.charAt(0) : 'U').toUpperCase();
+    const uname = m.username ? ('@' + m.username) : '<span style="color:var(--text-secondary)">-</span>';
+    const groups = (m.chat_titles || []).map(g => `<span class="group-pill">${escapeHtml(g)}</span>`).join('') || '<span style="color:var(--text-secondary)">None</span>';
+    const dateStr = m.last_accepted_at ? new Date(m.last_accepted_at).toLocaleString() : '-';
+
+    return `<tr>
+      <td><input type="checkbox" data-uid="${m.user_id}" ${isChecked ? 'checked' : ''} onchange="toggleSelectUser(${m.user_id}, this.checked)"></td>
+      <td>
+        <div class="user-cell">
+          <div class="avatar">${initials}</div>
+          <div>
+            <div class="user-name">${escapeHtml(m.full_name || 'User ' + m.user_id)}</div>
+            <div class="user-id">${m.user_id}</div>
+          </div>
+        </div>
+      </td>
+      <td>${uname}</td>
+      <td>${groups}</td>
+      <td style="color:var(--text-secondary);font-size:12px;">${dateStr}</td>
+      <td style="font-weight:600;color:var(--accent-blue);">${m.accept_count || 1}</td>
+    </tr>`;
+  }).join('');
+}
+
+function toggleSelectUser(userId, checked) {
+  if (checked) {
+    selectedUserIds.add(userId);
+  } else {
+    selectedUserIds.delete(userId);
+  }
+  updateSelectedBadge();
+}
+
+function selectAllFiltered(state) {
+  filteredMembers.forEach(m => {
+    if (state) selectedUserIds.add(m.user_id);
+    else selectedUserIds.delete(m.user_id);
+  });
+  document.getElementById('master-checkbox').checked = state;
+  renderTable();
+  updateSelectedBadge();
+}
+
+function toggleMasterCheckbox(masterEl) {
+  selectAllFiltered(masterEl.checked);
+}
+
+function updateSelectedBadge() {
+  const count = selectedUserIds.size;
+  document.getElementById('selected-badge').textContent = `${count} Selected`;
+  updateTargetMode();
+}
+
+function updateTargetMode() {
+  const mode = document.getElementById('target-mode').value;
+  const btn = document.getElementById('send-btn');
+  const count = selectedUserIds.size;
+  if (mode === 'selected') {
+    btn.textContent = `🚀 Send Broadcast to Selected (${count})`;
+  } else if (mode === 'filtered') {
+    btn.textContent = `🚀 Send Broadcast to Filtered (${filteredMembers.length})`;
+  } else {
+    btn.textContent = `🚀 Send Broadcast to All (${allMembers.length})`;
+  }
+}
+
+function insertTag(tag) {
+  const ta = document.getElementById('broadcast-msg');
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const sel = ta.value.substring(start, end);
+  const rep = `<${tag}>${sel || 'text'}</${tag}>`;
+  ta.value = ta.value.substring(0, start) + rep + ta.value.substring(end);
+  ta.focus();
+}
+
+function insertLink() {
+  const url = prompt('Enter link URL (e.g. https://t.me/...):');
+  if (!url) return;
+  const ta = document.getElementById('broadcast-msg');
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const sel = ta.value.substring(start, end) || 'Click Here';
+  const rep = `<a href="${url}">${sel}</a>`;
+  ta.value = ta.value.substring(0, start) + rep + ta.value.substring(end);
+  ta.focus();
+}
+
+async function submitBroadcast() {
+  const msg = document.getElementById('broadcast-msg').value.trim();
+  if (!msg) {
+    alert('Please enter a broadcast message content.');
+    return;
+  }
+
+  const mode = document.getElementById('target-mode').value;
+  let targetUids = [];
+  let sendAll = false;
+
+  if (mode === 'selected') {
+    targetUids = Array.from(selectedUserIds);
+    if (!targetUids.length) {
+      alert('Please select at least one member to message.');
+      return;
+    }
+  } else if (mode === 'filtered') {
+    targetUids = filteredMembers.map(m => m.user_id);
+    if (!targetUids.length) {
+      alert('No members in current filter.');
+      return;
+    }
+  } else {
+    sendAll = true;
+  }
+
+  const recipientCount = sendAll ? allMembers.length : targetUids.length;
+  if (!confirm(`Confirm dispatching broadcast to ${recipientCount} accepted member(s)?`)) {
+    return;
+  }
+
+  const pBox = document.getElementById('progress-box');
+  const pStatus = document.getElementById('progress-status');
+  const pFill = document.getElementById('progress-bar-fill');
+  const btn = document.getElementById('send-btn');
+
+  btn.disabled = true;
+  pBox.style.display = 'block';
+  pStatus.textContent = 'Scheduling throttled broadcast...';
+  pFill.style.width = '25%';
+
+  try {
+    const res = await fetch(getApiBaseUrl() + '/api/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        all: sendAll,
+        user_ids: targetUids,
+        message: msg
+      })
+    });
+    const resp = await res.json();
+    if (resp.status === 'ok') {
+      pFill.style.width = '100%';
+      pStatus.textContent = `Broadcast running in background for ${resp.recipient_count} members!`;
+      showToast(`Broadcast queued successfully! (${resp.recipient_count} recipients)`);
+      setTimeout(() => {
+        pBox.style.display = 'none';
+        btn.disabled = false;
+      }, 4000);
+    } else {
+      throw new Error(resp.message || 'Broadcast failed.');
+    }
+  } catch (err) {
+    pBox.style.display = 'none';
+    btn.disabled = false;
+    alert('Broadcast Error: ' + err.message);
+  }
+}
+
+function showToast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isError ? 'var(--danger)' : 'var(--accent-blue)';
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 3500);
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+window.addEventListener('DOMContentLoaded', fetchMembers);
+</script>
+</body>
+</html>
