@@ -13,7 +13,6 @@ from .models import (
     ChatSettingsModel,
     ModerationAuditLogModel,
     ReportRecordModel,
-    UserWarningsModel,
     WarnIncident,
     migrate_chat_settings_document,
 )

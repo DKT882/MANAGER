@@ -24,7 +24,7 @@ except Exception:
     pass
 os.environ["PYTHONUNBUFFERED"] = "1"
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 # ==============================================================================
@@ -49,7 +49,7 @@ from aiohttp import web
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.methods import TelegramMethod
 from aiogram.methods.base import TelegramType
-from database import DatabaseService, MongoDBManager, AcceptedMemberModel
+from database import DatabaseService, MongoDBManager
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router, types
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -2096,10 +2096,6 @@ def generate_settings_page2_keyboard(chat_id: int, is_dm: bool = False) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def generate_settings_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
-    return generate_settings_page1_keyboard(chat_id, is_dm=is_dm)
-
-
 def format_regulation_text(chat_title: str, s: Dict[str, Any]) -> str:
     rules = s.get("rules_text", "").strip()
     perm_label = "👥 Everyone" if s.get("rules_perm", "all") == "all" else "👮 Admins Only"
@@ -2948,67 +2944,6 @@ def format_flood_text(chat_title: str, s: Dict[str, Any]) -> str:
     )
 
 
-def generate_bot_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
-    s = CHAT_SETTINGS[chat_id]
-    is_on = s.get("block_bots", False)
-    b_action = s.get("bot_action", "ban").upper()
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text=f"🤖 Anti-Bot: {'✅ ACTIVE' if is_on else '❌ DISABLED'}",
-                callback_data=f"set:bot_toggle:{chat_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🔨 Punishment: {b_action} (BAN / KICK)",
-                callback_data=f"set:bot_action:{chat_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
-        ]
-    ])
-
-
-def format_bot_text(chat_title: str, s: Dict[str, Any]) -> str:
-    is_on = s.get("block_bots", False)
-    b_action = s.get("bot_action", "ban").upper()
-    return (
-        f"🤖 <b>ANTI-BOT AUTO-PROTECTION</b>\n"
-        f"Group: <code>{chat_title}</code>\n\n"
-        f"• <b>Status:</b> {'<code>ACTIVE</code>' if is_on else '<i>Disabled</i>'}\n"
-        f"• <b>Punishment Action:</b> <code>{b_action}</code> (BAN: permanent / KICK: allows rejoining)\n\n"
-        f"<i>When active, any unauthorized bot added to this group is instantly penalized.</i>"
-    )
-
-
-def generate_service_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
-    s = CHAT_SETTINGS[chat_id]
-    is_on = s.get("clean_service_messages", True)
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text=f"🚷 Delete Join/Left: {'✅ ACTIVE' if is_on else '❌ DISABLED'}",
-                callback_data=f"set:service_toggle:{chat_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
-        ]
-    ])
-
-
-def format_service_text(chat_title: str, s: Dict[str, Any]) -> str:
-    is_on = s.get("clean_service_messages", True)
-    return (
-        f"🧹 <b>SERVICE MESSAGE CLEANER</b>\n"
-        f"Group: <code>{chat_title}</code>\n\n"
-        f"• <b>Status:</b> {'<code>ACTIVE (Auto-Delete)</code>' if is_on else '<i>Disabled</i>'}\n\n"
-        f"<i>Automatically purges user joined and user left system notifications.</i>"
-    )
-
-
 def generate_links_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
     s = CHAT_SETTINGS[chat_id]
     def badge(b: bool) -> str:
@@ -3111,35 +3046,6 @@ def format_excepted_text(chat_title: str, s: Dict[str, Any]) -> str:
         f"{list_str}\n\n"
         f"👉 <b>How to add:</b> Reply to the admin's message with <code>/addexcept</code> or send <code>/addexcept @admin</code>.\n"
         f"👉 <b>Private DM access:</b> Once added, they can manage settings in Private DM via @{bot_name}."
-    )
-
-
-def format_settings_text(chat_title: str, s: Dict[str, Any]) -> str:
-    """Renders standardized settings dashboard text."""
-    warn_dur_str = format_duration(s.get("warn_duration", 86400))
-    flood_dur_str = format_duration(s.get("flood_duration", 900))
-    media_blocked = sum(1 for k in [
-        "block_sticker", "block_animation", "block_document",
-        "block_audio", "block_voice", "block_photo", "block_video"
-    ] if s.get(k))
-
-    return (
-        f"⚙️ <b>GROUP CONFIGURATION DASHBOARD</b>\n"
-        f"Group: <code>{chat_title}</code>\n\n"
-        f"🛡️ <b>PUNISHMENTS & VIOLATIONS:</b>\n"
-        f"• <b>Warn Ceiling:</b> <code>{s.get('warn_limit', 3)} violations</code> ➔ <code>{s.get('warn_action', 'mute').upper()} ({warn_dur_str})</code>\n"
-        f"• <b>Anti-Flood:</b> {'<code>ACTIVE</code>' if s.get('flood_protection') else '<i>Disabled</i>'} "
-        f"({s.get('flood_limit', 5)} msgs / {int(s.get('flood_window', 3))}s) ➔ <code>{s.get('flood_action', 'mute').upper()} ({flood_dur_str})</code>\n"
-        f"• <b>Anti-Bot:</b> {'<code>ACTIVE</code>' if s.get('block_bots') else '<i>Disabled</i>'} "
-        f"➔ <code>{s.get('bot_action', 'ban').upper()}</code>\n\n"
-        f"🔒 <b>RESTRICTIONS & FILTERS:</b>\n"
-        f"• <b>Member Links:</b> {'<code>Blocked</code>' if s.get('block_links') else '<i>Allowed</i>'} (Action: <code>{s.get('link_action', 'delete').upper()}</code>)\n"
-        f"• <b>Admin Links:</b> {'<code>Blocked</code>' if s.get('admin_links_block') else '<i>Allowed</i>'}\n"
-        f"• <b>Channel Links / Invites:</b> {'<code>Blocked</code>' if s.get('block_channel_links') else '<i>Allowed</i>'}\n"
-        f"• <b>Media Blocked:</b> <code>{media_blocked}/7 types</code> (Action: <code>{s.get('media_action', 'delete').upper()}</code>)\n"
-        f"• <b>Join/Left Cleanup:</b> {'<code>ACTIVE</code>' if s.get('clean_service_messages', True) else '<i>Disabled</i>'}\n"
-        f"• <b>Excepted Admins:</b> <code>{len(s.get('excepted_admins', []))} designated</code>\n\n"
-        f"👉 <i>Tap any category below to customize rules, thresholds, and punishments:</i>"
     )
 
 

@@ -1,7 +1,4 @@
-import asyncio
-import sys
 import unittest
-from datetime import datetime, timezone
 
 from database.models import ChatSettingsModel, AcceptedMemberModel
 import bot
