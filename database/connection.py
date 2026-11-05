@@ -120,6 +120,21 @@ class MongoDBManager:
                 name="idx_reports_ttl_60d"
             )
 
+            # 5. Accepted Members: Global unified entity for cross-group member auditing and broadcasts
+            await cls._db.accepted_members.create_index(
+                [("user_id", pymongo.ASCENDING)],
+                unique=True,
+                name="idx_accepted_members_user_id_unique"
+            )
+            await cls._db.accepted_members.create_index(
+                [("chat_ids", pymongo.ASCENDING)],
+                name="idx_accepted_members_chat_ids"
+            )
+            await cls._db.accepted_members.create_index(
+                [("last_accepted_at", pymongo.DESCENDING)],
+                name="idx_accepted_members_last_accepted"
+            )
+
             print("[DATABASE] Production database indexes successfully provisioned.")
         except Exception as e:
             print(f"[DATABASE] Index creation notice: {e}")

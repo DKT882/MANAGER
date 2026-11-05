@@ -372,3 +372,126 @@ class DatabaseService:
             )
         except Exception as e:
             print(f"[DATABASE ERROR] Failed to resolve report in database: {e}")
+
+    # --------------------------------------------------------------------------
+    # 6. Global Accepted Members Entity & Broadcast DAL
+    # --------------------------------------------------------------------------
+    @classmethod
+    def record_accepted_member_background(
+        cls,
+        user_id: int,
+        first_name: str,
+        last_name: Optional[str],
+        username: Optional[str],
+        full_name: str,
+        chat_id: int,
+        chat_title: str,
+        bio: Optional[str] = None
+    ) -> None:
+        """Schedules non-blocking async persistence of accepted member into global entity."""
+        if not MongoDBManager.is_connected():
+            return
+        asyncio.create_task(cls._persist_accepted_member_worker(
+            user_id, first_name, last_name, username, full_name, chat_id, chat_title, bio
+        ))
+
+    @staticmethod
+    async def _persist_accepted_member_worker(
+        user_id: int,
+        first_name: str,
+        last_name: Optional[str],
+        username: Optional[str],
+        full_name: str,
+        chat_id: int,
+        chat_title: str,
+        bio: Optional[str] = None
+    ) -> None:
+        db = get_db()
+        if db is None:
+            return
+
+        try:
+            now = datetime.now(timezone.utc)
+            await db.accepted_members.update_one(
+                {"user_id": user_id},
+                {
+                    "$set": {
+                        "user_id": user_id,
+                        "first_name": first_name or "",
+                        "last_name": last_name or None,
+                        "username": username.lower() if username else None,
+                        "full_name": full_name or first_name or f"User {user_id}",
+                        "last_accepted_at": now,
+                        "status": "active",
+                        "bio": bio,
+                    },
+                    "$setOnInsert": {
+                        "first_accepted_at": now,
+                    },
+                    "$addToSet": {
+                        "chat_ids": chat_id,
+                        "chat_titles": chat_title,
+                    },
+                    "$inc": {
+                        "accept_count": 1,
+                    }
+                },
+                upsert=True
+            )
+        except Exception as e:
+            print(f"[DATABASE ERROR] Failed to record accepted member {user_id}: {e}", flush=True)
+
+    @staticmethod
+    async def hydrate_accepted_members_cache(cache_dict: Dict[int, Dict[str, Any]]) -> int:
+        """Loads all globally accepted members from MongoDB into local memory cache on startup."""
+        db = get_db()
+        if db is None:
+            return 0
+
+        count = 0
+        try:
+            cursor = db.accepted_members.find({}, {"_id": 0})
+            async for doc in cursor:
+                uid = doc.get("user_id")
+                if uid:
+                    cache_dict[uid] = doc
+                    count += 1
+            print(f"[DATABASE] Hydrated {count} globally accepted members into memory cache.")
+        except Exception as e:
+            print(f"[DATABASE ERROR] Failed to hydrate accepted members: {e}")
+        return count
+
+    @staticmethod
+    async def get_accepted_members(chat_id: Optional[int] = None, limit: int = 1000) -> list[Dict[str, Any]]:
+        """Retrieves accepted members list, optionally filtered by group chat ID."""
+        db = get_db()
+        if db is None:
+            return []
+
+        query = {}
+        if chat_id is not None:
+            query = {"chat_ids": chat_id}
+
+        try:
+            cursor = db.accepted_members.find(query, {"_id": 0}).sort("last_accepted_at", -1).limit(limit)
+            return await cursor.to_list(length=limit)
+        except Exception as e:
+            print(f"[DATABASE ERROR] Failed to fetch accepted members: {e}")
+            return []
+
+    @staticmethod
+    async def get_accepted_members_count(chat_id: Optional[int] = None) -> int:
+        """Returns total count of accepted members in global entity or specific group."""
+        db = get_db()
+        if db is None:
+            return 0
+
+        query = {}
+        if chat_id is not None:
+            query = {"chat_ids": chat_id}
+
+        try:
+            return await db.accepted_members.count_documents(query)
+        except Exception as e:
+            print(f"[DATABASE ERROR] Failed to count accepted members: {e}")
+            return 0

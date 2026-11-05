@@ -13,6 +13,7 @@ from .models import (
     ReportRecordModel,
     UserWarningsModel,
     WarnSettings,
+    AcceptedMemberModel,
 )
 from .service import DatabaseService
 
@@ -28,4 +29,5 @@ __all__ = [
     "UserWarningsModel",
     "ModerationAuditLogModel",
     "ReportRecordModel",
+    "AcceptedMemberModel",
 ]

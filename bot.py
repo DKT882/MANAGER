@@ -49,7 +49,7 @@ from aiohttp import web
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.methods import TelegramMethod
 from aiogram.methods.base import TelegramType
-from database import DatabaseService, MongoDBManager
+from database import DatabaseService, MongoDBManager, AcceptedMemberModel
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router, types
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -116,6 +116,8 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "welcome_enabled": False,
     "welcome_msg": "👋 Welcome to <b>{chat_title}</b>, {mention}!",
     "clean_welcome": True,
+    "welcome_pm_enabled": False,
+    "welcome_pm_msg": "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉",
     "goodbye_enabled": False,
     "goodbye_msg": "👋 Goodbye, {mention}!",
     # Alphabets Filter
@@ -201,6 +203,15 @@ CHAT_TITLES: Dict[int, str] = {}
 # USERNAME_CACHE: username (lowercase, without @) -> (user_id, full_name)
 # Provides sub-microsecond in-memory resolution for @username command targeting
 USERNAME_CACHE: Dict[str, Tuple[int, str]] = {}
+
+# ACCEPTED_MEMBERS_CACHE: user_id -> dict containing global consolidated member metadata across all groups
+ACCEPTED_MEMBERS_CACHE: Dict[int, Dict[str, Any]] = {}
+
+# PENDING_BROADCAST: broadcast_token -> dict holding broadcast session configuration for confirmation
+PENDING_BROADCAST: Dict[str, Dict[str, Any]] = {}
+
+# GLOBAL_BOT: Global singleton reference for web dashboard API and background dispatch
+GLOBAL_BOT: Optional[Bot] = None
 
 # Pre-compiled high-performance regex patterns
 RE_DURATION = re.compile(r"^(\d+)([smhdw]?)$")
@@ -1056,9 +1067,63 @@ async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
             METRICS["violations_handled"] += 1
             print(f"[APPROVAL] Auto-approved join request for user {user.id} (@{user.username}) in chat {chat_id}", flush=True)
 
-            # Optional welcome greeting dispatch
+            chat_title = await get_cached_chat_title(bot, chat_id)
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # 1. Update in-memory unified global accepted members cache (0ms lookup)
+            mem_data = ACCEPTED_MEMBERS_CACHE.get(user.id, {})
+            existing_cids = list(mem_data.get("chat_ids", []))
+            if chat_id not in existing_cids:
+                existing_cids.append(chat_id)
+            existing_titles = list(mem_data.get("chat_titles", []))
+            if chat_title not in existing_titles:
+                existing_titles.append(chat_title)
+
+            ACCEPTED_MEMBERS_CACHE[user.id] = {
+                "user_id": user.id,
+                "first_name": user.first_name or "",
+                "last_name": user.last_name or None,
+                "username": user.username.lower() if user.username else None,
+                "full_name": user.full_name or user.first_name or f"User {user.id}",
+                "chat_ids": existing_cids,
+                "chat_titles": existing_titles,
+                "first_accepted_at": mem_data.get("first_accepted_at", now_iso),
+                "last_accepted_at": now_iso,
+                "accept_count": mem_data.get("accept_count", 0) + 1,
+                "bio": getattr(request, "bio", None),
+                "status": "active"
+            }
+
+            # 2. Persist to MongoDB global entity in background worker
+            DatabaseService.record_accepted_member_background(
+                user_id=user.id,
+                first_name=user.first_name or "",
+                last_name=user.last_name,
+                username=user.username,
+                full_name=user.full_name or user.first_name or f"User {user.id}",
+                chat_id=chat_id,
+                chat_title=chat_title,
+                bio=getattr(request, "bio", None)
+            )
+
+            # 3. Optional Private DM Welcome Message
+            if settings.get("welcome_pm_enabled"):
+                pm_template = settings.get(
+                    "welcome_pm_msg",
+                    "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"
+                )
+                pm_formatted = pm_template.replace("{mention}", user.mention_html()) \
+                                           .replace("{name}", html.escape(user.full_name)) \
+                                           .replace("{chat_title}", html.escape(chat_title)) \
+                                           .replace("{id}", str(user.id))
+                try:
+                    await bot.send_message(chat_id=user.id, text=pm_formatted, parse_mode=ParseMode.HTML)
+                    print(f"[APPROVAL PM] Sent private DM welcome greeting to user {user.id}", flush=True)
+                except Exception as pme:
+                    print(f"[APPROVAL NOTICE] Private DM welcome send error for {user.id}: {pme}", flush=True)
+
+            # 4. Optional In-Chat welcome greeting dispatch
             if settings.get("welcome_enabled"):
-                chat_title = await get_cached_chat_title(bot, chat_id)
                 template = settings.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
                 formatted = template.replace("{mention}", user.mention_html()) \
                                     .replace("{name}", html.escape(user.full_name)) \
@@ -1077,7 +1142,7 @@ async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
                 except Exception as we:
                     print(f"[APPROVAL NOTICE] Welcome message dispatch error: {we}", flush=True)
 
-            # Security audit log dispatch
+            # 5. Security audit log dispatch
             log_chan = settings.get("log_channel") or settings.get("log_channel_id")
             if log_chan:
                 try:
@@ -1090,6 +1155,83 @@ async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
                     pass
         except Exception as e:
             print(f"[APPROVAL ERROR] Failed to auto-approve user {user.id} in chat {chat_id}: {e}", flush=True)
+
+
+@router.chat_member()
+async def handle_chat_member_updated(event: types.ChatMemberUpdated, bot: Bot) -> None:
+    """
+    Handles member status transitions (such as manual join request approval by admin).
+    Guarantees that manual approvals are also captured into the global accepted members registry
+    and receive their Private DM welcome greeting.
+    """
+    if event.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    chat_id = event.chat.id
+    user = event.new_chat_member.user
+    if not user or user.is_bot:
+        return
+
+    old_status = event.old_chat_member.status if event.old_chat_member else None
+    new_status = event.new_chat_member.status
+
+    # Check transition to MEMBER or RESTRICTED from non-member
+    was_member = old_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+    is_now_member = new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED)
+
+    if not was_member and is_now_member:
+        # User joined or had their join request approved
+        chat_title = await get_cached_chat_title(bot, chat_id)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        settings = CHAT_SETTINGS[chat_id]
+
+        mem_data = ACCEPTED_MEMBERS_CACHE.get(user.id, {})
+        existing_cids = list(mem_data.get("chat_ids", []))
+        if chat_id not in existing_cids:
+            existing_cids.append(chat_id)
+        existing_titles = list(mem_data.get("chat_titles", []))
+        if chat_title not in existing_titles:
+            existing_titles.append(chat_title)
+
+        ACCEPTED_MEMBERS_CACHE[user.id] = {
+            "user_id": user.id,
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or None,
+            "username": user.username.lower() if user.username else None,
+            "full_name": user.full_name or user.first_name or f"User {user.id}",
+            "chat_ids": existing_cids,
+            "chat_titles": existing_titles,
+            "first_accepted_at": mem_data.get("first_accepted_at", now_iso),
+            "last_accepted_at": now_iso,
+            "accept_count": mem_data.get("accept_count", 0) + 1,
+            "status": "active"
+        }
+
+        # Background persistence
+        DatabaseService.record_accepted_member_background(
+            user_id=user.id,
+            first_name=user.first_name or "",
+            last_name=user.last_name,
+            username=user.username,
+            full_name=user.full_name or user.first_name or f"User {user.id}",
+            chat_id=chat_id,
+            chat_title=chat_title
+        )
+
+        # Send private DM welcome if enabled
+        if settings.get("welcome_pm_enabled"):
+            pm_template = settings.get(
+                "welcome_pm_msg",
+                "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"
+            )
+            pm_formatted = pm_template.replace("{mention}", user.mention_html()) \
+                                       .replace("{name}", html.escape(user.full_name)) \
+                                       .replace("{chat_title}", html.escape(chat_title)) \
+                                       .replace("{id}", str(user.id))
+            try:
+                await bot.send_message(chat_id=user.id, text=pm_formatted, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
 
 
 # ==============================================================================
@@ -2021,14 +2163,18 @@ def generate_antispam_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeybo
 def format_welcome_text(chat_title: str, s: Dict[str, Any]) -> str:
     st = "🟢 Enabled" if s.get("welcome_enabled") else "🔴 Disabled"
     cl = "🟢 Yes" if s.get("clean_welcome") else "⚪ No"
+    pm_st = "🟢 Enabled" if s.get("welcome_pm_enabled") else "🔴 Disabled"
     msg = s.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
+    pm_msg = s.get("welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉")
     return (
         "<b>Manager</b>\n"
         "💬 <b>Welcome Message</b>\n"
         "Configure automated greetings for new members joining the group.\n\n"
-        f"<b>Status:</b> {st}\n"
-        f"<b>Clean Previous Welcome:</b> {cl}\n\n"
-        f"<b>Current Template:</b>\n<code>{html.escape(msg)}</code>\n\n"
+        f"• <b>In-Chat Welcome:</b> {st}\n"
+        f"• <b>Clean Previous Welcome:</b> {cl}\n"
+        f"• <b>Join Request Private DM:</b> {pm_st}\n\n"
+        f"<b>In-Chat Template:</b>\n<code>{html.escape(msg)}</code>\n\n"
+        f"<b>Private DM Template:</b>\n<code>{html.escape(pm_msg)}</code>\n\n"
         "<i>Placeholders: {mention}, {name}, {chat_title}, {id}</i>"
     )
 
@@ -2036,12 +2182,15 @@ def format_welcome_text(chat_title: str, s: Dict[str, Any]) -> str:
 def generate_welcome_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
     prefix = "dm:" if is_dm else "set:"
     s = CHAT_SETTINGS[chat_id]
-    st_btn = f"⚡ State: {'ON' if s.get('welcome_enabled') else 'OFF'}"
-    cl_btn = f"🧹 Clean Previous: {'ON' if s.get('clean_welcome') else 'OFF'}"
+    st_btn = f"⚡ In-Chat: {'ON' if s.get('welcome_enabled') else 'OFF'}"
+    cl_btn = f"🧹 Clean Prev: {'ON' if s.get('clean_welcome') else 'OFF'}"
+    pm_btn = f"📬 Request PM: {'ON' if s.get('welcome_pm_enabled') else 'OFF'}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=st_btn, callback_data=f"{prefix}toggle:welcome_enabled:{chat_id}:welcome")],
-        [InlineKeyboardButton(text=cl_btn, callback_data=f"{prefix}toggle:clean_welcome:{chat_id}:welcome")],
-        [InlineKeyboardButton(text="✍️ Customize message", callback_data=f"{prefix}cust:welcome:{chat_id}")],
+        [InlineKeyboardButton(text=st_btn, callback_data=f"{prefix}toggle:welcome_enabled:{chat_id}:welcome"),
+         InlineKeyboardButton(text=cl_btn, callback_data=f"{prefix}toggle:clean_welcome:{chat_id}:welcome")],
+        [InlineKeyboardButton(text=pm_btn, callback_data=f"{prefix}toggle:welcome_pm_enabled:{chat_id}:welcome")],
+        [InlineKeyboardButton(text="✍️ Custom In-Chat Msg", callback_data=f"{prefix}cust:welcome:{chat_id}")],
+        [InlineKeyboardButton(text="📩 Custom Request PM Msg", callback_data=f"{prefix}cust:welcome_pm:{chat_id}")],
         [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
     ])
 
@@ -2310,11 +2459,16 @@ def generate_guardian_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeybo
 
 def format_approval_text(chat_title: str, s: Dict[str, Any]) -> str:
     st = "🟢 Auto-Approve" if s.get("approval_auto") else "🔴 Manual Admin Review"
+    pm_st = "🟢 Enabled" if s.get("welcome_pm_enabled") else "🔴 Disabled"
+    pm_msg = s.get("welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉")
     return (
         "<b>Manager</b>\n"
         "📭 <b>Join Request Approval Mode</b>\n"
-        "Manage how incoming join requests are handled.\n\n"
-        f"<b>Mode:</b> <code>{st}</code>"
+        "Manage how incoming join requests are handled and greeted.\n\n"
+        f"• <b>Approval Mode:</b> <code>{st}</code>\n"
+        f"• <b>Private DM Welcome:</b> <code>{pm_st}</code>\n\n"
+        f"<b>Private DM Template:</b>\n<code>{html.escape(pm_msg)}</code>\n\n"
+        "<i>Placeholders: {mention}, {name}, {chat_title}, {id}</i>"
     )
 
 
@@ -2322,8 +2476,11 @@ def generate_approval_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeybo
     prefix = "dm:" if is_dm else "set:"
     s = CHAT_SETTINGS[chat_id]
     st = "🟢 ON" if s.get("approval_auto") else "⚪ OFF"
+    pm_st = "🟢 ON" if s.get("welcome_pm_enabled") else "⚪ OFF"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⚡ Auto-Approve: {st}", callback_data=f"{prefix}toggle:approval_auto:{chat_id}:approval")],
+        [InlineKeyboardButton(text=f"📬 Private DM: {pm_st}", callback_data=f"{prefix}toggle:welcome_pm_enabled:{chat_id}:approval")],
+        [InlineKeyboardButton(text="📩 Customize PM Welcome", callback_data=f"{prefix}cust:welcome_pm:{chat_id}")],
         [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
     ])
 
@@ -2444,15 +2601,22 @@ def generate_recurring_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyb
     ])
 
 
-def format_members_text(chat_title: str, s: Dict[str, Any]) -> str:
+def format_members_text(chat_title: str, s: Dict[str, Any], chat_id: Optional[int] = None) -> str:
     ro = "🟢 Active" if s.get("readonly_mode") else "⚪ Disabled"
     sm = f"{s.get('slow_mode', 0)}s" if s.get('slow_mode', 0) > 0 else "OFF"
+    chat_accepted = 0
+    if chat_id is not None:
+        chat_accepted = sum(1 for m in ACCEPTED_MEMBERS_CACHE.values() if chat_id in m.get("chat_ids", []))
+    total_accepted = len(ACCEPTED_MEMBERS_CACHE)
     return (
         "<b>Manager</b>\n"
-        "👥 <b>Members Management</b>\n"
-        "Group-wide restrictions and crowd control.\n\n"
+        "👥 <b>Members Management & Broadcast</b>\n"
+        "Group-wide restrictions, accepted member registry, and broadcast messaging.\n\n"
         f"• <b>Read-Only Mode:</b> {ro}\n"
-        f"• <b>Slow Mode:</b> <code>{sm}</code>"
+        f"• <b>Slow Mode:</b> <code>{sm}</code>\n"
+        f"• <b>Accepted Members (This Chat):</b> <code>{chat_accepted}</code>\n"
+        f"• <b>Global Accepted Members:</b> <code>{total_accepted}</code>\n\n"
+        "<i>Broadcast messages directly to accepted members or manage them in the Web Dashboard.</i>"
     )
 
 
@@ -2462,8 +2626,12 @@ def generate_members_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboa
     ro = "🟢 ON" if s.get("readonly_mode") else "⚪ OFF"
     sm = f"{s.get('slow_mode', 0)}s" if s.get('slow_mode', 0) > 0 else "OFF"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🔒 Read-Only: {ro}", callback_data=f"{prefix}toggle:readonly_mode:{chat_id}:members")],
-        [InlineKeyboardButton(text=f"⏱ Slow Mode: {sm}", callback_data=f"{prefix}cycle:slow_mode:{chat_id}:members")],
+        [
+            InlineKeyboardButton(text=f"🔒 Read-Only: {ro}", callback_data=f"{prefix}toggle:readonly_mode:{chat_id}:members"),
+            InlineKeyboardButton(text=f"⏱ Slow Mode: {sm}", callback_data=f"{prefix}cycle:slow_mode:{chat_id}:members"),
+        ],
+        [InlineKeyboardButton(text="📢 Broadcast to This Chat Members", callback_data=f"{prefix}bcast_chat:{chat_id}")],
+        [InlineKeyboardButton(text="🌐 Broadcast to All Accepted Members", callback_data=f"{prefix}bcast_all:{chat_id}")],
         [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
     ])
 
@@ -3118,6 +3286,48 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 except Exception:
                     pass
 
+        elif arg.startswith("custom_"):
+            try:
+                parts = arg.split("_")
+                subname_param = "_".join(parts[1:-1]) if len(parts) > 2 else parts[1]
+                raw_id = parts[-1]
+                target_cid = -int(raw_id) if not raw_id.startswith("-") else int(raw_id)
+            except Exception:
+                target_cid = None
+            if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
+                PENDING_CUSTOM_INPUT[user_id] = (target_cid, subname_param)
+                title = await get_cached_chat_title(bot, target_cid)
+                nice_name = subname_param.replace("_", " ").title()
+                await message.answer(
+                    f"✍️ <b>Configure Custom {nice_name}</b>\n\n"
+                    f"<b>Group:</b> <code>{html.escape(title)}</code>\n\n"
+                    f"Please send your custom message template now.\n"
+                    f"<i>Placeholders like {{mention}}, {{name}}, {{chat_title}}, {{id}} are supported.\nSend /cancel to abort.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+        elif arg.startswith("bcast_"):
+            try:
+                parts = arg.split("_")
+                raw_id = parts[1]
+                scope = parts[2] if len(parts) > 2 else "chat"
+                target_cid = -int(raw_id) if not raw_id.startswith("-") else int(raw_id)
+            except Exception:
+                target_cid = None
+            if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
+                PENDING_CUSTOM_INPUT[user_id] = (target_cid, f"broadcast:{scope}")
+                title = await get_cached_chat_title(bot, target_cid)
+                target_count = sum(1 for m in ACCEPTED_MEMBERS_CACHE.values() if target_cid in m.get("chat_ids", [])) if scope == "chat" else len(ACCEPTED_MEMBERS_CACHE)
+                scope_name = f"Group '{title}'" if scope == "chat" else "All Global"
+                await message.answer(
+                    f"📢 <b>Broadcast to {scope_name} Accepted Members ({target_count} members)</b>\n\n"
+                    f"Please send the message you wish to broadcast now.\n"
+                    f"<i>HTML formatting tags (<b>bold</b>, <i>italic</i>, <code>code</code>, <a href='...'>link</a>) are supported.\nSend /cancel to abort.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
         if target_cid:
             if await check_can_setup_bot(bot, target_cid, user_id):
                 title = await get_cached_chat_title(bot, target_cid)
@@ -3449,7 +3659,7 @@ def render_submenu(subname: str, chat_title: str, s: Dict[str, Any], chat_id: in
     elif subname == "recurring":
         return format_recurring_text(chat_title, s), generate_recurring_keyboard(chat_id, is_dm=is_dm)
     elif subname == "members":
-        return format_members_text(chat_title, s), generate_members_keyboard(chat_id, is_dm=is_dm)
+        return format_members_text(chat_title, s, chat_id=chat_id), generate_members_keyboard(chat_id, is_dm=is_dm)
     elif subname == "masked":
         return format_masked_text(chat_title, s), generate_masked_keyboard(chat_id, is_dm=is_dm)
     elif subname == "discussion":
@@ -3626,16 +3836,38 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     if action == "cust":
         if is_dm:
             PENDING_CUSTOM_INPUT[user_id] = (chat_id, subname)
+            nice_name = subname.replace("_", " ").title()
             await query.message.answer(
-                f"✍️ <b>Please send your custom {subname} message now:</b>\n"
-                f"<i>Placeholders like {{mention}}, {{name}}, {{chat_title}} are supported.\nSend /cancel to abort.</i>",
+                f"✍️ <b>Please send your custom {nice_name} message now:</b>\n"
+                f"<i>Placeholders like {{mention}}, {{name}}, {{chat_title}}, {{id}} are supported.\nSend /cancel to abort.</i>",
                 parse_mode=ParseMode.HTML
             )
             await query.answer("Waiting for text...")
         else:
             bot_me = await bot.get_me()
-            dm_link = f"https://t.me/{bot_me.username}?start=group_{abs(chat_id)}"
-            await query.answer("Please open settings in Private DM to customize text!", show_alert=True)
+            dm_link = f"https://t.me/{bot_me.username}?start=custom_{subname}_{abs(chat_id)}"
+            await query.answer(f"To customize message, please open bot PM: @{bot_me.username}", show_alert=True)
+        return
+
+    # 7B. Broadcast Triggers from Members Management
+    if action in ("bcast_chat", "bcast_all"):
+        scope = "chat" if action == "bcast_chat" else "all"
+        if not is_dm:
+            bot_me = await bot.get_me()
+            dm_link = f"https://t.me/{bot_me.username}?start=bcast_{abs(chat_id)}_{scope}"
+            await query.answer("Please switch to Private DM to compose broadcast safely!", show_alert=True)
+            return
+
+        target_count = sum(1 for m in ACCEPTED_MEMBERS_CACHE.values() if chat_id in m.get("chat_ids", [])) if scope == "chat" else len(ACCEPTED_MEMBERS_CACHE)
+        PENDING_CUSTOM_INPUT[user_id] = (chat_id, f"broadcast:{scope}")
+        scope_name = f"Group '{chat_title}'" if scope == "chat" else "All Global"
+        await query.message.answer(
+            f"📢 <b>Broadcast to {scope_name} Accepted Members ({target_count} members)</b>\n\n"
+            f"Please send the message you wish to broadcast now.\n"
+            f"<i>HTML formatting tags (<b>bold</b>, <i>italic</i>, <code>code</code>, <a href='...'>link</a>) are supported.\nSend /cancel to abort.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        await query.answer()
         return
 
     # 8. Rules Permission Toggle
@@ -4367,6 +4599,55 @@ async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
         s = CHAT_SETTINGS[chat_id]
         chat_title = await get_cached_chat_title(bot, chat_id)
 
+        # Broadcast text processing in private DM
+        if subname.startswith("broadcast:"):
+            scope = subname.split(":", 1)[1]
+            if scope == "chat" and chat_id != 0:
+                target_ids = [uid for uid, m in ACCEPTED_MEMBERS_CACHE.items() if chat_id in m.get("chat_ids", [])]
+                scope_label = f"Group '{chat_title}'"
+            else:
+                target_ids = list(ACCEPTED_MEMBERS_CACHE.keys())
+                scope_label = "All Global Managed Groups"
+
+            if not target_ids:
+                await message.answer(
+                    f"⚠️ No accepted members found for {scope_label} to broadcast to.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="👥 Members Management", callback_data=f"set:menu:members:{chat_id}") if chat_id != 0 else InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+                    ])
+                )
+                return
+
+            token = str(uuid.uuid4())[:8]
+            PENDING_BROADCAST[token] = {
+                "admin_id": user_id,
+                "chat_id": chat_id,
+                "scope": scope,
+                "scope_label": scope_label,
+                "target_ids": target_ids,
+                "message_text": custom_text,
+                "created_at": time.time()
+            }
+
+            confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Confirm & Send", callback_data=f"bcast_confirm:{token}"),
+                 InlineKeyboardButton(text="❌ Cancel", callback_data=f"bcast_cancel:{token}")]
+            ])
+
+            await message.answer(
+                f"📢 <b>Broadcast Confirmation Preview</b>\n\n"
+                f"🎯 <b>Target Audience:</b> {scope_label}\n"
+                f"👥 <b>Total Recipients:</b> <code>{len(target_ids)} members</code>\n\n"
+                f"📝 <b>Message Preview:</b>\n"
+                f"────────────────────────\n"
+                f"{custom_text}\n"
+                f"────────────────────────\n\n"
+                f"⚠️ <i>Please confirm to dispatch this broadcast. It will be throttled at 25 msgs/sec.</i>",
+                reply_markup=confirm_kb,
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         if subname in ("rules", "regulation"):
             s["rules_text"] = custom_text
             back_key = "regulation"
@@ -4376,6 +4657,11 @@ async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
             s["welcome_enabled"] = True
             back_key = "welcome"
             label = "Welcome Message"
+        elif subname in ("welcome_pm", "approval_pm"):
+            s["welcome_pm_msg"] = custom_text
+            s["welcome_pm_enabled"] = True
+            back_key = "welcome" if subname == "welcome_pm" else "approval"
+            label = "Request PM Welcome"
         elif subname == "goodbye":
             s["goodbye_msg"] = custom_text
             s["goodbye_enabled"] = True
@@ -4383,7 +4669,7 @@ async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
             label = "Goodbye Message"
         else:
             back_key = "main"
-            label = subname.capitalize()
+            label = subname.replace("_", " ").title()
 
         DatabaseService.save_settings_background(chat_id, chat_title, s)
 
@@ -4439,6 +4725,234 @@ async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
             parse_mode=ParseMode.HTML
         )
         return
+
+
+# ==============================================================================
+# GLOBAL ACCEPTED MEMBERS BROADCAST ENGINE & DISPATCH WORKER
+# ==============================================================================
+
+async def run_background_broadcast(
+    bot: Bot,
+    recipient_ids: list[int],
+    message_text: str,
+    task_id: str,
+    admin_notify_id: Optional[int] = None
+) -> Dict[str, Any]:
+    """
+    Asynchronous throttled broadcaster. Dispatches at 25 msgs/sec
+    to strictly observe Telegram API rate limits without 429 throttling.
+    """
+    sent = 0
+    failed = 0
+    start_time = time.monotonic()
+    print(f"[BROADCAST {task_id}] Starting throttled broadcast to {len(recipient_ids)} recipients...", flush=True)
+
+    for uid in recipient_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=message_text, parse_mode=ParseMode.HTML)
+            sent += 1
+        except TelegramForbiddenError:
+            failed += 1
+            if uid in ACCEPTED_MEMBERS_CACHE:
+                ACCEPTED_MEMBERS_CACHE[uid]["status"] = "blocked"
+        except TelegramAPIError as e:
+            failed += 1
+            if "retry after" in str(e).lower():
+                await asyncio.sleep(2.0)
+        except Exception:
+            failed += 1
+
+        # 40ms sleep = 25 messages per second rate cap
+        await asyncio.sleep(0.04)
+
+    elapsed = round(time.monotonic() - start_time, 2)
+    print(f"[BROADCAST {task_id}] Completed in {elapsed}s: Sent={sent}, Failed={failed}", flush=True)
+
+    if admin_notify_id:
+        try:
+            await bot.send_message(
+                chat_id=admin_notify_id,
+                text=(
+                    f"✅ <b>Broadcast Completed!</b>\n\n"
+                    f"📬 <b>Sent Successfully:</b> <code>{sent}</code>\n"
+                    f"❌ <b>Failed / Blocked:</b> <code>{failed}</code>\n"
+                    f"⏱ <b>Elapsed Time:</b> <code>{elapsed}s</code>\n"
+                    f"👥 <b>Total Recipient Pool:</b> <code>{len(recipient_ids)}</code>"
+                ),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+    return {"sent": sent, "failed": failed, "elapsed": elapsed}
+
+
+@router.callback_query(F.data.startswith("bcast_"))
+async def handle_broadcast_callback(query: CallbackQuery, bot: Bot) -> None:
+    """Handles confirmation or cancellation of pending broadcast batches."""
+    parts = query.data.split(":", 1)
+    action = parts[0]
+    token = parts[1] if len(parts) > 1 else ""
+    user_id = query.from_user.id
+
+    bcast_data = PENDING_BROADCAST.pop(token, None)
+    if not bcast_data:
+        await query.answer("Broadcast session expired or already handled.", show_alert=True)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        return
+
+    if bcast_data.get("admin_id") != user_id:
+        await query.answer("Only the initiating administrator can confirm this broadcast.", show_alert=True)
+        PENDING_BROADCAST[token] = bcast_data
+        return
+
+    if action == "bcast_cancel":
+        await query.answer("Broadcast cancelled.")
+        try:
+            await query.message.edit_text("❌ <b>Broadcast Cancelled.</b>", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    if action == "bcast_confirm":
+        target_ids = bcast_data["target_ids"]
+        msg_text = bcast_data["message_text"]
+        scope_label = bcast_data["scope_label"]
+        await query.answer("Broadcasting started...")
+        try:
+            await query.message.edit_text(
+                f"🚀 <b>Broadcast in Progress...</b>\n\n"
+                f"🎯 <b>Target:</b> {scope_label}\n"
+                f"👥 <b>Total Recipients:</b> <code>{len(target_ids)}</code>\n"
+                f"⚡ <i>Sending throttled at 25 msgs/sec. You will receive a summary when finished.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+        asyncio.create_task(run_background_broadcast(
+            bot=bot,
+            recipient_ids=target_ids,
+            message_text=msg_text,
+            task_id=token,
+            admin_notify_id=user_id
+        ))
+
+
+@router.message(Command("broadcast", "bcast"))
+async def handle_broadcast_command(message: Message, command: CommandObject, bot: Bot) -> None:
+    """
+    Broadcasts a message directly to all accepted members across groups or within the current group.
+    Strictly guarded by check_can_setup_bot.
+    """
+    user_id = message.from_user.id if message.from_user else 0
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    chat_id = message.chat.id if is_group else 0
+
+    if is_group:
+        sender_chat_id = message.sender_chat.id if message.sender_chat else None
+        if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+            await send_ephemeral(message, "❌ Only the Group Owner, Anonymous Admins, or Exempted Admins can broadcast.")
+            return
+        await wipe_trigger(message)
+
+    msg_body = command.args.strip() if command and command.args else ""
+    if not msg_body:
+        if is_group:
+            bot_me = await bot.get_me()
+            dm_link = f"https://t.me/{bot_me.username}?start=bcast_{abs(chat_id)}_chat"
+            await message.answer(
+                "📢 <b>To start a broadcast, specify the message or use Private DM:</b>\n\n"
+                "• <i>Usage:</i> <code>/broadcast &lt;message&gt;</code>\n"
+                f"• Or compose securely in <a href='{dm_link}'>Private DM</a>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            PENDING_CUSTOM_INPUT[user_id] = (0, "broadcast:all")
+            await message.answer(
+                f"📢 <b>Broadcast to All Accepted Members ({len(ACCEPTED_MEMBERS_CACHE)} members)</b>\n\n"
+                f"Please send the message you wish to broadcast now.\n"
+                f"<i>HTML formatting tags (<b>bold</b>, <i>italic</i>, <code>code</code>, <a href='...'>link</a>) are supported.\nSend /cancel to abort.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    if is_group:
+        target_ids = [uid for uid, m in ACCEPTED_MEMBERS_CACHE.items() if chat_id in m.get("chat_ids", [])]
+        scope_label = f"Group '{message.chat.title}'"
+    else:
+        target_ids = list(ACCEPTED_MEMBERS_CACHE.keys())
+        scope_label = "All Global Managed Groups"
+
+    if not target_ids:
+        await message.answer(f"⚠️ No accepted members found for {scope_label} to broadcast to.")
+        return
+
+    token = str(uuid.uuid4())[:8]
+    PENDING_BROADCAST[token] = {
+        "admin_id": user_id,
+        "chat_id": chat_id,
+        "scope": "chat" if is_group else "all",
+        "scope_label": scope_label,
+        "target_ids": target_ids,
+        "message_text": msg_body,
+        "created_at": time.time()
+    }
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Confirm & Send", callback_data=f"bcast_confirm:{token}"),
+         InlineKeyboardButton(text="❌ Cancel", callback_data=f"bcast_cancel:{token}")]
+    ])
+
+    await message.answer(
+        f"📢 <b>Broadcast Confirmation Preview</b>\n\n"
+        f"🎯 <b>Target Audience:</b> {scope_label}\n"
+        f"👥 <b>Total Recipients:</b> <code>{len(target_ids)} members</code>\n\n"
+        f"📝 <b>Message Preview:</b>\n"
+        f"────────────────────────\n"
+        f"{msg_body}\n"
+        f"────────────────────────\n\n"
+        f"⚠️ <i>Please confirm to dispatch this broadcast. It will be throttled at 25 msgs/sec.</i>",
+        reply_markup=confirm_kb,
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("members", "acceptedmembers"))
+async def handle_members_command(message: Message, bot: Bot) -> None:
+    """Shows statistics on request-accepted members and provides dashboard / broadcast controls."""
+    user_id = message.from_user.id if message.from_user else 0
+    is_group = message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+    chat_id = message.chat.id if is_group else 0
+
+    if is_group:
+        sender_chat_id = message.sender_chat.id if message.sender_chat else None
+        if not await is_user_admin(bot, chat_id, user_id, sender_chat_id):
+            await send_ephemeral(message, "⚠️ Only administrators can view members registry.")
+            return
+        await wipe_trigger(message)
+        chat_accepted = sum(1 for m in ACCEPTED_MEMBERS_CACHE.values() if chat_id in m.get("chat_ids", []))
+    else:
+        chat_accepted = 0
+
+    total_accepted = len(ACCEPTED_MEMBERS_CACHE)
+
+    kb_buttons = []
+    if is_group:
+        kb_buttons.append([InlineKeyboardButton(text="📢 Broadcast Group Members", callback_data=f"set:bcast_chat:{chat_id}")])
+    kb_buttons.append([InlineKeyboardButton(text="🌐 Broadcast All Members", callback_data=f"set:bcast_all:{chat_id}")])
+    kb_buttons.append([InlineKeyboardButton(text="👥 Members Management", callback_data=f"set:menu:members:{chat_id}")])
+
+    text = (
+        f"👥 <b>ACCEPTED MEMBERS REGISTRY</b>\n\n"
+        f"• <b>Accepted in this Chat:</b> <code>{chat_accepted}</code>\n"
+        f"• <b>Global Consolidated Total:</b> <code>{total_accepted}</code>\n\n"
+        f"<i>To filter, select, and message members visually, access the Web Dashboard at <code>/members</code> on the bot web host or use the broadcast controls above.</i>"
+    )
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("help"))
@@ -5120,6 +5634,8 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="addexcept", description="Designate admin to receive reports"),
         BotCommand(command="remexcept", description="Remove admin from report recipients"),
         BotCommand(command="excepted", description="List excepted report admins"),
+        BotCommand(command="broadcast", description="Broadcast to accepted members"),
+        BotCommand(command="members", description="Accepted members registry & controls"),
         BotCommand(command="start", description="Open group settings (Authorized admins only)"),
         BotCommand(command="settings", description="Alias to /start group settings"),
         BotCommand(command="setcommands", description="Force sync admin command catalog"),
@@ -5347,6 +5863,12 @@ async def resource_optimizer_worker() -> None:
                 for k in list(USERNAME_CACHE.keys())[:1000]:
                     USERNAME_CACHE.pop(k, None)
 
+            # 5B. Clean expired PENDING_BROADCAST sessions (>15 min)
+            now_ts = time.time()
+            stale_bcasts = [k for k, v in list(PENDING_BROADCAST.items()) if now_ts - v.get("created_at", 0) > 900]
+            for k in stale_bcasts:
+                PENDING_BROADCAST.pop(k, None)
+
             # 6. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
             if rss_mb > 100.0:
                 # Tier 1 Relief (>100MB): Clear admin cache and compress flood deques
@@ -5365,6 +5887,7 @@ async def resource_optimizer_worker() -> None:
                 USERNAME_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
+                PENDING_BROADCAST.clear()
                 CHAT_TITLES.clear()
 
             if rss_mb > 400.0:
@@ -5375,6 +5898,7 @@ async def resource_optimizer_worker() -> None:
                 USERNAME_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
+                PENDING_BROADCAST.clear()
                 CHAT_TITLES.clear()
                 print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
 
@@ -5396,6 +5920,496 @@ async def resource_optimizer_worker() -> None:
             break
         except Exception:
             pass
+
+
+def render_members_dashboard_html() -> str:
+    """Renders high-speed, modern, standalone HTML/JS dashboard for accepted members & broadcasts."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manager — Accepted Members & Broadcast</title>
+<style>
+  :root {
+    --bg-dark: #0e1621;
+    --card-bg: #17212b;
+    --card-header: #242f3d;
+    --accent: #2b5278;
+    --accent-hover: #3a6d9b;
+    --accent-blue: #5288c1;
+    --text-primary: #f5f5f5;
+    --text-secondary: #7f91a4;
+    --border-color: #242f3d;
+    --success: #4fae4e;
+    --danger: #e53935;
+    --badge-bg: rgba(82, 136, 193, 0.15);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  body { background: var(--bg-dark); color: var(--text-primary); padding: 20px; min-height: 100vh; }
+  .container { max-width: 1280px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 20px; gap: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-icon { font-size: 30px; }
+  .brand-title { font-size: 20px; font-weight: 700; color: #fff; }
+  .brand-sub { font-size: 12px; color: var(--text-secondary); }
+  .stats-badges { display: flex; gap: 10px; flex-wrap: wrap; }
+  .stat-badge { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 8px 14px; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .stat-val { font-weight: 700; color: var(--accent-blue); }
+  .grid { display: grid; grid-template-columns: 380px 1fr; gap: 20px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
+  .card-header { background: var(--card-header); padding: 12px 18px; font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+  .card-body { padding: 16px; flex: 1; display: flex; flex-direction: column; }
+  .form-group { margin-bottom: 14px; }
+  label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  textarea, input[type="text"], select { width: 100%; background: #0e1621; border: 1px solid var(--border-color); border-radius: 8px; padding: 10px 12px; color: #fff; font-size: 13px; outline: none; transition: border-color .2s; }
+  textarea:focus, input[type="text"]:focus, select:focus { border-color: var(--accent-blue); }
+  textarea { resize: vertical; min-height: 130px; line-height: 1.4; font-family: monospace; }
+  .tag-btns { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tag-btn { background: #242f3d; border: 1px solid #3a4756; color: #7f91a4; font-size: 11px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+  .tag-btn:hover { color: #fff; border-color: var(--accent-blue); }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; font-weight: 600; padding: 10px 18px; border-radius: 8px; border: none; cursor: pointer; transition: background .2s, opacity .2s; }
+  .btn-primary { background: var(--accent); color: #fff; width: 100%; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary { background: #242f3d; color: var(--text-primary); padding: 6px 12px; font-size: 12px; }
+  .btn-secondary:hover { background: #313f52; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+  .search-wrap { display: flex; gap: 8px; flex: 1; min-width: 260px; }
+  .actions-wrap { display: flex; gap: 8px; align-items: center; }
+  .table-container { max-height: 580px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: #0e1621; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }
+  th { background: #1c2734; padding: 10px 12px; position: sticky; top: 0; z-index: 2; border-bottom: 1px solid var(--border-color); font-weight: 600; color: var(--text-secondary); font-size: 12px; }
+  td { padding: 10px 12px; border-bottom: 1px solid var(--border-color); vertical-align: middle; }
+  tr:hover td { background: rgba(82, 136, 193, 0.05); }
+  .avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11px; color: #fff; margin-right: 8px; flex-shrink: 0; }
+  .user-cell { display: flex; align-items: center; }
+  .user-name { font-weight: 600; color: #fff; }
+  .user-id { font-size: 11px; color: var(--text-secondary); font-family: monospace; }
+  .group-pill { display: inline-block; background: var(--badge-bg); color: var(--accent-blue); padding: 2px 6px; border-radius: 4px; font-size: 11px; margin: 1px 2px; }
+  .progress-box { display: none; margin-top: 14px; background: #0e1621; border-radius: 8px; padding: 12px; }
+  .progress-bar-bg { width: 100%; height: 8px; background: #242f3d; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .progress-bar-fill { width: 0%; height: 100%; background: var(--accent-blue); transition: width .3s; }
+  .status-text { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; }
+  .empty-msg { text-align: center; padding: 40px; color: var(--text-secondary); }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #1c2734; border: 1px solid var(--accent-blue); color: #fff; padding: 12px 18px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); z-index: 100; font-size: 13px; display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="brand">
+      <div class="brand-icon">🛡️</div>
+      <div>
+        <div class="brand-title">Manager Bot Console</div>
+        <div class="brand-sub">Global Unified Accepted Members Registry & Broadcast</div>
+      </div>
+    </div>
+    <div class="stats-badges">
+      <div class="stat-badge">👥 Total Members: <span id="stat-total" class="stat-val">0</span></div>
+      <div class="stat-badge">🏷️ Groups: <span id="stat-groups" class="stat-val">0</span></div>
+      <div class="stat-badge">⚡ Status: <span class="stat-val" style="color:var(--success)">ONLINE</span></div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- BROADCAST COMPOSER -->
+    <div class="card">
+      <div class="card-header">
+        <span>📢 Compose Broadcast Message</span>
+        <span id="selected-badge" style="font-size:12px;color:var(--accent-blue)">0 Selected</span>
+      </div>
+      <div class="card-body">
+        <div class="form-group">
+          <label>Target Audience</label>
+          <select id="target-mode" onchange="updateTargetMode()">
+            <option value="selected">Selected Members (<span id="opt-sel-count">0</span>)</option>
+            <option value="filtered">All Filtered Members</option>
+            <option value="all">All Global Members</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Message Content (HTML Supported)</label>
+          <div class="tag-btns">
+            <button class="tag-btn" onclick="insertTag('b')">&lt;b&gt;Bold&lt;/b&gt;</button>
+            <button class="tag-btn" onclick="insertTag('i')">&lt;i&gt;Italic&lt;/i&gt;</button>
+            <button class="tag-btn" onclick="insertTag('code')">&lt;code&gt;Code&lt;/code&gt;</button>
+            <button class="tag-btn" onclick="insertLink()">&lt;a&gt;Link&lt;/a&gt;</button>
+          </div>
+          <textarea id="broadcast-msg" placeholder="Type your broadcast announcement here...&#10;&#10;Supports {name}, {chat_title}, HTML tags like &lt;b&gt;bold&lt;/b&gt;, &lt;a href='...'&gt;links&lt;/a&gt;."></textarea>
+        </div>
+
+        <button id="send-btn" class="btn btn-primary" onclick="submitBroadcast()">
+          🚀 Send Broadcast
+        </button>
+
+        <div id="progress-box" class="progress-box">
+          <div class="status-text">
+            <span id="progress-status">Dispatching messages...</span>
+            <span id="progress-percent">0%</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div id="progress-bar-fill" class="progress-bar-fill"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MEMBERS REGISTRY & SELECTOR -->
+    <div class="card">
+      <div class="card-header">
+        <span>👥 Request-Accepted Members Registry</span>
+        <button class="btn btn-secondary" onclick="fetchMembers()">🔄 Refresh</button>
+      </div>
+      <div class="card-body">
+        <div class="toolbar">
+          <div class="search-wrap">
+            <input type="text" id="search-input" placeholder="🔍 Search by name, @username, or User ID..." oninput="filterTable()">
+            <select id="group-filter" style="max-width:180px;" onchange="filterTable()">
+              <option value="">All Groups</option>
+            </select>
+          </div>
+          <div class="actions-wrap">
+            <button class="btn btn-secondary" onclick="selectAllFiltered(true)">Select All</button>
+            <button class="btn btn-secondary" onclick="selectAllFiltered(false)">Clear</button>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:36px;"><input type="checkbox" id="master-checkbox" onchange="toggleMasterCheckbox(this)"></th>
+                <th>Member</th>
+                <th>Username</th>
+                <th>Groups</th>
+                <th>Last Accepted</th>
+                <th>Approvals</th>
+              </tr>
+            </thead>
+            <tbody id="members-table-body">
+              <tr><td colspan="6" class="empty-msg">Loading accepted members registry...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+let allMembers = [];
+let filteredMembers = [];
+let selectedUserIds = new Set();
+
+async function fetchMembers() {
+  try {
+    const res = await fetch('/api/members');
+    const data = await res.json();
+    allMembers = data.members || [];
+    document.getElementById('stat-total').textContent = allMembers.length;
+
+    // Populate group filter
+    const groupsSet = new Set();
+    allMembers.forEach(m => (m.chat_titles || []).forEach(t => groupsSet.add(t)));
+    document.getElementById('stat-groups').textContent = groupsSet.size;
+
+    const groupFilter = document.getElementById('group-filter');
+    const curVal = groupFilter.value;
+    groupFilter.innerHTML = '<option value="">All Groups</option>';
+    groupsSet.forEach(g => {
+      const opt = document.createElement('option');
+      opt.value = g;
+      opt.textContent = g;
+      groupFilter.appendChild(opt);
+    });
+    groupFilter.value = curVal;
+
+    filterTable();
+  } catch (e) {
+    showToast('Failed to load members: ' + e.message, true);
+  }
+}
+
+function filterTable() {
+  const query = document.getElementById('search-input').value.trim().toLowerCase();
+  const group = document.getElementById('group-filter').value;
+
+  filteredMembers = allMembers.filter(m => {
+    const matchQuery = !query ||
+      (m.full_name && m.full_name.toLowerCase().includes(query)) ||
+      (m.username && m.username.toLowerCase().includes(query)) ||
+      String(m.user_id).includes(query);
+
+    const matchGroup = !group || (m.chat_titles && m.chat_titles.includes(group));
+    return matchQuery && matchGroup;
+  });
+
+  renderTable();
+  updateTargetMode();
+}
+
+function renderTable() {
+  const tbody = document.getElementById('members-table-body');
+  if (!filteredMembers.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-msg">No accepted members found.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filteredMembers.map(m => {
+    const isChecked = selectedUserIds.has(m.user_id);
+    const initials = (m.first_name ? m.first_name.charAt(0) : 'U').toUpperCase();
+    const uname = m.username ? ('@' + m.username) : '<span style="color:var(--text-secondary)">-</span>';
+    const groups = (m.chat_titles || []).map(g => `<span class="group-pill">${escapeHtml(g)}</span>`).join('') || '<span style="color:var(--text-secondary)">None</span>';
+    const dateStr = m.last_accepted_at ? new Date(m.last_accepted_at).toLocaleString() : '-';
+
+    return `<tr>
+      <td><input type="checkbox" data-uid="${m.user_id}" ${isChecked ? 'checked' : ''} onchange="toggleSelectUser(${m.user_id}, this.checked)"></td>
+      <td>
+        <div class="user-cell">
+          <div class="avatar">${initials}</div>
+          <div>
+            <div class="user-name">${escapeHtml(m.full_name || 'User ' + m.user_id)}</div>
+            <div class="user-id">${m.user_id}</div>
+          </div>
+        </div>
+      </td>
+      <td>${uname}</td>
+      <td>${groups}</td>
+      <td style="color:var(--text-secondary);font-size:12px;">${dateStr}</td>
+      <td style="font-weight:600;color:var(--accent-blue);">${m.accept_count || 1}</td>
+    </tr>`;
+  }).join('');
+}
+
+function toggleSelectUser(userId, checked) {
+  if (checked) {
+    selectedUserIds.add(userId);
+  } else {
+    selectedUserIds.delete(userId);
+  }
+  updateSelectedBadge();
+}
+
+function selectAllFiltered(state) {
+  filteredMembers.forEach(m => {
+    if (state) selectedUserIds.add(m.user_id);
+    else selectedUserIds.delete(m.user_id);
+  });
+  document.getElementById('master-checkbox').checked = state;
+  renderTable();
+  updateSelectedBadge();
+}
+
+function toggleMasterCheckbox(masterEl) {
+  selectAllFiltered(masterEl.checked);
+}
+
+function updateSelectedBadge() {
+  const count = selectedUserIds.size;
+  document.getElementById('selected-badge').textContent = `${count} Selected`;
+  updateTargetMode();
+}
+
+function updateTargetMode() {
+  const mode = document.getElementById('target-mode').value;
+  const btn = document.getElementById('send-btn');
+  const count = selectedUserIds.size;
+  if (mode === 'selected') {
+    btn.textContent = `🚀 Send Broadcast to Selected (${count})`;
+  } else if (mode === 'filtered') {
+    btn.textContent = `🚀 Send Broadcast to Filtered (${filteredMembers.length})`;
+  } else {
+    btn.textContent = `🚀 Send Broadcast to All (${allMembers.length})`;
+  }
+}
+
+function insertTag(tag) {
+  const ta = document.getElementById('broadcast-msg');
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const sel = ta.value.substring(start, end);
+  const rep = `<${tag}>${sel || 'text'}</${tag}>`;
+  ta.value = ta.value.substring(0, start) + rep + ta.value.substring(end);
+  ta.focus();
+}
+
+function insertLink() {
+  const url = prompt('Enter link URL (e.g. https://t.me/...):');
+  if (!url) return;
+  const ta = document.getElementById('broadcast-msg');
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const sel = ta.value.substring(start, end) || 'Click Here';
+  const rep = `<a href="${url}">${sel}</a>`;
+  ta.value = ta.value.substring(0, start) + rep + ta.value.substring(end);
+  ta.focus();
+}
+
+async function submitBroadcast() {
+  const msg = document.getElementById('broadcast-msg').value.trim();
+  if (!msg) {
+    alert('Please enter a broadcast message content.');
+    return;
+  }
+
+  const mode = document.getElementById('target-mode').value;
+  let targetUids = [];
+  let sendAll = false;
+
+  if (mode === 'selected') {
+    targetUids = Array.from(selectedUserIds);
+    if (!targetUids.length) {
+      alert('Please select at least one member to message.');
+      return;
+    }
+  } else if (mode === 'filtered') {
+    targetUids = filteredMembers.map(m => m.user_id);
+    if (!targetUids.length) {
+      alert('No members in current filter.');
+      return;
+    }
+  } else {
+    sendAll = true;
+  }
+
+  const recipientCount = sendAll ? allMembers.length : targetUids.length;
+  if (!confirm(`Confirm dispatching broadcast to ${recipientCount} accepted member(s)?`)) {
+    return;
+  }
+
+  const pBox = document.getElementById('progress-box');
+  const pStatus = document.getElementById('progress-status');
+  const pFill = document.getElementById('progress-bar-fill');
+  const btn = document.getElementById('send-btn');
+
+  btn.disabled = true;
+  pBox.style.display = 'block';
+  pStatus.textContent = 'Scheduling throttled broadcast...';
+  pFill.style.width = '25%';
+
+  try {
+    const res = await fetch('/api/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        all: sendAll,
+        user_ids: targetUids,
+        message: msg
+      })
+    });
+    const resp = await res.json();
+    if (resp.status === 'ok') {
+      pFill.style.width = '100%';
+      pStatus.textContent = `Broadcast running in background for ${resp.recipient_count} members!`;
+      showToast(`Broadcast queued successfully! (${resp.recipient_count} recipients)`);
+      setTimeout(() => {
+        pBox.style.display = 'none';
+        btn.disabled = false;
+      }, 4000);
+    } else {
+      throw new Error(resp.message || 'Broadcast failed.');
+    }
+  } catch (err) {
+    pBox.style.display = 'none';
+    btn.disabled = false;
+    alert('Broadcast Error: ' + err.message);
+  }
+}
+
+function showToast(msg, isError = false) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.borderColor = isError ? 'var(--danger)' : 'var(--accent-blue)';
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 3500);
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+window.addEventListener('DOMContentLoaded', fetchMembers);
+</script>
+</body>
+</html>
+"""
+
+
+async def members_dashboard_handler(request: web.Request) -> web.Response:
+    """Serves the fast, responsive web frontend dashboard."""
+    html_content = render_members_dashboard_html()
+    resp = web.Response(text=html_content, content_type="text/html")
+    if resp.body is not None:
+        BANDWIDTH_MONITOR.add_outbound_bytes(len(resp.body) + 150)
+    return resp
+
+
+async def api_get_members_handler(request: web.Request) -> web.Response:
+    """REST JSON endpoint returning list of all globally accepted members."""
+    chat_id_param = request.query.get("chat_id")
+    members_list = list(ACCEPTED_MEMBERS_CACHE.values())
+    if chat_id_param:
+        try:
+            cid = int(chat_id_param)
+            members_list = [m for m in members_list if cid in m.get("chat_ids", [])]
+        except ValueError:
+            pass
+    members_list.sort(key=lambda x: str(x.get("last_accepted_at") or ""), reverse=True)
+    resp = web.json_response({
+        "status": "ok",
+        "total": len(members_list),
+        "members": members_list
+    })
+    if resp.body is not None:
+        BANDWIDTH_MONITOR.add_outbound_bytes(len(resp.body) + 150)
+    return resp
+
+
+async def api_post_broadcast_handler(request: web.Request) -> web.Response:
+    """REST JSON endpoint receiving broadcast dispatch requests from web frontend."""
+    global GLOBAL_BOT
+    if not GLOBAL_BOT:
+        return web.json_response({"status": "error", "message": "Bot is not connected yet."}, status=503)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"status": "error", "message": "Invalid JSON payload."}, status=400)
+
+    user_ids = data.get("user_ids", [])
+    send_all = data.get("all", False)
+    message_text = data.get("message", "").strip()
+
+    if not message_text:
+        return web.json_response({"status": "error", "message": "Broadcast message cannot be empty."}, status=400)
+
+    if send_all or not user_ids:
+        target_ids = list(ACCEPTED_MEMBERS_CACHE.keys())
+    else:
+        target_ids = []
+        for uid in user_ids:
+            try:
+                target_ids.append(int(uid))
+            except (ValueError, TypeError):
+                pass
+
+    if not target_ids:
+        return web.json_response({"status": "error", "message": "No valid recipients selected."}, status=400)
+
+    task_id = str(uuid.uuid4())[:8]
+    asyncio.create_task(run_background_broadcast(GLOBAL_BOT, target_ids, message_text, task_id))
+
+    return web.json_response({
+        "status": "ok",
+        "task_id": task_id,
+        "recipient_count": len(target_ids),
+        "message": f"Broadcast queued successfully for {len(target_ids)} members."
+    })
 
 
 async def start_render_health_server() -> Optional[web.AppRunner]:
@@ -5461,6 +6475,12 @@ async def start_render_health_server() -> Optional[web.AppRunner]:
     app.router.add_get("/health", health_handler)
     app.router.add_get("/", health_handler)
 
+    # Web Dashboard routes for Accepted Members & Broadcast
+    app.router.add_get("/members", members_dashboard_handler)
+    app.router.add_get("/dashboard", members_dashboard_handler)
+    app.router.add_get("/api/members", api_get_members_handler)
+    app.router.add_post("/api/broadcast", api_post_broadcast_handler)
+
     try:
         runner = web.AppRunner(app)
         await runner.setup()
@@ -5516,6 +6536,8 @@ async def main() -> None:
     session = MeteredAiohttpSession(limit=10)
     bot = Bot(token=token.strip(), session=session)
     dp = Dispatcher()
+    global GLOBAL_BOT
+    GLOBAL_BOT = bot
 
     # Dynamic bot identity resolution for health metrics
     try:
@@ -5551,6 +6573,7 @@ async def main() -> None:
     if MongoDBManager.is_connected():
         await DatabaseService.hydrate_settings_cache(CHAT_SETTINGS, CHAT_TITLES)
         await DatabaseService.hydrate_warn_cache(WARN_CACHE)
+        await DatabaseService.hydrate_accepted_members_cache(ACCEPTED_MEMBERS_CACHE)
 
     # Register admin-only command catalog with Telegram API
     try:

@@ -134,6 +134,8 @@ class ChatSettingsModel(BaseModel):
     block_bots: bool = Field(default=False, description="Auto-ban bots added to the group chat")
     bot_action: str = Field(default="ban", description="Punishment when unauthorized bot joins: 'ban' or 'kick'")
     approval_auto: bool = Field(default=False, description="Auto-approve chat join requests")
+    welcome_pm_enabled: bool = Field(default=False, description="Send private DM welcome greeting when member request is accepted")
+    welcome_pm_msg: str = Field(default="👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉", description="Custom private DM welcome template")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -181,6 +183,8 @@ class ChatSettingsModel(BaseModel):
             "block_bots": self.block_bots,
             "bot_action": getattr(self, "bot_action", "ban"),
             "approval_auto": getattr(self, "approval_auto", False),
+            "welcome_pm_enabled": getattr(self, "welcome_pm_enabled", False),
+            "welcome_pm_msg": getattr(self, "welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"),
         })
         return data
 
@@ -250,6 +254,8 @@ class ChatSettingsModel(BaseModel):
             block_bots=mem_dict.get("block_bots", False),
             bot_action=mem_dict.get("bot_action", "ban"),
             approval_auto=mem_dict.get("approval_auto", False),
+            welcome_pm_enabled=mem_dict.get("welcome_pm_enabled", False),
+            welcome_pm_msg=mem_dict.get("welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"),
             custom_attributes=custom_attrs,
         )
 
@@ -317,6 +323,30 @@ class ReportRecordModel(BaseModel):
     action_taken: Optional[str] = Field(default=None, description="Action taken: deleted, muted, banned, dismissed")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     resolved_at: Optional[datetime] = Field(default=None)
+
+
+class AcceptedMemberModel(BaseModel):
+    """
+    Global Unified Member Entity.
+    Consolidated storage of all request-accepted members across all managed groups.
+    Enables cross-group member auditing, historical tracking, and targeted broadcasts.
+    Unique Index: user_id
+    Index: chat_ids, last_accepted_at
+    """
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    user_id: int = Field(..., description="Unique 64-bit Telegram user ID")
+    first_name: str = Field(default="", description="Telegram user first name")
+    last_name: Optional[str] = Field(default=None, description="Telegram user last name")
+    username: Optional[str] = Field(default=None, description="Telegram username without @ (lowercase)")
+    full_name: str = Field(default="Member", description="Formatted full name")
+    chat_ids: List[int] = Field(default_factory=list, description="All chat IDs where member's join request was accepted")
+    chat_titles: List[str] = Field(default_factory=list, description="All chat titles where member was accepted")
+    first_accepted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_accepted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    accept_count: int = Field(default=1, description="Number of times accepted across groups")
+    bio: Optional[str] = Field(default=None, description="User bio at time of join request")
+    status: str = Field(default="active", description="Member status: active, unsubscribed, blocked")
 
 
 # ==============================================================================
