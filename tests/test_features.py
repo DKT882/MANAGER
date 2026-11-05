@@ -183,20 +183,62 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         btn_data = [btn.callback_data for row in kb.inline_keyboard for btn in row if btn.callback_data]
         self.assertTrue(any("toggle:antispam_enabled" in d for d in btn_data))
 
-    def test_dm_group_switcher_button(self):
+    def test_dm_group_switcher_button_replaces_language(self):
         self.assertIsInstance(bot.LAST_DM_SETTINGS_MSG, dict)
+        self.assertNotIn("lang", bot.DEFAULT_CHAT_CONFIG)
+
+        # Page 1 checks
         kb_page1_dm = bot.generate_settings_page1_keyboard(-100777, is_dm=True)
         btn_data_p1 = [btn.callback_data for row in kb_page1_dm.inline_keyboard for btn in row if btn.callback_data]
         self.assertIn("dm:switch_group", btn_data_p1)
+        self.assertFalse(any("lang" in d for d in btn_data_p1))
 
+        # Page 2 checks
         kb_page2_dm = bot.generate_settings_page2_keyboard(-100777, is_dm=True)
         btn_data_p2 = [btn.callback_data for row in kb_page2_dm.inline_keyboard for btn in row if btn.callback_data]
         self.assertIn("dm:switch_group", btn_data_p2)
+        self.assertFalse(any("lang" in d for d in btn_data_p2))
 
-        # In group chat, switch_group should NOT appear
+        # In group chat, switch_group is also in the exact language position
         kb_page1_gc = bot.generate_settings_page1_keyboard(-100777, is_dm=False)
         btn_data_gc = [btn.callback_data for row in kb_page1_gc.inline_keyboard for btn in row if btn.callback_data]
-        self.assertNotIn("dm:switch_group", btn_data_gc)
+        self.assertIn("dm:switch_group", btn_data_gc)
+        self.assertFalse(any("lang" in d for d in btn_data_gc))
+
+    def test_dispatch_private_welcome_dm(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+
+        mock_user = MagicMock()
+        mock_user.id = 5018082627
+        mock_user.full_name = "DKT Secondary"
+        mock_user.first_name = "DKT"
+        mock_user.username = "dkt_test"
+        mock_user.mention_html.return_value = "<a href='tg://user?id=5018082627'>DKT</a>"
+
+        settings = {
+            "welcome_pm_enabled": True,
+            "welcome_pm_msg": "Hello {name}, welcome to {chat_title}!"
+        }
+
+        # Test successful delivery
+        res = asyncio.run(bot.dispatch_private_welcome_dm(
+            mock_bot, -100999, mock_user, "VIP Group", settings
+        ))
+        self.assertTrue(res)
+        mock_bot.send_message.assert_called_once()
+        self.assertEqual(mock_bot.send_message.call_args[1]["chat_id"], 5018082627)
+        self.assertIn("Hello DKT Secondary", mock_bot.send_message.call_args[1]["text"])
+
+        # Test disabled
+        settings["welcome_pm_enabled"] = False
+        res2 = asyncio.run(bot.dispatch_private_welcome_dm(
+            mock_bot, -100999, mock_user, "VIP Group", settings
+        ))
+        self.assertFalse(res2)
 
     def test_json_serial_and_members_api(self):
         import json

@@ -165,8 +165,6 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     # Deleting Messages Cleaners
     "clean_service_messages": True,
     "auto_clean_bot_cmds": False,
-    # Language
-    "lang": "en",
     # Page 2 features
     "strict_topic": False,
     "banned_words_enabled": False,
@@ -971,6 +969,83 @@ async def trigger_admin_alert(bot: Bot, message: Message, user: types.User, reas
                 pass
 
 
+async def dispatch_private_welcome_dm(
+    bot: Bot,
+    chat_id: int,
+    user: types.User,
+    chat_title: str,
+    settings: Dict[str, Any]
+) -> bool:
+    """
+    Dispatches the configured private DM welcome message to the joining user.
+    IMPORTANT: The bot ALWAYS attempts to send the message directly to user.id, regardless
+    of whether the user has previously started or interacted with the bot.
+    Includes multi-stage resilient delivery:
+      1. Tries HTML formatted message.
+      2. If HTML parse error occurs (e.g. invalid tags or unescaped characters in custom text),
+         retries in clean plain text.
+      3. Handles Telegram API errors gracefully.
+    """
+    if not settings.get("welcome_pm_enabled"):
+        return False
+
+    template = settings.get(
+        "welcome_pm_msg",
+        "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"
+    )
+    if not template or not str(template).strip():
+        template = "👋 Hello {name}!\nWelcome to <b>{chat_title}</b>! 🎉"
+
+    user_name = user.full_name or user.first_name or f"User {user.id}"
+    safe_name = html.escape(user_name)
+    safe_title = html.escape(chat_title or "this group")
+    mention_html = user.mention_html()
+
+    formatted_html = template.replace("{mention}", mention_html) \
+                             .replace("{name}", safe_name) \
+                             .replace("{chat_title}", safe_title) \
+                             .replace("{id}", str(user.id))
+
+    # Stage 1: Direct HTML dispatch
+    try:
+        await bot.send_message(
+            chat_id=user.id,
+            text=formatted_html,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        print(f"[WELCOME PM SUCCESS] Sent private DM welcome to user {user.id} ({user_name}) for {chat_title}", flush=True)
+        return True
+    except TelegramForbiddenError as fe:
+        print(f"[WELCOME PM BLOCKED] User {user.id} has not started the bot or blocked it: {fe}", flush=True)
+        return False
+    except TelegramAPIError as api_err:
+        # Stage 2: HTML parse error fallback (deliver as plain text)
+        try:
+            plain_template = re.sub(r'<[^>]+>', '', template)
+            formatted_plain = plain_template.replace("{mention}", f"@{user.username}" if user.username else user_name) \
+                                            .replace("{name}", user_name) \
+                                            .replace("{chat_title}", chat_title) \
+                                            .replace("{id}", str(user.id))
+            await bot.send_message(
+                chat_id=user.id,
+                text=formatted_plain,
+                parse_mode=None,
+                disable_web_page_preview=True
+            )
+            print(f"[WELCOME PM FALLBACK] Sent plain-text DM welcome to user {user.id} ({user_name})", flush=True)
+            return True
+        except TelegramForbiddenError as fe2:
+            print(f"[WELCOME PM BLOCKED] User {user.id} has not started the bot: {fe2}", flush=True)
+            return False
+        except Exception as ex2:
+            print(f"[WELCOME PM ERROR] Plain fallback failed for user {user.id}: {ex2}", flush=True)
+            return False
+    except Exception as e:
+        print(f"[WELCOME PM ERROR] Unexpected error sending DM to user {user.id}: {e}", flush=True)
+        return False
+
+
 @router.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
     F.new_chat_members | F.left_chat_member
@@ -1016,6 +1091,44 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
         for member in message.new_chat_members:
             if member.is_bot:
                 continue
+
+            chat_title = CHAT_TITLES.get(chat_id) or (message.chat.title if message.chat else f"Group {chat_id}")
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            # Record member in unified accepted members registry
+            mem_data = ACCEPTED_MEMBERS_CACHE.get(member.id, {})
+            existing_cids = list(mem_data.get("chat_ids", []))
+            if chat_id not in existing_cids:
+                existing_cids.append(chat_id)
+            existing_titles = list(mem_data.get("chat_titles", []))
+            if chat_title not in existing_titles:
+                existing_titles.append(chat_title)
+
+            ACCEPTED_MEMBERS_CACHE[member.id] = {
+                "user_id": member.id,
+                "first_name": member.first_name or "",
+                "last_name": member.last_name or None,
+                "username": member.username.lower() if member.username else None,
+                "full_name": member.full_name or member.first_name or f"User {member.id}",
+                "chat_ids": existing_cids,
+                "chat_titles": existing_titles,
+                "first_accepted_at": mem_data.get("first_accepted_at", now_iso),
+                "last_accepted_at": now_iso,
+                "accept_count": mem_data.get("accept_count", 0) + 1,
+                "status": "active"
+            }
+            DatabaseService.record_accepted_member_background(
+                user_id=member.id,
+                first_name=member.first_name or "",
+                last_name=member.last_name,
+                username=member.username,
+                full_name=member.full_name or member.first_name or f"User {member.id}",
+                chat_id=chat_id,
+                chat_title=chat_title
+            )
+
+            # Dispatch Private DM welcome (always attempts direct delivery)
+            await dispatch_private_welcome_dm(bot, chat_id, member, chat_title, settings)
 
             # Captcha Verification
             c_mode = settings.get("captcha_mode", "off")
@@ -1153,21 +1266,8 @@ async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
                 bio=getattr(request, "bio", None)
             )
 
-            # 3. Optional Private DM Welcome Message
-            if settings.get("welcome_pm_enabled"):
-                pm_template = settings.get(
-                    "welcome_pm_msg",
-                    "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"
-                )
-                pm_formatted = pm_template.replace("{mention}", user.mention_html()) \
-                                           .replace("{name}", html.escape(user.full_name)) \
-                                           .replace("{chat_title}", html.escape(chat_title)) \
-                                           .replace("{id}", str(user.id))
-                try:
-                    await bot.send_message(chat_id=user.id, text=pm_formatted, parse_mode=ParseMode.HTML)
-                    print(f"[APPROVAL PM] Sent private DM welcome greeting to user {user.id}", flush=True)
-                except Exception as pme:
-                    print(f"[APPROVAL NOTICE] Private DM welcome send error for {user.id}: {pme}", flush=True)
+            # 3. Private DM Welcome Message (always attempts direct delivery)
+            await dispatch_private_welcome_dm(bot, chat_id, user, chat_title, settings)
 
             # 4. Optional In-Chat welcome greeting dispatch
             if settings.get("welcome_enabled"):
@@ -1265,20 +1365,8 @@ async def handle_chat_member_updated(event: types.ChatMemberUpdated, bot: Bot) -
             chat_title=chat_title
         )
 
-        # Send private DM welcome if enabled
-        if settings.get("welcome_pm_enabled"):
-            pm_template = settings.get(
-                "welcome_pm_msg",
-                "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"
-            )
-            pm_formatted = pm_template.replace("{mention}", user.mention_html()) \
-                                       .replace("{name}", html.escape(user.full_name)) \
-                                       .replace("{chat_title}", html.escape(chat_title)) \
-                                       .replace("{id}", str(user.id))
-            try:
-                await bot.send_message(chat_id=user.id, text=pm_formatted, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
+        # Send private DM welcome if enabled (always attempts direct delivery)
+        await dispatch_private_welcome_dm(bot, chat_id, user, chat_title, settings)
 
 
 # ==============================================================================
@@ -2283,17 +2371,13 @@ def generate_settings_page1_keyboard(chat_id: int, is_dm: bool = False) -> Inlin
         [
             InlineKeyboardButton(text="🗑️ Deleting Messages", callback_data=f"{prefix}menu:delmsgs:{chat_id}"),
         ],
-        # Row 12
+        # Row 12 (Language button replaced with Switch Group)
         [
-            InlineKeyboardButton(text="🇬🇧 Lang", callback_data=f"{prefix}menu:lang:{chat_id}"),
+            InlineKeyboardButton(text="🔄 Switch Group", callback_data="dm:switch_group"),
             InlineKeyboardButton(text="✅ Close", callback_data=f"{prefix}close:{chat_id}"),
             InlineKeyboardButton(text="▶️ Other", callback_data=f"{prefix}page:2:{chat_id}"),
         ],
     ]
-    if is_dm:
-        buttons.append([
-            InlineKeyboardButton(text="🔄 Switch Group (Back to GC List)", callback_data="dm:switch_group")
-        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2328,17 +2412,13 @@ def generate_settings_page2_keyboard(chat_id: int, is_dm: bool = False) -> Inlin
             InlineKeyboardButton(text="🖋 Permissions", callback_data=f"{prefix}menu:permissions:{chat_id}"),
             InlineKeyboardButton(text="🔍 Log Channel", callback_data=f"{prefix}menu:logchannel:{chat_id}"),
         ],
-        # Row 12
+        # Row 12 (Language button replaced with Switch Group)
         [
             InlineKeyboardButton(text="◀️ Back", callback_data=f"{prefix}page:1:{chat_id}"),
             InlineKeyboardButton(text="✅ Close", callback_data=f"{prefix}close:{chat_id}"),
-            InlineKeyboardButton(text="🇬🇧 Lang", callback_data=f"{prefix}menu:lang:{chat_id}"),
+            InlineKeyboardButton(text="🔄 Switch Group", callback_data="dm:switch_group"),
         ],
     ]
-    if is_dm:
-        buttons.append([
-            InlineKeyboardButton(text="🔄 Switch Group (Back to GC List)", callback_data="dm:switch_group")
-        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2758,31 +2838,6 @@ def generate_delmsgs_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboa
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🧹 Service Messages: {srv}", callback_data=f"{prefix}toggle:clean_service_messages:{chat_id}:delmsgs")],
         [InlineKeyboardButton(text=f"⏱ Auto-delete Cmds: {cmd}", callback_data=f"{prefix}toggle:auto_clean_bot_cmds:{chat_id}:delmsgs")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
-    ])
-
-
-def format_lang_text(chat_title: str, s: Dict[str, Any]) -> str:
-    lang = s.get("lang", "en").upper()
-    return (
-        "<b>Manager</b>\n"
-        "🇬🇧 <b>Language Selection</b>\n"
-        "Select the language used for bot interfaces and alerts.\n\n"
-        f"<b>Current Language:</b> <code>{lang}</code>"
-    )
-
-
-def generate_lang_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
-    prefix = "dm:" if is_dm else "set:"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇬🇧 English", callback_data=f"{prefix}setlang:en:{chat_id}"),
-            InlineKeyboardButton(text="🇪🇸 Español", callback_data=f"{prefix}setlang:es:{chat_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="🇮🇳 Hindi", callback_data=f"{prefix}setlang:hi:{chat_id}"),
-            InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"{prefix}setlang:ru:{chat_id}"),
-        ],
         [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:1:{chat_id}")],
     ])
 
@@ -3474,6 +3529,16 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 target_cid = int(arg)
             except ValueError:
                 pass
+        elif arg == "switch_group":
+            fake_query = types.CallbackQuery(
+                id="direct_switch",
+                from_user=message.from_user,
+                chat_instance="",
+                message=message,
+                data="dm:switch_group"
+            )
+            await handle_dm_manage_settings(fake_query, bot)
+            return
         elif arg.startswith("custom_warn_"):
             try:
                 raw_id = arg.replace("custom_warn_", "")
@@ -3645,8 +3710,15 @@ async def handle_dm_main_menu(query: CallbackQuery, bot: Bot) -> None:
 async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
     """Displays authorized groups for configuration from private DM and allows switching between groups."""
     user_id = query.from_user.id
-    LAST_DM_SETTINGS_MSG[user_id] = query.message.message_id
     bot_user = await bot.get_me()
+
+    # If triggered from inside a group chat, open deep-link to PM group switcher
+    if query.message and query.message.chat.type != ChatType.PRIVATE:
+        bot_username = bot_user.username or BOT_IDENTITY.get("username", "personal_guardBot")
+        await query.answer(url=f"https://t.me/{bot_username}?start=switch_group")
+        return
+
+    LAST_DM_SETTINGS_MSG[user_id] = query.message.message_id
 
     authorized_chats = []
     known_cids = {cid for cid in CHAT_SETTINGS.keys() if cid < 0}
@@ -3877,8 +3949,6 @@ def render_submenu(subname: str, chat_title: str, s: Dict[str, Any], chat_id: in
         return format_approval_text(chat_title, s), generate_approval_keyboard(chat_id, is_dm=is_dm)
     elif subname == "delmsgs" or subname == "service":
         return format_delmsgs_text(chat_title, s), generate_delmsgs_keyboard(chat_id, is_dm=is_dm)
-    elif subname == "lang":
-        return format_lang_text(chat_title, s), generate_lang_keyboard(chat_id, is_dm=is_dm)
     elif subname == "flood":
         return format_flood_text(chat_title, s), generate_flood_keyboard(chat_id, is_dm=is_dm)
     elif subname == "excepted":
@@ -3954,13 +4024,6 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
             await query.answer()
             return
         subname = parts[4] if len(parts) >= 5 else "main"
-    elif action == "setlang":
-        subname = parts[2]
-        try:
-            chat_id = int(parts[3])
-        except ValueError:
-            await query.answer()
-            return
     else:
         # Legacy action: e.g. set:warn_inc:<chat_id>
         try:
@@ -4119,18 +4182,6 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         except Exception:
             pass
         await query.answer(f"Rules permission: {s['rules_perm']}")
-        return
-
-    # 9. Language Switcher
-    if action == "setlang":
-        s["lang"] = subname
-        DatabaseService.save_settings_background(chat_id, chat_title, s)
-        text, kb = render_submenu("lang", chat_title, s, chat_id, is_dm)
-        try:
-            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-        await query.answer(f"Language set to {subname.upper()}")
         return
 
     # 10. Legacy Warn Actions
@@ -4558,6 +4609,66 @@ async def handle_setwelcome(message: Message, command: CommandObject, bot: Bot) 
     chat_title = await get_cached_chat_title(bot, chat_id)
     DatabaseService.save_settings_background(chat_id, chat_title, s)
     await message.answer("✅ <b>Welcome message updated and enabled!</b>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("welcomepm"))
+async def handle_preview_welcomepm(message: Message, bot: Bot) -> None:
+    """Previews the active private DM welcome greeting."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can preview settings.")
+        return
+
+    await wipe_trigger(message)
+    s = CHAT_SETTINGS[chat_id]
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    st = "🟢 Enabled" if s.get("welcome_pm_enabled") else "⚪ Disabled"
+    template = s.get("welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉")
+    user_obj = message.from_user
+    sample = template.replace("{mention}", user_obj.mention_html()) \
+                     .replace("{name}", html.escape(user_obj.full_name)) \
+                     .replace("{chat_title}", html.escape(chat_title)) \
+                     .replace("{id}", str(user_id))
+
+    await message.answer(
+        f"✉️ <b>Private DM Welcome Status:</b> {st}\n\n"
+        f"<b>Preview:</b>\n{sample}\n\n"
+        f"<i>To change template, use <code>/setwelcomepm &lt;text&gt;</code> or configure in <code>/settings</code>.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@router.message(Command("setwelcomepm"))
+async def handle_setwelcomepm(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Configures and enables the private DM welcome greeting message."""
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_can_setup_bot(bot, chat_id, user_id, sender_chat_id):
+        await send_ephemeral(message, "❌ Only authorized admins can configure settings.")
+        return
+
+    await wipe_trigger(message)
+    if not command or not command.args:
+        await send_ephemeral(
+            message,
+            "⚠️ Usage: <code>/setwelcomepm &lt;welcome text&gt;</code>\n"
+            "Placeholders: <code>{mention}</code>, <code>{name}</code>, <code>{chat_title}</code>, <code>{id}</code>"
+        )
+        return
+
+    s = CHAT_SETTINGS[chat_id]
+    s["welcome_pm_msg"] = command.args.strip()
+    s["welcome_pm_enabled"] = True
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    DatabaseService.save_settings_background(chat_id, chat_title, s)
+    await message.answer("✅ <b>Private DM welcome message updated and enabled!</b>", parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("goodbye"))
@@ -5885,6 +5996,8 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="setrules", description="Configure regulations"),
         BotCommand(command="welcome", description="Preview welcome greeting"),
         BotCommand(command="setwelcome", description="Configure welcome message"),
+        BotCommand(command="welcomepm", description="Preview private DM welcome greeting"),
+        BotCommand(command="setwelcomepm", description="Configure private DM welcome message"),
         BotCommand(command="goodbye", description="Preview goodbye message"),
         BotCommand(command="setgoodbye", description="Configure goodbye message"),
         BotCommand(command="words", description="List prohibited words"),
