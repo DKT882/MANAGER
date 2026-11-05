@@ -327,11 +327,34 @@ async def check_admin_rights(
     if user_id in (1087968824, 777000):  # GroupAnonymousBot / Telegram Service
         return True
 
-    # 1B. Check if user is an Exempted Admin for this chat
-    if chat_id in CHAT_SETTINGS:
-        raw_excepted = CHAT_SETTINGS[chat_id].get("excepted_admins", [])
-        if user_id in raw_excepted or str(user_id) in raw_excepted:
-            return True
+    # 1B. Check if user is an Exempted Admin for this chat (0ms RAM check + DB fallback)
+    try:
+        user_id_int = int(user_id)
+        if chat_id in CHAT_SETTINGS:
+            raw_excepted = CHAT_SETTINGS[chat_id].get("excepted_admins", [])
+            excepted_ids_int = {int(x) for x in raw_excepted if str(x).lstrip('-').isdigit()}
+            if user_id_int in excepted_ids_int:
+                return True
+        # Fallback to MongoDB if not yet hydrated in memory
+        if MongoDBManager.is_connected():
+            db = MongoDBManager.get_database()
+            if db is not None:
+                doc = await db.chat_settings.find_one(
+                    {"chat_id": chat_id},
+                    {"reporting.excepted_admin_ids": 1, "custom_attributes.excepted_admins": 1, "_id": 0}
+                )
+                if doc:
+                    db_excepted = doc.get("reporting", {}).get("excepted_admin_ids", [])
+                    if not db_excepted:
+                        db_excepted = doc.get("custom_attributes", {}).get("excepted_admins", [])
+                    db_excepted_ints = {int(x) for x in db_excepted if str(x).lstrip('-').isdigit()}
+                    if user_id_int in db_excepted_ints:
+                        cur_set = set(CHAT_SETTINGS[chat_id].get("excepted_admins", []))
+                        cur_set.update(db_excepted_ints)
+                        CHAT_SETTINGS[chat_id]["excepted_admins"] = list(cur_set)
+                        return True
+    except Exception:
+        pass
 
     if not user_id:
         return False
@@ -1325,8 +1348,14 @@ async def handle_mute(message: Message, command: CommandObject, bot: Bot) -> Non
             pass
 
     parts = remaining_args.split(maxsplit=1) if remaining_args else []
-    duration_str = parts[0] if parts else None
-    reason = parts[1] if len(parts) > 1 else "No reason specified"
+    duration_str = None
+    reason = "Rule violation"
+    if parts:
+        if RE_DURATION.match(parts[0].strip().lower()):
+            duration_str = parts[0].strip().lower()
+            reason = parts[1].strip() if len(parts) > 1 else "Rule violation"
+        else:
+            reason = remaining_args.strip()
 
     seconds, duration_label = parse_time_duration(duration_str)
     until_ts = int(time.time() + seconds) if seconds > 0 else 0
@@ -1532,8 +1561,15 @@ async def handle_ban_matrix(message: Message, command: CommandObject, bot: Bot) 
     duration_label = "indefinitely"
     if cmd == "tban":
         parts = remaining_args.split(maxsplit=1) if remaining_args else []
-        duration_str = parts[0] if parts else "1h"
-        remaining_args = parts[1] if len(parts) > 1 else "Temporary ban"
+        duration_str = "1h"
+        if parts:
+            if RE_DURATION.match(parts[0].strip().lower()):
+                duration_str = parts[0].strip().lower()
+                remaining_args = parts[1] if len(parts) > 1 else "Temporary ban"
+            else:
+                remaining_args = remaining_args.strip()
+        else:
+            remaining_args = "Temporary ban"
         seconds, duration_label = parse_time_duration(duration_str)
         if seconds > 0:
             until_ts = int(time.time() + seconds)
@@ -4896,7 +4932,7 @@ async def handle_pm_report_action_callback(query: CallbackQuery, bot: Bot) -> No
 # ------------------------------------------------------------------------------
 # 9. Excepted Admin Management (/addexcept, /remexcept, /excepted)
 # ------------------------------------------------------------------------------
-@router.message(Command("addexcept", "exceptadmin"))
+@router.message(Command("addexcept", "exceptadmin", "exemptadmin", "addexempt", "exempt", "except"))
 async def handle_add_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
     """Designates an admin as an Excepted Admin to receive report notifications and access settings."""
     await wipe_trigger(message)
@@ -4917,9 +4953,10 @@ async def handle_add_except_admin(message: Message, command: CommandObject, bot:
         try:
             notice = await message.answer(
                 "⚠️ <b>How to add an Exempted Admin:</b>\n"
-                "• <b>Reply:</b> Reply to the admin's message with <code>/addexcept</code>\n"
-                "• <b>Username:</b> <code>/addexcept @admin_username</code>\n"
-                "• <b>User ID:</b> <code>/addexcept 123456789</code>",
+                "• <b>Reply:</b> Reply to the admin's message with <code>/exemptadmin</code>\n"
+                "• <b>Username:</b> <code>/exemptadmin @admin_username</code>\n"
+                "• <b>User ID:</b> <code>/exemptadmin 123456789</code>\n\n"
+                "<i>Exempted Admins have full rights to execute all commands and manage all group settings.</i>",
                 parse_mode=ParseMode.HTML
             )
             await asyncio.sleep(8)
@@ -4944,7 +4981,7 @@ async def handle_add_except_admin(message: Message, command: CommandObject, bot:
     try:
         notice = await message.answer(
             f"✅ Admin <code>{target_id}</code>{name_label} is now an <b>Exempted Admin</b>!\n"
-            f"<i>They can now access and manage group settings in Private DM via @{bot_name}.</i>",
+            f"<i>They now have full permissions to use all commands and configure all group settings via @{bot_name}.</i>",
             parse_mode=ParseMode.HTML
         )
         await asyncio.sleep(8)
@@ -4953,7 +4990,7 @@ async def handle_add_except_admin(message: Message, command: CommandObject, bot:
         pass
 
 
-@router.message(Command("remexcept", "unexceptadmin"))
+@router.message(Command("remexcept", "unexceptadmin", "unexemptadmin", "remexempt", "delexempt", "delexcept"))
 async def handle_rem_except_admin(message: Message, command: CommandObject, bot: Bot) -> None:
     """Removes an admin from the Excepted Admins list."""
     await wipe_trigger(message)
@@ -4994,7 +5031,7 @@ async def handle_rem_except_admin(message: Message, command: CommandObject, bot:
         pass
 
 
-@router.message(Command("excepted"))
+@router.message(Command("excepted", "exempted", "exemptadmins", "exceptadmins", "exemptlist"))
 async def handle_list_excepted_admins(message: Message, bot: Bot) -> None:
     """Lists all Excepted Admins in the chat."""
     await wipe_trigger(message)
@@ -5077,6 +5114,9 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="setlog", description="Set audit log channel"),
         BotCommand(command="report", description="(Reply only) Report message publicly"),
         BotCommand(command="show", description="(Reply only) Report message to admins in PM"),
+        BotCommand(command="exemptadmin", description="Add an exempted admin for setup & commands"),
+        BotCommand(command="unexemptadmin", description="Remove an exempted admin"),
+        BotCommand(command="exempted", description="List all exempted admins"),
         BotCommand(command="addexcept", description="Designate admin to receive reports"),
         BotCommand(command="remexcept", description="Remove admin from report recipients"),
         BotCommand(command="excepted", description="List excepted report admins"),
