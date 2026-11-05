@@ -6,7 +6,7 @@ Bridges RAM in-memory caches with persistent MongoDB storage without introducing
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Any, Dict, Optional
 from .connection import MongoDBManager, get_db
 from .models import (
@@ -453,6 +453,10 @@ class DatabaseService:
             async for doc in cursor:
                 uid = doc.get("user_id")
                 if uid:
+                    if isinstance(doc.get("last_accepted_at"), (datetime, date)):
+                        doc["last_accepted_at"] = doc["last_accepted_at"].isoformat()
+                    if isinstance(doc.get("first_accepted_at"), (datetime, date)):
+                        doc["first_accepted_at"] = doc["first_accepted_at"].isoformat()
                     cache_dict[uid] = doc
                     count += 1
             print(f"[DATABASE] Hydrated {count} globally accepted members into memory cache.")
@@ -473,7 +477,13 @@ class DatabaseService:
 
         try:
             cursor = db.accepted_members.find(query, {"_id": 0}).sort("last_accepted_at", -1).limit(limit)
-            return await cursor.to_list(length=limit)
+            raw_list = await cursor.to_list(length=limit)
+            for doc in raw_list:
+                if isinstance(doc.get("last_accepted_at"), (datetime, date)):
+                    doc["last_accepted_at"] = doc["last_accepted_at"].isoformat()
+                if isinstance(doc.get("first_accepted_at"), (datetime, date)):
+                    doc["first_accepted_at"] = doc["first_accepted_at"].isoformat()
+            return raw_list
         except Exception as e:
             print(f"[DATABASE ERROR] Failed to fetch accepted members: {e}")
             return []

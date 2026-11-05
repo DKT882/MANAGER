@@ -203,7 +203,14 @@ async function fetchMembers() {
   const statusEl = document.getElementById('stat-status');
   try {
     const res = await fetch(getApiBaseUrl() + '/api/members');
+    if (!res.ok) {
+      const errTxt = await res.text();
+      throw new Error(`Server returned HTTP ${res.status}: ${errTxt.slice(0, 80)}`);
+    }
     const data = await res.json();
+    if (data.status === 'error') {
+      throw new Error(data.message || 'Backend returned error');
+    }
     allMembers = data.members || [];
     document.getElementById('stat-total').textContent = allMembers.length;
     statusEl.textContent = 'ONLINE';

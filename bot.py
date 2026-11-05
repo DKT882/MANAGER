@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import os
 import re
 import sys
@@ -24,7 +25,7 @@ except Exception:
     pass
 os.environ["PYTHONUNBUFFERED"] = "1"
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 # ==============================================================================
@@ -93,6 +94,7 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "block_channel_links": False,
     "link_action": "delete",   # 'delete' or 'warn'
     # Anti-Spam (Image 5)
+    "antispam_enabled": True,  # Master toggle for all anti-spam filters
     "block_telegram_links": False,
     "block_forwarding": False,
     "block_quote": False,
@@ -205,6 +207,33 @@ ADMIN_CACHE_TTL = 60.0  # seconds
 PENDING_CUSTOM_WARN: Dict[int, int] = {}
 # PENDING_CUSTOM_INPUT: admin_user_id -> (chat_id, setting_type) for direct text updates in PM
 PENDING_CUSTOM_INPUT: Dict[int, Tuple[int, str]] = {}
+
+# LAST_DM_SETTINGS_MSG: admin_user_id -> message_id of active settings menu in private DM
+# Used to auto-delete previous settings cards so private chats stay completely clean
+LAST_DM_SETTINGS_MSG: Dict[int, int] = {}
+
+
+async def send_or_replace_dm_settings(bot: Bot, user_id: int, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> types.Message:
+    """
+    Deletes the previous active settings message in private DM (if any) before
+    sending the updated settings card to guarantee a clean, clutter-free private chat.
+    """
+    old_mid = LAST_DM_SETTINGS_MSG.pop(user_id, None)
+    if old_mid:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=old_mid)
+        except Exception:
+            pass
+
+    msg = await bot.send_message(
+        chat_id=user_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+    LAST_DM_SETTINGS_MSG[user_id] = msg.message_id
+    return msg
 
 # CHAT_TITLES: chat_id -> cached group title (eliminates redundant getChat roundtrips)
 CHAT_TITLES: Dict[int, str] = {}
@@ -1316,7 +1345,7 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
             return
 
     # 4. Anti-Spam: Forwarding & Quote checks
-    if not is_admin:
+    if not is_admin and settings.get("antispam_enabled", True):
         if settings.get("block_forwarding") and (message.forward_origin or message.forward_from or message.forward_from_chat):
             METRICS["violations_handled"] += 1
             await wipe_trigger(message)
@@ -1411,14 +1440,15 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
 
     if not is_admin:
         # Anti-spam: Telegram links & Total links
-        if settings.get("block_telegram_links") and is_tg_link:
-            METRICS["violations_handled"] += 1
-            await wipe_trigger(message)
-            return
-        if settings.get("block_total_links") and has_link:
-            METRICS["violations_handled"] += 1
-            await wipe_trigger(message)
-            return
+        if settings.get("antispam_enabled", True):
+            if settings.get("block_telegram_links") and is_tg_link:
+                METRICS["violations_handled"] += 1
+                await wipe_trigger(message)
+                return
+            if settings.get("block_total_links") and has_link:
+                METRICS["violations_handled"] += 1
+                await wipe_trigger(message)
+                return
 
         # Core Link filter
         if has_link or (is_channel_link and settings.get("block_channel_links")):
@@ -2100,6 +2130,58 @@ async def handle_warnflood(message: Message, command: CommandObject, bot: Bot) -
     await send_ephemeral(message, f"🌊 <b>Warn on Flood:</b> {status_str} (Limit: <code>{f_limit} msgs</code> in <code>{f_win}s</code>)")
 
 
+@router.message(Command("antiflood", "flood", "antiglood"))
+async def handle_cmd_antiflood(message: Message, command: CommandObject, bot: Bot) -> None:
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can change anti-flood settings.")
+        return
+
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    arg = (command.args or "").strip().lower()
+
+    if arg in ("on", "enable", "true", "yes", "1"):
+        settings["flood_protection"] = True
+    elif arg in ("off", "disable", "false", "no", "0"):
+        settings["flood_protection"] = False
+    else:
+        settings["flood_protection"] = not settings.get("flood_protection", True)
+
+    chat_title = await get_cached_chat_title(bot, chat_id, fallback="Group")
+    DatabaseService.save_settings_background(chat_id, chat_title, settings)
+    status_str = "🟢 ACTIVE" if settings["flood_protection"] else "⚪ DISABLED"
+    await send_ephemeral(message, f"⚡ <b>Anti-Flood Protection:</b> {status_str}")
+
+
+@router.message(Command("antispam", "spam"))
+async def handle_cmd_antispam(message: Message, command: CommandObject, bot: Bot) -> None:
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can change anti-spam settings.")
+        return
+
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    arg = (command.args or "").strip().lower()
+
+    if arg in ("on", "enable", "true", "yes", "1"):
+        settings["antispam_enabled"] = True
+    elif arg in ("off", "disable", "false", "no", "0"):
+        settings["antispam_enabled"] = False
+    else:
+        settings["antispam_enabled"] = not settings.get("antispam_enabled", True)
+
+    chat_title = await get_cached_chat_title(bot, chat_id, fallback="Group")
+    DatabaseService.save_settings_background(chat_id, chat_title, settings)
+    status_str = "🟢 ACTIVE" if settings.get("antispam_enabled", True) else "⚪ DISABLED"
+    await send_ephemeral(message, f"🛡️ <b>Anti-Spam Engine:</b> {status_str}")
+
+
 # ==============================================================================
 # INTERACTIVE SETTINGS UI (MATCHING BIOLINK RESTRICTOR ARCHITECTURE)
 # ==============================================================================
@@ -2135,19 +2217,25 @@ def format_settings_hub_text(chat_title: str) -> str:
 
 def generate_settings_page1_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
     """
-    Renders exact 2-column Page 1 Settings Menu as shown in reference Image 2.
+    Renders exact 2-column Page 1 Settings Menu as shown in reference Image 2,
+    with real-time protection indicator badges and group switcher for private DM.
     """
     prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    spam_badge = " 🟢" if s.get("antispam_enabled", True) else " ⚪"
+    flood_badge = " 🟢" if s.get("flood_protection", True) else " ⚪"
+    warn_badge = " 🟢" if s.get("auto_warn_enabled", True) else " ⚪"
+
     buttons = [
         # Row 1
         [
             InlineKeyboardButton(text="📜 Regulation", callback_data=f"{prefix}menu:regulation:{chat_id}"),
-            InlineKeyboardButton(text="✉️ Anti-Spam", callback_data=f"{prefix}menu:antispam:{chat_id}"),
+            InlineKeyboardButton(text=f"✉️ Anti-Spam{spam_badge}", callback_data=f"{prefix}menu:antispam:{chat_id}"),
         ],
         # Row 2
         [
             InlineKeyboardButton(text="💬 Welcome", callback_data=f"{prefix}menu:welcome:{chat_id}"),
-            InlineKeyboardButton(text="🗣️ Anti-Flood", callback_data=f"{prefix}menu:flood:{chat_id}"),
+            InlineKeyboardButton(text=f"🗣️ Anti-Flood{flood_badge}", callback_data=f"{prefix}menu:flood:{chat_id}"),
         ],
         # Row 3
         [
@@ -2171,7 +2259,7 @@ def generate_settings_page1_keyboard(chat_id: int, is_dm: bool = False) -> Inlin
         ],
         # Row 7
         [
-            InlineKeyboardButton(text="❗ Warns", callback_data=f"{prefix}menu:warn:{chat_id}"),
+            InlineKeyboardButton(text=f"❗ Warns{warn_badge}", callback_data=f"{prefix}menu:warn:{chat_id}"),
             InlineKeyboardButton(text="🌘 Night", callback_data=f"{prefix}menu:night:{chat_id}"),
         ],
         # Row 8
@@ -2198,6 +2286,10 @@ def generate_settings_page1_keyboard(chat_id: int, is_dm: bool = False) -> Inlin
             InlineKeyboardButton(text="▶️ Other", callback_data=f"{prefix}page:2:{chat_id}"),
         ],
     ]
+    if is_dm:
+        buttons.append([
+            InlineKeyboardButton(text="🔄 Switch Group (Back to GC List)", callback_data="dm:switch_group")
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2239,6 +2331,10 @@ def generate_settings_page2_keyboard(chat_id: int, is_dm: bool = False) -> Inlin
             InlineKeyboardButton(text="🇬🇧 Lang", callback_data=f"{prefix}menu:lang:{chat_id}"),
         ],
     ]
+    if is_dm:
+        buttons.append([
+            InlineKeyboardButton(text="🔄 Switch Group (Back to GC List)", callback_data="dm:switch_group")
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2269,29 +2365,40 @@ def generate_regulation_keyboard(chat_id: int, is_dm: bool = False) -> InlineKey
 
 
 def format_antispam_text(chat_title: str, s: Dict[str, Any]) -> str:
+    master_on = s.get("antispam_enabled", True)
     tg_icon = "🟢 Blocked" if s.get("block_telegram_links") else "⚪ Allowed"
     fwd_icon = "🟢 Blocked" if s.get("block_forwarding") else "⚪ Allowed"
     quote_icon = "🟢 Blocked" if s.get("block_quote") else "⚪ Allowed"
     tot_icon = "🟢 Blocked" if s.get("block_total_links") else "⚪ Allowed"
+    status_str = "<code>🟢 ACTIVE</code>" if master_on else "<i>⚪ DISABLED</i>"
     return (
         "<b>Manager</b>\n"
-        "✉️ <b>Anti-Spam</b>\n"
-        "In this menu you can decide whether to protect your groups from unnecessary links, forwards, and quotes.\n\n"
+        "✉️ <b>Anti-Spam Engine</b>\n"
+        f"Group: <code>{html.escape(chat_title)}</code>\n\n"
+        f"• <b>Master Anti-Spam:</b> {status_str}\n"
         f"• <b>Telegram links:</b> {tg_icon}\n"
         f"• <b>Forwarding:</b> {fwd_icon}\n"
         f"• <b>Quote:</b> {quote_icon}\n"
-        f"• <b>Total links block:</b> {tot_icon}"
+        f"• <b>Total links block:</b> {tot_icon}\n\n"
+        "<i>Toggle master protection or individual spam filters below:</i>"
     )
 
 
 def generate_antispam_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
     prefix = "dm:" if is_dm else "set:"
     s = CHAT_SETTINGS[chat_id]
+    master_on = s.get("antispam_enabled", True)
     tg = "🟢" if s.get("block_telegram_links") else "⚪"
     fwd = "🟢" if s.get("block_forwarding") else "⚪"
     quote = "🟢" if s.get("block_quote") else "⚪"
     tot = "🟢" if s.get("block_total_links") else "⚪"
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"🛡️ Master Anti-Spam: {'🟢 ACTIVE' if master_on else '⚪ DISABLED'}",
+                callback_data=f"{prefix}toggle:antispam_enabled:{chat_id}:antispam"
+            )
+        ],
         [InlineKeyboardButton(text=f"📘 Telegram links {tg}", callback_data=f"{prefix}toggle:block_telegram_links:{chat_id}:antispam")],
         [
             InlineKeyboardButton(text=f"📨 Forwarding {fwd}", callback_data=f"{prefix}toggle:block_forwarding:{chat_id}:antispam"),
@@ -3082,6 +3189,7 @@ def format_warn_custom_text(chat_title: str, s: Dict[str, Any]) -> str:
 
 
 def generate_flood_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
     s = CHAT_SETTINGS[chat_id]
     is_on = s.get("flood_protection", True)
     f_limit = s.get("flood_limit", 5)
@@ -3091,26 +3199,26 @@ def generate_flood_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboard
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text=f"⚡ Protection: {'✅ ACTIVE' if is_on else '❌ DISABLED'}",
-                callback_data=f"set:flood_toggle:{chat_id}"
+                text=f"⚡ Anti-Flood Protection: {'🟢 ACTIVE' if is_on else '⚪ DISABLED'}",
+                callback_data=f"{prefix}flood_toggle:{chat_id}"
             )
         ],
         [
-            InlineKeyboardButton(text="➖ Msg", callback_data=f"set:flood_limit_dec:{chat_id}"),
-            InlineKeyboardButton(text=f"📬 Limit: {f_limit} msgs", callback_data=f"set:flood_limit_cycle:{chat_id}"),
-            InlineKeyboardButton(text="➕ Msg", callback_data=f"set:flood_limit_inc:{chat_id}"),
+            InlineKeyboardButton(text="➖ Msg", callback_data=f"{prefix}flood_limit_dec:{chat_id}"),
+            InlineKeyboardButton(text=f"📬 Limit: {f_limit} msgs", callback_data=f"{prefix}flood_limit_cycle:{chat_id}"),
+            InlineKeyboardButton(text="➕ Msg", callback_data=f"{prefix}flood_limit_inc:{chat_id}"),
         ],
         [
-            InlineKeyboardButton(text="➖ Sec", callback_data=f"set:flood_win_dec:{chat_id}"),
-            InlineKeyboardButton(text=f"⏱️ Window: {f_win}s", callback_data=f"set:flood_win_cycle:{chat_id}"),
-            InlineKeyboardButton(text="➕ Sec", callback_data=f"set:flood_win_inc:{chat_id}"),
+            InlineKeyboardButton(text="➖ Sec", callback_data=f"{prefix}flood_win_dec:{chat_id}"),
+            InlineKeyboardButton(text=f"⏱️ Window: {f_win}s", callback_data=f"{prefix}flood_win_cycle:{chat_id}"),
+            InlineKeyboardButton(text="➕ Sec", callback_data=f"{prefix}flood_win_inc:{chat_id}"),
         ],
         [
-            InlineKeyboardButton(text=f"🔨 Punishment: {f_action}", callback_data=f"set:flood_action:{chat_id}"),
-            InlineKeyboardButton(text=f"⏱️ Mute Duration: {f_dur}", callback_data=f"set:flood_dur:{chat_id}"),
+            InlineKeyboardButton(text=f"🔨 Punishment: {f_action}", callback_data=f"{prefix}flood_action:{chat_id}"),
+            InlineKeyboardButton(text=f"⏱️ Duration: {f_dur}", callback_data=f"{prefix}flood_dur:{chat_id}"),
         ],
         [
-            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"set:menu:main:{chat_id}")
+            InlineKeyboardButton(text="⬅️ Back to Settings", callback_data=f"{prefix}menu:main:{chat_id}")
         ]
     ])
 
@@ -3333,6 +3441,9 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
     user_id = message.from_user.id if message.from_user else 0
     bot_user = await bot.get_me()
 
+    # Automatically wipe user trigger command in private DM to keep chat pristine
+    await wipe_trigger(message)
+
     # 2A. Deep link directly to a specific group's settings (e.g. /start group_-100123)
     if command and command.args:
         arg = command.args.strip()
@@ -3375,7 +3486,7 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 text = format_warn_custom_text(title, CHAT_SETTINGS[target_cid])
                 kb = generate_warn_custom_keyboard(target_cid)
                 try:
-                    await message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+                    await send_or_replace_dm_settings(bot, user_id, text, reply_markup=kb)
                     return
                 except Exception:
                     pass
@@ -3392,12 +3503,13 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 PENDING_CUSTOM_INPUT[user_id] = (target_cid, subname_param)
                 title = await get_cached_chat_title(bot, target_cid)
                 nice_name = subname_param.replace("_", " ").title()
-                await message.answer(
+                await send_or_replace_dm_settings(
+                    bot,
+                    user_id,
                     f"✍️ <b>Configure Custom {nice_name}</b>\n\n"
                     f"<b>Group:</b> <code>{html.escape(title)}</code>\n\n"
                     f"Please send your custom message template now.\n"
-                    f"<i>Placeholders like {{mention}}, {{name}}, {{chat_title}}, {{id}} are supported.\nSend /cancel to abort.</i>",
-                    parse_mode=ParseMode.HTML
+                    f"<i>Placeholders like {{mention}}, {{name}}, {{chat_title}}, {{id}} are supported.\nSend /cancel to abort.</i>"
                 )
                 return
 
@@ -3414,11 +3526,12 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 title = await get_cached_chat_title(bot, target_cid)
                 target_count = sum(1 for m in ACCEPTED_MEMBERS_CACHE.values() if target_cid in m.get("chat_ids", [])) if scope == "chat" else len(ACCEPTED_MEMBERS_CACHE)
                 scope_name = f"Group '{title}'" if scope == "chat" else "All Global"
-                await message.answer(
+                await send_or_replace_dm_settings(
+                    bot,
+                    user_id,
                     f"📢 <b>Broadcast to {scope_name} Accepted Members ({target_count} members)</b>\n\n"
                     f"Please send the message you wish to broadcast now.\n"
-                    f"<i>HTML formatting tags (<b>bold</b>, <i>italic</i>, <code>code</code>, <a href='...'>link</a>) are supported.\nSend /cancel to abort.</i>",
-                    parse_mode=ParseMode.HTML
+                    f"<i>HTML formatting tags (<b>bold</b>, <i>italic</i>, <code>code</code>, <a href='...'>link</a>) are supported.\nSend /cancel to abort.</i>"
                 )
                 return
 
@@ -3427,19 +3540,21 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 title = await get_cached_chat_title(bot, target_cid)
                 text = format_settings_hub_text(title)
                 try:
-                    await message.answer(
+                    await send_or_replace_dm_settings(
+                        bot,
+                        user_id,
                         text,
-                        reply_markup=generate_settings_page1_keyboard(target_cid, is_dm=True),
-                        parse_mode=ParseMode.HTML
+                        reply_markup=generate_settings_page1_keyboard(target_cid, is_dm=True)
                     )
                     return
                 except Exception:
                     pass
             else:
-                await message.answer(
+                await send_or_replace_dm_settings(
+                    bot,
+                    user_id,
                     "❌ <b>Access Denied:</b> You are not authorized to configure settings for this group.\n"
-                    "Only the Group Owner, Anonymous Admins, or Exempted Admins can configure settings.",
-                    parse_mode=ParseMode.HTML
+                    "Only the Group Owner, Anonymous Admins, or Exempted Admins can configure settings."
                 )
                 return
 
@@ -3462,21 +3577,23 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu"),
             ])
             kb = InlineKeyboardMarkup(inline_keyboard=group_buttons)
-            await message.answer(
+            await send_or_replace_dm_settings(
+                bot,
+                user_id,
                 "⚙️ <b>Your Managed Groups:</b>\n\n"
                 "Select a group below to view and configure its settings:",
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML
+                reply_markup=kb
             )
             return
         else:
-            await message.answer(
+            await send_or_replace_dm_settings(
+                bot,
+                user_id,
                 "⚙️ <b>Group Settings Management</b>\n\n"
                 "To manage your group's settings from Private DM:\n"
                 "1️⃣ In your group chat, type <code>/settings</code> and tap <b>👤 Open in Private Chat</b>.\n"
                 "2️⃣ Or send <code>/settings &lt;group_id&gt;</code> here in DM (e.g. <code>/settings -1001234567890</code>).\n\n"
-                "<i>Note: You must be the Group Owner, Anonymous Admin, or an Exempted Admin.</i>",
-                parse_mode=ParseMode.HTML
+                "<i>Note: You must be the Group Owner, Anonymous Admin, or an Exempted Admin.</i>"
             )
             return
 
@@ -3490,10 +3607,11 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
         "📄 <i>Default protection is active automatically across all connected groups.</i>"
     )
     try:
-        await message.answer(
+        await send_or_replace_dm_settings(
+            bot,
+            user_id,
             welcome_text,
-            reply_markup=generate_dm_main_menu(bot_user.username or "personal_guardBot"),
-            parse_mode=ParseMode.HTML
+            reply_markup=generate_dm_main_menu(bot_user.username or "personal_guardBot")
         )
     except Exception:
         pass
@@ -3522,10 +3640,11 @@ async def handle_dm_main_menu(query: CallbackQuery, bot: Bot) -> None:
     await query.answer()
 
 
-@router.callback_query(F.data.in_({"dm:manage_settings", "dm:refresh_groups"}))
+@router.callback_query(F.data.in_({"dm:manage_settings", "dm:refresh_groups", "dm:switch_group"}))
 async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
-    """Displays authorized groups for configuration from private DM."""
+    """Displays authorized groups for configuration from private DM and allows switching between groups."""
     user_id = query.from_user.id
+    LAST_DM_SETTINGS_MSG[user_id] = query.message.message_id
     bot_user = await bot.get_me()
 
     authorized_chats = []
@@ -3565,8 +3684,8 @@ async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
             InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu"),
         ])
         text = (
-            "⚙️ <b>Manage Group Settings</b>\n"
-            "👉 <i>Select the group whose settings you want to change:</i>\n\n"
+            "⚙️ <b>Your Managed Groups:</b>\n\n"
+            "👉 <i>Select the group chat you want to configure:</i>\n\n"
             "<i>Note: Only groups where you are the Owner, Anonymous Admin, or Excepted Admin appear here.</i>"
         )
         try:
@@ -3609,6 +3728,23 @@ async def handle_dm_manage_settings(query: CallbackQuery, bot: Bot) -> None:
 async def handle_dm_select_group(query: CallbackQuery, bot: Bot) -> None:
     chat_id = int(query.data.split(":")[1])
     user_id = query.from_user.id
+    LAST_DM_SETTINGS_MSG[user_id] = query.message.message_id
+
+    if not await check_can_setup_bot(bot, chat_id, user_id):
+        await query.answer("❌ You are not an authorized admin for this group.", show_alert=True)
+        return
+
+    chat_title = await get_cached_chat_title(bot, chat_id)
+    text = format_settings_hub_text(chat_title)
+    try:
+        await query.message.edit_text(
+            text,
+            reply_markup=generate_settings_page1_keyboard(chat_id, is_dm=True),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+    await query.answer(f"Switched to {chat_title}")
 
     if not await check_can_setup_bot(bot, chat_id, user_id):
         await query.answer("❌ You are not an authorized admin for this group.", show_alert=True)
@@ -3781,6 +3917,10 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     Guarded strictly by check_can_setup_bot (Owner, Anonymous Admin, Excepted Admin).
     Provides deep modular customization for all violation limits, punishments, and features.
     """
+    if query.data in ("dm:switch_group", "dm:refresh_groups"):
+        await handle_dm_manage_settings(query, bot)
+        return
+
     parts = query.data.split(":")
     if len(parts) < 3:
         await query.answer()
@@ -3838,6 +3978,8 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
 
     s = CHAT_SETTINGS[chat_id]
     is_dm = query.message.chat.type == ChatType.PRIVATE if query.message else False
+    if is_dm and query.message:
+        LAST_DM_SETTINGS_MSG[user_id] = query.message.message_id
     chat_title = await get_cached_chat_title(bot, chat_id)
 
     # 1. Open Here (Group inline expansion)
@@ -3857,6 +3999,8 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
             await query.message.delete()
         except Exception:
             pass
+        if is_dm:
+            LAST_DM_SETTINGS_MSG.pop(user_id, None)
         await query.answer("Closed.")
         return
 
@@ -5734,6 +5878,8 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="autowarn", description="Toggle automated warning enforcement"),
         BotCommand(command="warndup", description="Configure duplicate spam warning"),
         BotCommand(command="warnflood", description="Configure flood frequency warning"),
+        BotCommand(command="antiflood", description="Toggle anti-flood protection engine"),
+        BotCommand(command="antispam", description="Toggle anti-spam links & quote engine"),
         BotCommand(command="rules", description="View group regulations"),
         BotCommand(command="setrules", description="Configure regulations"),
         BotCommand(command="welcome", description="Preview welcome greeting"),
@@ -6004,6 +6150,11 @@ async def resource_optimizer_worker() -> None:
             for k in stale_bcasts:
                 PENDING_BROADCAST.pop(k, None)
 
+            # 5C. Bound LAST_DM_SETTINGS_MSG (max 1,000 entries)
+            if len(LAST_DM_SETTINGS_MSG) > 1000:
+                for k in list(LAST_DM_SETTINGS_MSG.keys())[:300]:
+                    LAST_DM_SETTINGS_MSG.pop(k, None)
+
             # 6. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
             if rss_mb > 100.0:
                 # Tier 1 Relief (>100MB): Clear admin cache and compress flood deques
@@ -6024,6 +6175,7 @@ async def resource_optimizer_worker() -> None:
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
                 PENDING_BROADCAST.clear()
+                LAST_DM_SETTINGS_MSG.clear()
                 CHAT_TITLES.clear()
 
             if rss_mb > 400.0:
@@ -6035,6 +6187,7 @@ async def resource_optimizer_worker() -> None:
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
                 PENDING_BROADCAST.clear()
+                LAST_DM_SETTINGS_MSG.clear()
                 CHAT_TITLES.clear()
                 print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
 
@@ -6264,7 +6417,14 @@ function promptSetBackendUrl() {
 async function fetchMembers() {
   try {
     const res = await fetch(getApiBaseUrl() + '/api/members');
+    if (!res.ok) {
+      const errTxt = await res.text();
+      throw new Error(`Server returned HTTP ${res.status}: ${errTxt.slice(0, 80)}`);
+    }
     const data = await res.json();
+    if (data.status === 'error') {
+      throw new Error(data.message || 'Backend returned error');
+    }
     allMembers = data.members || [];
     document.getElementById('stat-total').textContent = allMembers.length;
 
@@ -6504,29 +6664,52 @@ async def members_dashboard_handler(request: web.Request) -> web.Response:
     return resp
 
 
+def json_serial(obj: Any) -> str:
+    """JSON serializer for objects not serializable by default json code (e.g. datetime, date)."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return str(obj)
+
+
 async def api_get_members_handler(request: web.Request) -> web.Response:
     """REST JSON endpoint returning list of all globally accepted members."""
-    chat_id_param = request.query.get("chat_id")
-    members_list = list(ACCEPTED_MEMBERS_CACHE.values())
-    if chat_id_param:
-        try:
-            cid = int(chat_id_param)
-            members_list = [m for m in members_list if cid in m.get("chat_ids", [])]
-        except ValueError:
-            pass
-    members_list.sort(key=lambda x: str(x.get("last_accepted_at") or ""), reverse=True)
-    resp = web.json_response({
-        "status": "ok",
-        "total": len(members_list),
-        "members": members_list
-    }, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    })
-    if resp.body is not None:
-        BANDWIDTH_MONITOR.add_outbound_bytes(len(resp.body) + 150)
-    return resp
+    try:
+        chat_id_param = request.query.get("chat_id")
+        members_list = []
+        for m in ACCEPTED_MEMBERS_CACHE.values():
+            m_copy = dict(m)
+            if isinstance(m_copy.get("last_accepted_at"), (datetime, date)):
+                m_copy["last_accepted_at"] = m_copy["last_accepted_at"].isoformat()
+            if isinstance(m_copy.get("first_accepted_at"), (datetime, date)):
+                m_copy["first_accepted_at"] = m_copy["first_accepted_at"].isoformat()
+            members_list.append(m_copy)
+
+        if chat_id_param:
+            try:
+                cid = int(chat_id_param)
+                members_list = [m for m in members_list if cid in m.get("chat_ids", [])]
+            except ValueError:
+                pass
+
+        members_list.sort(key=lambda x: str(x.get("last_accepted_at") or ""), reverse=True)
+        payload = {
+            "status": "ok",
+            "total": len(members_list),
+            "members": members_list
+        }
+        json_str = json.dumps(payload, default=json_serial)
+        resp = web.Response(
+            text=json_str,
+            content_type="application/json",
+            headers=CORS_HEADERS
+        )
+        if resp.body is not None:
+            BANDWIDTH_MONITOR.add_outbound_bytes(len(resp.body) + 150)
+        return resp
+    except Exception as e:
+        print(f"[API ERROR] api_get_members_handler: {e}", flush=True)
+        err_payload = json.dumps({"status": "error", "message": str(e), "members": []})
+        return web.Response(text=err_payload, content_type="application/json", status=200, headers=CORS_HEADERS)
 
 
 CORS_HEADERS = {

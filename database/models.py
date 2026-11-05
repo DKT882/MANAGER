@@ -141,6 +141,7 @@ class ChatSettingsModel(BaseModel):
     approval_auto: bool = Field(default=False, description="Auto-approve chat join requests")
     welcome_pm_enabled: bool = Field(default=False, description="Send private DM welcome greeting when member request is accepted")
     welcome_pm_msg: str = Field(default="👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉", description="Custom private DM welcome template")
+    antispam_enabled: bool = Field(default=True, description="Master toggle for all anti-spam restrictions")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -195,6 +196,7 @@ class ChatSettingsModel(BaseModel):
             "approval_auto": getattr(self, "approval_auto", False),
             "welcome_pm_enabled": getattr(self, "welcome_pm_enabled", False),
             "welcome_pm_msg": getattr(self, "welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"),
+            "antispam_enabled": getattr(self, "antispam_enabled", True),
         })
         return data
 
@@ -271,6 +273,7 @@ class ChatSettingsModel(BaseModel):
             approval_auto=mem_dict.get("approval_auto", False),
             welcome_pm_enabled=mem_dict.get("welcome_pm_enabled", False),
             welcome_pm_msg=mem_dict.get("welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"),
+            antispam_enabled=mem_dict.get("antispam_enabled", True),
             custom_attributes=custom_attrs,
         )
 

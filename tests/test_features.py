@@ -160,6 +160,60 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         self.assertIn("warn_on_flood", bot.DEFAULT_CHAT_CONFIG)
         self.assertIsInstance(bot.DUPLICATE_CACHE, dict)
 
+    def test_antispam_toggle_and_model(self):
+        self.assertIn("antispam_enabled", bot.DEFAULT_CHAT_CONFIG)
+        self.assertTrue(bot.DEFAULT_CHAT_CONFIG["antispam_enabled"])
+
+        settings = ChatSettingsModel(
+            chat_id=-100777666,
+            antispam_enabled=False
+        )
+        self.assertFalse(settings.antispam_enabled)
+        in_mem = settings.to_in_memory_dict()
+        self.assertFalse(in_mem["antispam_enabled"])
+        restored = ChatSettingsModel.from_in_memory_dict(-100777666, "Antispam Test", in_mem)
+        self.assertFalse(restored.antispam_enabled)
+
+        s = bot.DEFAULT_CHAT_CONFIG.copy()
+        s["antispam_enabled"] = False
+        text = bot.format_antispam_text("Test Chat", s)
+        self.assertIn("DISABLED", text)
+
+        kb = bot.generate_antispam_keyboard(-100777666, is_dm=False)
+        btn_data = [btn.callback_data for row in kb.inline_keyboard for btn in row if btn.callback_data]
+        self.assertTrue(any("toggle:antispam_enabled" in d for d in btn_data))
+
+    def test_dm_group_switcher_button(self):
+        self.assertIsInstance(bot.LAST_DM_SETTINGS_MSG, dict)
+        kb_page1_dm = bot.generate_settings_page1_keyboard(-100777, is_dm=True)
+        btn_data_p1 = [btn.callback_data for row in kb_page1_dm.inline_keyboard for btn in row if btn.callback_data]
+        self.assertIn("dm:switch_group", btn_data_p1)
+
+        kb_page2_dm = bot.generate_settings_page2_keyboard(-100777, is_dm=True)
+        btn_data_p2 = [btn.callback_data for row in kb_page2_dm.inline_keyboard for btn in row if btn.callback_data]
+        self.assertIn("dm:switch_group", btn_data_p2)
+
+        # In group chat, switch_group should NOT appear
+        kb_page1_gc = bot.generate_settings_page1_keyboard(-100777, is_dm=False)
+        btn_data_gc = [btn.callback_data for row in kb_page1_gc.inline_keyboard for btn in row if btn.callback_data]
+        self.assertNotIn("dm:switch_group", btn_data_gc)
+
+    def test_json_serial_and_members_api(self):
+        import json
+        from datetime import datetime, timezone, date
+
+        now_dt = datetime.now(timezone.utc)
+        today_d = date.today()
+        payload = {
+            "status": "ok",
+            "dt": now_dt,
+            "d": today_d
+        }
+        # Should not raise TypeError: Object of type datetime is not JSON serializable
+        json_output = json.dumps(payload, default=bot.json_serial)
+        self.assertIn(now_dt.isoformat()[:10], json_output)
+        self.assertIn(today_d.isoformat(), json_output)
+
 
 if __name__ == "__main__":
     unittest.main()
