@@ -969,6 +969,10 @@ async def trigger_admin_alert(bot: Bot, message: Message, user: types.User, reas
                 pass
 
 
+# _LAST_DM_SENT_TS: (chat_id, user_id) -> timestamp of last sent welcome DM to prevent duplicate sends
+_LAST_DM_SENT_TS: Dict[Tuple[int, int], float] = {}
+
+
 async def dispatch_private_welcome_dm(
     bot: Bot,
     chat_id: int,
@@ -988,6 +992,11 @@ async def dispatch_private_welcome_dm(
     """
     if not settings.get("welcome_pm_enabled"):
         return False
+
+    now_ts = time.time()
+    dm_key = (chat_id, user.id)
+    if now_ts - _LAST_DM_SENT_TS.get(dm_key, 0.0) < 30.0:
+        return True  # Already dispatched to this user within 30s, prevent duplicate
 
     template = settings.get(
         "welcome_pm_msg",
@@ -1014,6 +1023,7 @@ async def dispatch_private_welcome_dm(
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True
         )
+        _LAST_DM_SENT_TS[dm_key] = now_ts
         print(f"[WELCOME PM SUCCESS] Sent private DM welcome to user {user.id} ({user_name}) for {chat_title}", flush=True)
         return True
     except TelegramForbiddenError as fe:
@@ -1033,6 +1043,7 @@ async def dispatch_private_welcome_dm(
                 parse_mode=None,
                 disable_web_page_preview=True
             )
+            _LAST_DM_SENT_TS[dm_key] = now_ts
             print(f"[WELCOME PM FALLBACK] Sent plain-text DM welcome to user {user.id} ({user_name})", flush=True)
             return True
         except TelegramForbiddenError as fe2:
@@ -1205,8 +1216,12 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
 async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
     """
     Handles Telegram ChatJoinRequest updates when members request to join via invite link.
-    When 'approval_auto' is enabled in chat settings, automatically approves the request
-    instantly, tracks username in local cache, and optionally dispatches welcome greetings.
+    CRITICAL TELEGRAM SPECIFICATION:
+    Telegram grants a temporary 5-minute window for the bot to send private messages
+    to the applicant EVEN IF THEY HAVE NEVER STARTED THE BOT.
+    Crucially: The bot MUST send the message BEFORE approving the join request!
+    Once approve_chat_join_request() is executed, the join request is resolved and closed,
+    which instantly revokes the bot's permission to initiate conversation with the user.
     """
     chat_id = request.chat.id
     user = request.from_user
@@ -1220,56 +1235,58 @@ async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
     if request.chat and request.chat.title:
         CHAT_TITLES[chat_id] = request.chat.title
 
+    chat_title = await get_cached_chat_title(bot, chat_id)
     settings = CHAT_SETTINGS[chat_id]
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # 1. Update in-memory unified global accepted members cache (0ms lookup)
+    mem_data = ACCEPTED_MEMBERS_CACHE.get(user.id, {})
+    existing_cids = list(mem_data.get("chat_ids", []))
+    if chat_id not in existing_cids:
+        existing_cids.append(chat_id)
+    existing_titles = list(mem_data.get("chat_titles", []))
+    if chat_title not in existing_titles:
+        existing_titles.append(chat_title)
+
+    ACCEPTED_MEMBERS_CACHE[user.id] = {
+        "user_id": user.id,
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or None,
+        "username": user.username.lower() if user.username else None,
+        "full_name": user.full_name or user.first_name or f"User {user.id}",
+        "chat_ids": existing_cids,
+        "chat_titles": existing_titles,
+        "first_accepted_at": mem_data.get("first_accepted_at", now_iso),
+        "last_accepted_at": now_iso,
+        "accept_count": mem_data.get("accept_count", 0) + 1,
+        "bio": getattr(request, "bio", None),
+        "status": "active"
+    }
+
+    # 2. Persist to MongoDB global entity in background worker
+    DatabaseService.record_accepted_member_background(
+        user_id=user.id,
+        first_name=user.first_name or "",
+        last_name=user.last_name,
+        username=user.username,
+        full_name=user.full_name or user.first_name or f"User {user.id}",
+        chat_id=chat_id,
+        chat_title=chat_title,
+        bio=getattr(request, "bio", None)
+    )
+
+    # 3. CRITICAL: Dispatch Private DM Welcome FIRST while join request is still pending!
+    # Telegram allows messaging applicants who never started the bot ONLY while the request is open.
+    await dispatch_private_welcome_dm(bot, chat_id, user, chat_title, settings)
+
+    # 4. Process Auto-Approval if enabled
     if settings.get("approval_auto"):
         try:
             await bot.approve_chat_join_request(chat_id=chat_id, user_id=user.id)
             METRICS["violations_handled"] += 1
             print(f"[APPROVAL] Auto-approved join request for user {user.id} (@{user.username}) in chat {chat_id}", flush=True)
 
-            chat_title = await get_cached_chat_title(bot, chat_id)
-            now_iso = datetime.now(timezone.utc).isoformat()
-
-            # 1. Update in-memory unified global accepted members cache (0ms lookup)
-            mem_data = ACCEPTED_MEMBERS_CACHE.get(user.id, {})
-            existing_cids = list(mem_data.get("chat_ids", []))
-            if chat_id not in existing_cids:
-                existing_cids.append(chat_id)
-            existing_titles = list(mem_data.get("chat_titles", []))
-            if chat_title not in existing_titles:
-                existing_titles.append(chat_title)
-
-            ACCEPTED_MEMBERS_CACHE[user.id] = {
-                "user_id": user.id,
-                "first_name": user.first_name or "",
-                "last_name": user.last_name or None,
-                "username": user.username.lower() if user.username else None,
-                "full_name": user.full_name or user.first_name or f"User {user.id}",
-                "chat_ids": existing_cids,
-                "chat_titles": existing_titles,
-                "first_accepted_at": mem_data.get("first_accepted_at", now_iso),
-                "last_accepted_at": now_iso,
-                "accept_count": mem_data.get("accept_count", 0) + 1,
-                "bio": getattr(request, "bio", None),
-                "status": "active"
-            }
-
-            # 2. Persist to MongoDB global entity in background worker
-            DatabaseService.record_accepted_member_background(
-                user_id=user.id,
-                first_name=user.first_name or "",
-                last_name=user.last_name,
-                username=user.username,
-                full_name=user.full_name or user.first_name or f"User {user.id}",
-                chat_id=chat_id,
-                chat_title=chat_title,
-                bio=getattr(request, "bio", None)
-            )
-
-            # 3. Private DM Welcome Message (always attempts direct delivery)
-            await dispatch_private_welcome_dm(bot, chat_id, user, chat_title, settings)
-
-            # 4. Optional In-Chat welcome greeting dispatch
+            # Optional In-Chat welcome greeting dispatch
             if settings.get("welcome_enabled"):
                 template = settings.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
                 formatted = template.replace("{mention}", user.mention_html()) \
@@ -1289,7 +1306,7 @@ async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
                 except Exception as we:
                     print(f"[APPROVAL NOTICE] Welcome message dispatch error: {we}", flush=True)
 
-            # 5. Security audit log dispatch
+            # Security audit log dispatch
             log_chan = settings.get("log_channel") or settings.get("log_channel_id")
             if log_chan:
                 try:
@@ -6279,6 +6296,11 @@ async def resource_optimizer_worker() -> None:
                 for k in sorted_keys[8000:]:
                     ACCEPTED_MEMBERS_CACHE.pop(k, None)
 
+            # 5E. Clean stale _LAST_DM_SENT_TS entries (>300s)
+            stale_dm_keys = [k for k, ts in list(_LAST_DM_SENT_TS.items()) if now_ts - ts > 300]
+            for k in stale_dm_keys:
+                _LAST_DM_SENT_TS.pop(k, None)
+
             # 6. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
             if rss_mb > 100.0:
                 # Tier 1 Relief (>100MB): Clear admin cache and compress flood deques
@@ -6300,6 +6322,7 @@ async def resource_optimizer_worker() -> None:
                 PENDING_CUSTOM_INPUT.clear()
                 PENDING_BROADCAST.clear()
                 LAST_DM_SETTINGS_MSG.clear()
+                _LAST_DM_SENT_TS.clear()
                 CHAT_TITLES.clear()
 
             if rss_mb > 400.0:
@@ -6312,6 +6335,7 @@ async def resource_optimizer_worker() -> None:
                 PENDING_CUSTOM_INPUT.clear()
                 PENDING_BROADCAST.clear()
                 LAST_DM_SETTINGS_MSG.clear()
+                _LAST_DM_SENT_TS.clear()
                 CHAT_TITLES.clear()
                 print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
 

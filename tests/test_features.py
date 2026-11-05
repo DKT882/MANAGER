@@ -286,6 +286,55 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         # delete() MUST be called in group chat
         group_msg.delete.assert_called_once()
 
+    def test_chat_join_request_sends_dm_before_approving(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_bot = MagicMock()
+        call_order = []
+
+        async def fake_send_message(*args, **kwargs):
+            call_order.append("send_message")
+            return MagicMock()
+
+        async def fake_approve(*args, **kwargs):
+            call_order.append("approve_chat_join_request")
+            return True
+
+        mock_bot.send_message = AsyncMock(side_effect=fake_send_message)
+        mock_bot.approve_chat_join_request = AsyncMock(side_effect=fake_approve)
+
+        # Configure chat settings
+        chat_id = -100555666
+        bot.CHAT_SETTINGS[chat_id] = {
+            "approval_auto": True,
+            "welcome_pm_enabled": True,
+            "welcome_pm_msg": "Welcome {name}!"
+        }
+        bot._LAST_DM_SENT_TS.clear()
+
+        # Build join request
+        mock_user = MagicMock()
+        mock_user.id = 8881234
+        mock_user.full_name = "New Applicant"
+        mock_user.first_name = "New"
+        mock_user.username = "new_applicant"
+        mock_user.mention_html.return_value = "New"
+
+        req = MagicMock()
+        req.chat.id = chat_id
+        req.chat.title = "Test Approvals"
+        req.from_user = mock_user
+
+        asyncio.run(bot.handle_chat_join_request(req, mock_bot))
+
+        # Critical verification: send_message must be called BEFORE approve_chat_join_request!
+        self.assertIn("send_message", call_order)
+        self.assertIn("approve_chat_join_request", call_order)
+        dm_idx = call_order.index("send_message")
+        approve_idx = call_order.index("approve_chat_join_request")
+        self.assertLess(dm_idx, approve_idx, "Private DM MUST be dispatched BEFORE approving join request!")
+
 
 if __name__ == "__main__":
     unittest.main()
