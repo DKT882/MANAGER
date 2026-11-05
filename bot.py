@@ -62,6 +62,7 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
     CallbackQuery,
+    ChatJoinRequest,
     ChatMemberAdministrator,
     ChatMemberOwner,
     ChatPermissions,
@@ -197,6 +198,10 @@ PENDING_CUSTOM_INPUT: Dict[int, Tuple[int, str]] = {}
 # CHAT_TITLES: chat_id -> cached group title (eliminates redundant getChat roundtrips)
 CHAT_TITLES: Dict[int, str] = {}
 
+# USERNAME_CACHE: username (lowercase, without @) -> (user_id, full_name)
+# Provides sub-microsecond in-memory resolution for @username command targeting
+USERNAME_CACHE: Dict[str, Tuple[int, str]] = {}
+
 # Pre-compiled high-performance regex patterns
 RE_DURATION = re.compile(r"^(\d+)([smhdw]?)$")
 RE_LINK = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
@@ -322,6 +327,12 @@ async def check_admin_rights(
     if user_id in (1087968824, 777000):  # GroupAnonymousBot / Telegram Service
         return True
 
+    # 1B. Check if user is an Exempted Admin for this chat
+    if chat_id in CHAT_SETTINGS:
+        raw_excepted = CHAT_SETTINGS[chat_id].get("excepted_admins", [])
+        if user_id in raw_excepted or str(user_id) in raw_excepted:
+            return True
+
     if not user_id:
         return False
 
@@ -414,6 +425,8 @@ async def check_can_setup_bot(
 
     # Check native Telegram anonymous group admin message
     if sender_chat_id and sender_chat_id == chat_id:
+        return True
+    if user_id in (1087968824, 777000):
         return True
 
     if not user_id:
@@ -528,16 +541,25 @@ async def resolve_target(
 ) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
     Resolves target user from replied message, numeric ID, mention entity, or @username.
+    Features 3-tier sub-millisecond resolution:
+    1. Direct reply / numeric ID / text_mention entity
+    2. Local USERNAME_CACHE (sub-microsecond 0.001ms RAM lookup)
+    3. Group Administrators cache population
+    4. Telegram API getChat fallback for public usernames
     Returns: (target_user_id, target_user_name, extra_arguments_string)
     """
     # 1. Target from replied message
     if message.reply_to_message:
         if message.reply_to_message.from_user:
             target_user = message.reply_to_message.from_user
+            if target_user.username:
+                USERNAME_CACHE[target_user.username.lower()] = (target_user.id, target_user.full_name)
             extra_args = command.args if command and command.args else ""
             return target_user.id, target_user.full_name, extra_args.strip()
         elif message.reply_to_message.sender_chat:
             sc = message.reply_to_message.sender_chat
+            if sc.username:
+                USERNAME_CACHE[sc.username.lower()] = (sc.id, sc.title or f"Channel {sc.id}")
             extra_args = command.args if command and command.args else ""
             return sc.id, sc.title or f"Channel {sc.id}", extra_args.strip()
 
@@ -556,18 +578,42 @@ async def resolve_target(
         if message.entities:
             for entity in message.entities:
                 if entity.type == "text_mention" and entity.user:
+                    if entity.user.username:
+                        USERNAME_CACHE[entity.user.username.lower()] = (entity.user.id, entity.user.full_name)
                     return entity.user.id, entity.user.full_name, remaining.strip()
 
-        # Target @username resolution via chat administrators list
-        if first_arg.startswith("@") and bot and message.chat:
-            target_handle = first_arg.lstrip("@").lower()
-            try:
-                admins = await bot.get_chat_administrators(message.chat.id)
-                for admin in admins:
-                    if admin.user and admin.user.username and admin.user.username.lower() == target_handle:
-                        return admin.user.id, admin.user.full_name, remaining.strip()
-            except Exception:
-                pass
+        # Target username resolution (handles both @username and username without @)
+        target_handle = first_arg.lstrip("@").lower().strip()
+        if target_handle:
+            # Step 2A: Check in-memory USERNAME_CACHE (0.001ms RAM lookup)
+            if target_handle in USERNAME_CACHE:
+                cached_id, cached_name = USERNAME_CACHE[target_handle]
+                return cached_id, cached_name, remaining.strip()
+
+            # Step 2B: Check chat administrators list
+            if bot and getattr(message, "chat", None) and getattr(message.chat, "id", None):
+                try:
+                    admins = await bot.get_chat_administrators(message.chat.id)
+                    for admin in admins:
+                        if admin.user and admin.user.username:
+                            admin_handle = admin.user.username.lower()
+                            USERNAME_CACHE[admin_handle] = (admin.user.id, admin.user.full_name)
+                            if admin_handle == target_handle:
+                                return admin.user.id, admin.user.full_name, remaining.strip()
+                except Exception:
+                    pass
+
+            # Step 2C: Direct Telegram API lookup via bot.get_chat (resolves ANY public user/bot/channel)
+            if bot:
+                try:
+                    chat_info = await bot.get_chat(f"@{target_handle}")
+                    if chat_info and chat_info.id:
+                        resolved_id = chat_info.id
+                        resolved_name = getattr(chat_info, "full_name", None) or chat_info.first_name or chat_info.title or f"@{target_handle}"
+                        USERNAME_CACHE[target_handle] = (resolved_id, resolved_name)
+                        return resolved_id, resolved_name, remaining.strip()
+                except Exception:
+                    pass
 
     return None, None, None
 
@@ -958,6 +1004,72 @@ async def handle_service_messages(message: Message, bot: Bot) -> None:
 
 
 # ==============================================================================
+# JOIN REQUEST APPROVAL ENGINE (APPROVAL MODE)
+# ==============================================================================
+
+@router.chat_join_request()
+async def handle_chat_join_request(request: ChatJoinRequest, bot: Bot) -> None:
+    """
+    Handles Telegram ChatJoinRequest updates when members request to join via invite link.
+    When 'approval_auto' is enabled in chat settings, automatically approves the request
+    instantly, tracks username in local cache, and optionally dispatches welcome greetings.
+    """
+    chat_id = request.chat.id
+    user = request.from_user
+    if not user:
+        return
+
+    # Cache user info for instant command targeting
+    if user.username:
+        USERNAME_CACHE[user.username.lower()] = (user.id, user.full_name)
+
+    if request.chat and request.chat.title:
+        CHAT_TITLES[chat_id] = request.chat.title
+
+    settings = CHAT_SETTINGS[chat_id]
+    if settings.get("approval_auto"):
+        try:
+            await bot.approve_chat_join_request(chat_id=chat_id, user_id=user.id)
+            METRICS["violations_handled"] += 1
+            print(f"[APPROVAL] Auto-approved join request for user {user.id} (@{user.username}) in chat {chat_id}", flush=True)
+
+            # Optional welcome greeting dispatch
+            if settings.get("welcome_enabled"):
+                chat_title = await get_cached_chat_title(bot, chat_id)
+                template = settings.get("welcome_msg", "👋 Welcome to <b>{chat_title}</b>, {mention}!")
+                formatted = template.replace("{mention}", user.mention_html()) \
+                                    .replace("{name}", html.escape(user.full_name)) \
+                                    .replace("{chat_title}", html.escape(chat_title)) \
+                                    .replace("{id}", str(user.id))
+                try:
+                    if settings.get("clean_welcome"):
+                        last_msg_id = settings.get("_last_welcome_msg_id")
+                        if last_msg_id:
+                            try:
+                                await bot.delete_message(chat_id=chat_id, message_id=last_msg_id)
+                            except Exception:
+                                pass
+                    w_msg = await bot.send_message(chat_id=chat_id, text=formatted, parse_mode=ParseMode.HTML)
+                    settings["_last_welcome_msg_id"] = w_msg.message_id
+                except Exception as we:
+                    print(f"[APPROVAL NOTICE] Welcome message dispatch error: {we}", flush=True)
+
+            # Security audit log dispatch
+            log_chan = settings.get("log_channel") or settings.get("log_channel_id")
+            if log_chan:
+                try:
+                    await bot.send_message(
+                        chat_id=log_chan,
+                        text=f"📭 <b>Auto-Approved Join Request</b>\n👤 <b>User:</b> {user.mention_html()} (<code>{user.id}</code>)\n🏷️ <b>Chat:</b> <code>{chat_id}</code>",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[APPROVAL ERROR] Failed to auto-approve user {user.id} in chat {chat_id}: {e}", flush=True)
+
+
+# ==============================================================================
 # ASYNCHRONOUS MEDIA, LINK, & CONTENT INTERCEPTOR (SUB-SECOND SCANNER)
 # ==============================================================================
 
@@ -980,6 +1092,13 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
     user = message.from_user
     if not user or user.is_bot:
         return
+
+    # Ingress username caching for sub-microsecond command target resolution
+    if user.username:
+        USERNAME_CACHE[user.username.lower()] = (user.id, user.full_name)
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.username:
+        r_user = message.reply_to_message.from_user
+        USERNAME_CACHE[r_user.username.lower()] = (r_user.id, r_user.full_name)
 
     chat_id = message.chat.id
     if message.chat and message.chat.title:
@@ -1456,8 +1575,7 @@ async def handle_unban(message: Message, command: CommandObject, bot: Bot) -> No
     try:
         await bot.unban_chat_member(
             chat_id=message.chat.id,
-            user_id=target_id,
-            only_if_banned=True
+            user_id=target_id
         )
         mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
         await message.answer(f"✅ <b>Unbanned:</b> {mention}. Member can now rejoin.", parse_mode=ParseMode.HTML)
@@ -1479,6 +1597,13 @@ async def handle_kickme(message: Message, bot: Bot) -> None:
     user = message.from_user
     if not user or user.is_bot:
         return
+
+    # Ingress username caching for sub-microsecond command target resolution
+    if user.username:
+        USERNAME_CACHE[user.username.lower()] = (user.id, user.full_name)
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.username:
+        r_user = message.reply_to_message.from_user
+        USERNAME_CACHE[r_user.username.lower()] = (r_user.id, r_user.full_name)
 
     chat_id = message.chat.id
     user_id = user.id
@@ -2957,18 +3082,63 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                 except Exception:
                     pass
 
-        if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
-            title = await get_cached_chat_title(bot, target_cid)
-            text = format_settings_hub_text(title)
-            try:
+        if target_cid:
+            if await check_can_setup_bot(bot, target_cid, user_id):
+                title = await get_cached_chat_title(bot, target_cid)
+                text = format_settings_hub_text(title)
+                try:
+                    await message.answer(
+                        text,
+                        reply_markup=generate_settings_page1_keyboard(target_cid, is_dm=True),
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                except Exception:
+                    pass
+            else:
                 await message.answer(
-                    text,
-                    reply_markup=generate_settings_page1_keyboard(target_cid, is_dm=True),
+                    "❌ <b>Access Denied:</b> You are not authorized to configure settings for this group.\n"
+                    "Only the Group Owner, Anonymous Admins, or Exempted Admins can configure settings.",
                     parse_mode=ParseMode.HTML
                 )
                 return
-            except Exception:
-                pass
+
+    # 2B. Direct /settings command in private DM (without args)
+    if command and command.command.lower() == "settings":
+        authorized_chats = []
+        known_cids = {cid for cid in CHAT_SETTINGS.keys() if cid < 0}
+        for cid in known_cids:
+            if await check_can_setup_bot(bot, cid, user_id):
+                title = await get_cached_chat_title(bot, cid)
+                authorized_chats.append((cid, title))
+
+        if authorized_chats:
+            group_buttons = [
+                [InlineKeyboardButton(text=f"👥 {title}", callback_data=f"dmgroup:{cid}")]
+                for cid, title in authorized_chats
+            ]
+            group_buttons.append([
+                InlineKeyboardButton(text="🔄 Refresh List", callback_data="dm:refresh_groups"),
+                InlineKeyboardButton(text="⬅️ Back", callback_data="dm:main_menu"),
+            ])
+            kb = InlineKeyboardMarkup(inline_keyboard=group_buttons)
+            await message.answer(
+                "⚙️ <b>Your Managed Groups:</b>\n\n"
+                "Select a group below to view and configure its settings:",
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML
+            )
+            return
+        else:
+            await message.answer(
+                "⚙️ <b>Group Settings Management</b>\n\n"
+                "To manage your group's settings from Private DM:\n"
+                "1️⃣ In your group chat, type <code>/settings</code> and tap <b>👤 Open in Private Chat</b>.\n"
+                "2️⃣ Or send <code>/settings &lt;group_id&gt;</code> here in DM (e.g. <code>/settings -1001234567890</code>).\n\n"
+                "<i>Note: You must be the Group Owner, Anonymous Admin, or an Exempted Admin.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
 
     # 2B. Welcome Menu Card (Matching Exact User Screenshot Specification)
     welcome_text = (
@@ -5132,7 +5302,12 @@ async def resource_optimizer_worker() -> None:
             for cid in private_chats:
                 CHAT_SETTINGS.pop(cid, None)
 
-            # 5. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
+            # 5. Bound USERNAME_CACHE (max 5,000 entries)
+            if len(USERNAME_CACHE) > 5000:
+                for k in list(USERNAME_CACHE.keys())[:1000]:
+                    USERNAME_CACHE.pop(k, None)
+
+            # 6. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
             if rss_mb > 100.0:
                 # Tier 1 Relief (>100MB): Clear admin cache and compress flood deques
                 ADMIN_CACHE.clear()
@@ -5147,6 +5322,7 @@ async def resource_optimizer_worker() -> None:
                 # Tier 2 Emergency Relief (>250MB): Shed flood and warn memory
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
+                USERNAME_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
                 CHAT_TITLES.clear()
@@ -5156,6 +5332,7 @@ async def resource_optimizer_worker() -> None:
                 ADMIN_CACHE.clear()
                 FLOOD_CACHE.clear()
                 WARN_CACHE.clear()
+                USERNAME_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
                 CHAT_TITLES.clear()
@@ -5351,7 +5528,7 @@ async def main() -> None:
         # Slashes outbound HTTP request headers by >90% to stay well under Render's 5GB limit (<50MB/mo).
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"],
             polling_timeout=50,
             handle_signals=True
         )

@@ -133,6 +133,7 @@ class ChatSettingsModel(BaseModel):
     clean_service_messages: bool = Field(default=True, description="Auto-delete join and group left service notifications")
     block_bots: bool = Field(default=False, description="Auto-ban bots added to the group chat")
     bot_action: str = Field(default="ban", description="Punishment when unauthorized bot joins: 'ban' or 'kick'")
+    approval_auto: bool = Field(default=False, description="Auto-approve chat join requests")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -179,6 +180,7 @@ class ChatSettingsModel(BaseModel):
             "clean_service_messages": self.clean_service_messages,
             "block_bots": self.block_bots,
             "bot_action": getattr(self, "bot_action", "ban"),
+            "approval_auto": getattr(self, "approval_auto", False),
         })
         return data
 
@@ -247,6 +249,7 @@ class ChatSettingsModel(BaseModel):
             clean_service_messages=mem_dict.get("clean_service_messages", True),
             block_bots=mem_dict.get("block_bots", False),
             bot_action=mem_dict.get("bot_action", "ban"),
+            approval_auto=mem_dict.get("approval_auto", False),
             custom_attributes=custom_attrs,
         )
 

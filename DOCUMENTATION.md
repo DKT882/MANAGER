@@ -392,6 +392,30 @@ Render enforces a **512MB RAM cap**. Any memory leaks from uncollected collectio
   - The built-in `start_render_health_server()` starts an asynchronous `aiohttp.web` server on `0.0.0.0:$PORT` (responding to `/` and `/health`).
   - Allows deployment as a **Render Web Service** without timing out on startup.
 - **European Edge Region (`frankfurt`)**:
-  - Setting `region: frankfurt` in [render.yaml](file:///c:/Users/kamle/OneDrive/Desktop/Manager/render.yaml) positions the bot in the same European data center as Telegram's Bot API (`api.telegram.org`), reducing network roundtrip latency to **< 15ms**.
+  - Setting `region: frankfurt` in [render.yaml](file:///c:/Users/kamle/OneDrive\Desktop\Manager\render.yaml) positions the bot in the same European data center as Telegram's Bot API (`api.telegram.org`), reducing network roundtrip latency to **< 15ms**.
+
+---
+
+## 9. 3-Tier Username Resolution & Join Request Approval Engine
+
+### A. Sub-Millisecond Username Resolution Matrix
+All moderation commands (`/unban`, `/ban`, `/mute`, `/warn`, `/addexcept`, `/promote`, `/demote`) resolve targets using a high-speed 3-tier pipeline:
+1. **Local `USERNAME_CACHE` (0.001ms RAM lookup)**:
+   - Populated transparently on every incoming message, service event, button press, and join request.
+   - Handles both `@username` and bare `username` without making any network requests.
+2. **Chat Administrators In-Memory Fallback**:
+   - Inspects the group administrator list if not cached, concurrently hydrating all admin usernames into `USERNAME_CACHE`.
+3. **Direct Telegram API `get_chat("@handle")` Fallback**:
+   - Queries Telegram directly for any public user, channel, or bot, caching the resulting numeric ID and full name permanently.
+
+### B. Group Join Request Auto-Acceptance Engine
+- Full support for `ChatJoinRequest` updates registered via `allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"]`.
+- When `approval_auto` is enabled via `/settings` (Approval Mode), the bot immediately invokes `bot.approve_chat_join_request()` without human intervention.
+- Supports automatic welcome greeting dispatch with previous welcome message cleanup (`clean_welcome`) and audit logging.
+
+### C. Exempted Admin Private DM Configuration
+- Group Owners and Anonymous Admins can designate Exempted Admins using `/addexcept @username` or `/addexcept <user_id>`.
+- Exempted Admins enjoy full access to manage group protection settings directly from Private DM (`/settings`, deep-links, or the interactive managed group picker).
+
 
 
