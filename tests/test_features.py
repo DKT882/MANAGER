@@ -214,6 +214,13 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         self.assertIn(now_dt.isoformat()[:10], json_output)
         self.assertIn(today_d.isoformat(), json_output)
 
+    def test_html_caching_and_keepalive(self):
+        import asyncio
+        h1 = bot.render_members_dashboard_html()
+        h2 = bot.render_members_dashboard_html()
+        self.assertIs(h1, h2)
+        self.assertTrue(asyncio.iscoroutinefunction(bot.render_keepalive_worker))
+
 
 if __name__ == "__main__":
     unittest.main()

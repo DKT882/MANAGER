@@ -449,7 +449,7 @@ class DatabaseService:
 
         count = 0
         try:
-            cursor = db.accepted_members.find({}, {"_id": 0})
+            cursor = db.accepted_members.find({}, {"_id": 0}).sort("last_accepted_at", -1).limit(10000)
             async for doc in cursor:
                 uid = doc.get("user_id")
                 if uid:

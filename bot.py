@@ -6155,6 +6155,16 @@ async def resource_optimizer_worker() -> None:
                 for k in list(LAST_DM_SETTINGS_MSG.keys())[:300]:
                     LAST_DM_SETTINGS_MSG.pop(k, None)
 
+            # 5D. Bound ACCEPTED_MEMBERS_CACHE (max 10,000 entries in RAM)
+            if len(ACCEPTED_MEMBERS_CACHE) > 10000:
+                sorted_keys = sorted(
+                    ACCEPTED_MEMBERS_CACHE.keys(),
+                    key=lambda k: str(ACCEPTED_MEMBERS_CACHE[k].get("last_accepted_at") or ""),
+                    reverse=True
+                )
+                for k in sorted_keys[8000:]:
+                    ACCEPTED_MEMBERS_CACHE.pop(k, None)
+
             # 6. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
             if rss_mb > 100.0:
                 # Tier 1 Relief (>100MB): Clear admin cache and compress flood deques
@@ -6211,9 +6221,51 @@ async def resource_optimizer_worker() -> None:
             pass
 
 
+async def render_keepalive_worker() -> None:
+    """
+    Self-ping keepalive worker designed for Render Free Web Service tier.
+    Render free instances spin down after 15 minutes of HTTP inactivity.
+    If RENDER_EXTERNAL_URL or PING_URL is set, performs a lightweight GET request
+    to /health every 12 minutes (720 seconds) to guarantee 24/7 continuous uptime.
+    """
+    ping_url = os.getenv("RENDER_EXTERNAL_URL", "").strip() or os.getenv("PING_URL", "").strip()
+    if not ping_url:
+        return
+
+    if not ping_url.startswith("http://") and not ping_url.startswith("https://"):
+        ping_url = f"https://{ping_url}"
+    health_endpoint = ping_url.rstrip("/") + "/health"
+
+    print(f"[RENDER KEEPALIVE] Worker active. Pinging {health_endpoint} every 12m to prevent spindown.", flush=True)
+
+    # Initial delay so application completes boot before first ping
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            await asyncio.sleep(720)  # 12 minutes
+            connector = aiohttp.TCPConnector(limit=1, ssl=False)
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async with session.get(health_endpoint) as resp:
+                    if resp.status == 200:
+                        METRICS["last_heartbeat"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+_CACHED_DASHBOARD_HTML: Optional[str] = None
+
+
 def render_members_dashboard_html() -> str:
     """Renders high-speed, modern, standalone HTML/JS dashboard for accepted members & broadcasts."""
-    return """<!DOCTYPE html>
+    global _CACHED_DASHBOARD_HTML
+    if _CACHED_DASHBOARD_HTML is not None:
+        return _CACHED_DASHBOARD_HTML
+
+    _CACHED_DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -6653,6 +6705,7 @@ window.addEventListener('DOMContentLoaded', fetchMembers);
 </body>
 </html>
 """
+    return _CACHED_DASHBOARD_HTML
 
 
 async def members_dashboard_handler(request: web.Request) -> web.Response:
@@ -6672,30 +6725,32 @@ def json_serial(obj: Any) -> str:
 
 
 async def api_get_members_handler(request: web.Request) -> web.Response:
-    """REST JSON endpoint returning list of all globally accepted members."""
+    """REST JSON endpoint returning list of all globally accepted members with pagination."""
     try:
         chat_id_param = request.query.get("chat_id")
-        members_list = []
-        for m in ACCEPTED_MEMBERS_CACHE.values():
-            m_copy = dict(m)
-            if isinstance(m_copy.get("last_accepted_at"), (datetime, date)):
-                m_copy["last_accepted_at"] = m_copy["last_accepted_at"].isoformat()
-            if isinstance(m_copy.get("first_accepted_at"), (datetime, date)):
-                m_copy["first_accepted_at"] = m_copy["first_accepted_at"].isoformat()
-            members_list.append(m_copy)
+        limit_param = request.query.get("limit")
+        try:
+            limit = min(max(int(limit_param), 1), 5000) if limit_param else 1000
+        except (ValueError, TypeError):
+            limit = 1000
 
+        all_members = list(ACCEPTED_MEMBERS_CACHE.values())
         if chat_id_param:
             try:
                 cid = int(chat_id_param)
-                members_list = [m for m in members_list if cid in m.get("chat_ids", [])]
+                all_members = [m for m in all_members if cid in m.get("chat_ids", [])]
             except ValueError:
                 pass
 
-        members_list.sort(key=lambda x: str(x.get("last_accepted_at") or ""), reverse=True)
+        total_count = len(all_members)
+        all_members.sort(key=lambda x: str(x.get("last_accepted_at") or ""), reverse=True)
+        paginated_members = all_members[:limit]
+
         payload = {
             "status": "ok",
-            "total": len(members_list),
-            "members": members_list
+            "total": total_count,
+            "count": len(paginated_members),
+            "members": paginated_members
         }
         json_str = json.dumps(payload, default=json_serial)
         resp = web.Response(
@@ -6939,8 +6994,9 @@ async def main() -> None:
     except Exception as e:
         print(f"[BOT WARNING] Command setup notice: {e}", flush=True)
 
-    # Start background RAM & cache resource optimizer task
+    # Start background RAM & cache resource optimizer task + Render 24/7 keepalive
     optimizer_task = asyncio.create_task(resource_optimizer_worker())
+    keepalive_task = asyncio.create_task(render_keepalive_worker())
 
     print(f"[READY] Listening for commands with zero DB roundtrips. Engine: {LOOP_ENGINE}", flush=True)
 
@@ -6955,6 +7011,7 @@ async def main() -> None:
         )
     finally:
         optimizer_task.cancel()
+        keepalive_task.cancel()
         if health_runner:
             await health_runner.cleanup()
         await MongoDBManager.disconnect()
