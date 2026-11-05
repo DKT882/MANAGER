@@ -82,6 +82,11 @@ class WarnSettings(BaseModel):
     warn_decay_hours: int = Field(default=0, ge=0, description="Hours after which an unpunished warn expires (0 = no decay)")
     warn_cancel_btn: bool = Field(default=True, description="Attach inline cancel button to warn notices")
     custom_warn_msg: str = Field(default="", description="Custom template for warning notices configured via PM")
+    auto_warn_enabled: bool = Field(default=True, description="Master toggle for automated violation warnings")
+    warn_on_duplicate: bool = Field(default=True, description="Auto-warn on duplicate message repetitions")
+    duplicate_limit: int = Field(default=2, ge=2, le=10, description="Repeated message threshold before violation")
+    duplicate_window: int = Field(default=30, ge=5, le=300, description="Window in seconds for duplicate tracking")
+    warn_on_flood: bool = Field(default=True, description="Auto-warn on message flood / frequency breach")
 
 
 class ReportingSettings(BaseModel):
@@ -178,6 +183,11 @@ class ChatSettingsModel(BaseModel):
             "warn_duration": self.warnings.warn_duration,
             "warn_cancel_btn": getattr(self.warnings, "warn_cancel_btn", True),
             "custom_warn_msg": getattr(self.warnings, "custom_warn_msg", ""),
+            "auto_warn_enabled": getattr(self.warnings, "auto_warn_enabled", True),
+            "warn_on_duplicate": getattr(self.warnings, "warn_on_duplicate", True),
+            "duplicate_limit": getattr(self.warnings, "duplicate_limit", 2),
+            "duplicate_window": getattr(self.warnings, "duplicate_window", 30),
+            "warn_on_flood": getattr(self.warnings, "warn_on_flood", True),
             "excepted_admins": list(self.reporting.excepted_admin_ids),
             "clean_service_messages": self.clean_service_messages,
             "block_bots": self.block_bots,
@@ -234,6 +244,11 @@ class ChatSettingsModel(BaseModel):
             warn_duration=int(mem_dict.get("warn_duration", 86400)),
             warn_cancel_btn=bool(mem_dict.get("warn_cancel_btn", True)),
             custom_warn_msg=str(mem_dict.get("custom_warn_msg", "")),
+            auto_warn_enabled=bool(mem_dict.get("auto_warn_enabled", True)),
+            warn_on_duplicate=bool(mem_dict.get("warn_on_duplicate", True)),
+            duplicate_limit=int(mem_dict.get("duplicate_limit", 2)),
+            duplicate_window=int(mem_dict.get("duplicate_window", 30)),
+            warn_on_flood=bool(mem_dict.get("warn_on_flood", True)),
         )
         reporting = ReportingSettings(
             public_report_enabled=mem_dict.get("public_report_enabled", True),
