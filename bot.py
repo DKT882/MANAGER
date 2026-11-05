@@ -328,9 +328,13 @@ async def get_cached_chat_title(bot: Bot, chat_id: int, fallback: Optional[str] 
 
 async def wipe_trigger(message: Message) -> None:
     """
-    Instantly wipes the incoming admin trigger command message from the chat.
-    Executes BEFORE permission checks or command parsing to eliminate latency.
+    Instantly wipes the incoming admin trigger command message from GROUP chats.
+    In Private DMs (1-on-1 chats), the user's command message is NEVER deleted
+    to preserve their command history and prevent confusing message disappearance.
     """
+    if not message.chat or message.chat.type == ChatType.PRIVATE:
+        return
+
     try:
         await message.delete()
     except (TelegramBadRequest, TelegramForbiddenError, TelegramAPIError, Exception):
@@ -3440,9 +3444,6 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
     # --------------------------------------------------------------------------
     user_id = message.from_user.id if message.from_user else 0
     bot_user = await bot.get_me()
-
-    # Automatically wipe user trigger command in private DM to keep chat pristine
-    await wipe_trigger(message)
 
     # 2A. Deep link directly to a specific group's settings (e.g. /start group_-100123)
     if command and command.args:

@@ -221,6 +221,29 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         self.assertIs(h1, h2)
         self.assertTrue(asyncio.iscoroutinefunction(bot.render_keepalive_worker))
 
+    def test_wipe_trigger_preserves_dm_commands(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from aiogram.enums import ChatType
+
+        # Mock private chat message
+        dm_msg = MagicMock()
+        dm_msg.chat.type = ChatType.PRIVATE
+        dm_msg.delete = AsyncMock()
+
+        asyncio.run(bot.wipe_trigger(dm_msg))
+        # delete() MUST NOT be called in private chat
+        dm_msg.delete.assert_not_called()
+
+        # Mock group chat message
+        group_msg = MagicMock()
+        group_msg.chat.type = ChatType.SUPERGROUP
+        group_msg.delete = AsyncMock()
+
+        asyncio.run(bot.wipe_trigger(group_msg))
+        # delete() MUST be called in group chat
+        group_msg.delete.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
