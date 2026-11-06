@@ -178,6 +178,7 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "custom_filters": {},      # trigger -> reply text
     "magic_stickers_limit": 0, # max per minute (0 = off)
     "max_message_length": 0,   # chars (0 = off)
+    "msg_length_action": "delete", # 'delete' or 'warn'
     "log_channel_id": None,    # audit log channel ID
     # Reporting exception settings
     "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
@@ -1622,6 +1623,19 @@ async def message_media_and_link_interceptor(message: Message, bot: Bot) -> None
         if max_len > 0 and len(raw_text) > max_len:
             METRICS["violations_handled"] += 1
             await wipe_trigger(message)
+            act = settings.get("msg_length_action", "delete")
+            if act == "warn":
+                await issue_warn_and_notify(
+                    bot, chat_id, user, bot.id,
+                    f"Message exceeded maximum character limit ({len(raw_text)}/{max_len})"
+                )
+            else:
+                user_name = user.first_name if user else "User"
+                await send_ephemeral(
+                    message,
+                    f"⚠️ <b>{html.escape(user_name)}</b>, your message exceeded the maximum allowed length (<code>{len(raw_text)}/{max_len}</code> chars) and was deleted.",
+                    delay=4
+                )
             return
 
     # 8. Custom Trigger Filters (/filter)
@@ -2289,6 +2303,61 @@ async def handle_cmd_antispam(message: Message, command: CommandObject, bot: Bot
     DatabaseService.save_settings_background(chat_id, chat_title, settings)
     status_str = "🟢 ACTIVE" if settings.get("antispam_enabled", True) else "⚪ DISABLED"
     await send_ephemeral(message, f"🛡️ <b>Anti-Spam Engine:</b> {status_str}")
+
+
+@router.message(Command("msglength", "length", "setlen"))
+async def handle_cmd_msglength(message: Message, command: CommandObject, bot: Bot) -> None:
+    """Configures maximum message length limit and violation action (delete vs warn)."""
+    await wipe_trigger(message)
+    user_id = message.from_user.id if message.from_user else 0
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
+        await send_ephemeral(message, "⚠️ Only administrators can change message length settings.")
+        return
+
+    chat_id = message.chat.id
+    settings = CHAT_SETTINGS[chat_id]
+    arg = (command.args or "").strip().lower()
+
+    if not arg:
+        cur_len = settings.get("max_message_length", 0)
+        cur_act = settings.get("msg_length_action", "delete").upper()
+        cur_desc = f"{cur_len} chars" if cur_len > 0 else "Unlimited (Disabled)"
+        await send_ephemeral(
+            message,
+            f"📏 <b>Message Length Limit:</b> <code>{cur_desc}</code>\n"
+            f"🔨 <b>Violation Action:</b> <code>{cur_act}</code>\n\n"
+            "Usage: <code>/msglength &lt;0-4096&gt; [delete|warn]</code> or <code>/msglength off</code>"
+        )
+        return
+
+    tokens = arg.split()
+    first_token = tokens[0]
+
+    if first_token in ("off", "disable", "unlimited", "0"):
+        settings["max_message_length"] = 0
+    else:
+        try:
+            val = int(first_token)
+            if val < 0 or val > 4096:
+                await send_ephemeral(message, "⚠️ Message length must be between <code>0</code> and <code>4096</code>.")
+                return
+            settings["max_message_length"] = val
+        except ValueError:
+            await send_ephemeral(message, "⚠️ Invalid format. Usage: <code>/msglength &lt;0-4096&gt; [delete|warn]</code>")
+            return
+
+    if len(tokens) > 1:
+        act_token = tokens[1]
+        if act_token in ("warn", "delete"):
+            settings["msg_length_action"] = act_token
+
+    chat_title = await get_cached_chat_title(bot, chat_id, fallback="Group")
+    DatabaseService.save_settings_background(chat_id, chat_title, settings)
+    new_len = settings["max_message_length"]
+    new_act = settings.get("msg_length_action", "delete").upper()
+    new_desc = f"{new_len} chars" if new_len > 0 else "Unlimited (Disabled)"
+    await send_ephemeral(message, f"📏 <b>Message Length Limit:</b> <code>{new_desc}</code> (Action: <code>{new_act}</code>)")
 
 
 # ==============================================================================
@@ -3043,12 +3112,15 @@ def generate_magicstickers_keyboard(chat_id: int, is_dm: bool = False) -> Inline
 
 def format_msglength_text(chat_title: str, s: Dict[str, Any]) -> str:
     lim = s.get("max_message_length", 0)
-    lim_str = f"{lim} chars" if lim > 0 else "Unlimited"
+    lim_str = f"{lim} characters" if lim > 0 else "Unlimited (Disabled)"
+    action = s.get("msg_length_action", "delete").upper()
     return (
         "<b>Manager</b>\n"
         "📏 <b>Message Length Limit</b>\n"
         "Restrict wall-of-text spam messages.\n\n"
-        f"<b>Max Allowed Length:</b> <code>{lim_str}</code>"
+        f"<b>Max Allowed Length:</b> <code>{lim_str}</code>\n"
+        f"<b>Violation Action:</b> <code>{action}</code>\n\n"
+        "<i>Select a preset below, cycle through limits, toggle action, or tap ✍️ Custom:</i>"
     )
 
 
@@ -3056,10 +3128,40 @@ def generate_msglength_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyb
     prefix = "dm:" if is_dm else "set:"
     s = CHAT_SETTINGS[chat_id]
     lim = s.get("max_message_length", 0)
-    lim_str = f"{lim} chars" if lim > 0 else "Unlimited"
+    lim_str = f"{lim}" if lim > 0 else "Unlimited"
+    action = s.get("msg_length_action", "delete").upper()
+
+    def _btn(val: int) -> InlineKeyboardButton:
+        active = (lim == val)
+        label = "Off" if val == 0 else str(val)
+        text = f"🟢 {label}" if active else label
+        return InlineKeyboardButton(text=text, callback_data=f"{prefix}setlen:{val}:{chat_id}")
+
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📏 Limit: {lim_str}", callback_data=f"{prefix}cycle:max_message_length:{chat_id}:msglength")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}")],
+        [
+            InlineKeyboardButton(text=f"📏 Limit: {lim_str}", callback_data=f"{prefix}cycle:max_message_length:{chat_id}:msglength"),
+            InlineKeyboardButton(text=f"🔨 Action: {action}", callback_data=f"{prefix}cycle:msg_length_action:{chat_id}:msglength"),
+        ],
+        [
+            _btn(0),
+            _btn(100),
+            _btn(250),
+            _btn(500),
+        ],
+        [
+            _btn(750),
+            _btn(1000),
+            _btn(1500),
+            _btn(2000),
+        ],
+        [
+            _btn(3000),
+            _btn(4000),
+            InlineKeyboardButton(text="✍️ Custom", callback_data=f"{prefix}cust:msglength:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Back", callback_data=f"{prefix}page:2:{chat_id}"),
+        ],
     ])
 
 
@@ -3585,6 +3687,16 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
             if target_cid and await check_can_setup_bot(bot, target_cid, user_id):
                 PENDING_CUSTOM_INPUT[user_id] = (target_cid, subname_param)
                 title = await get_cached_chat_title(bot, target_cid)
+                if subname_param in ("msglength", "message_length", "length"):
+                    await send_or_replace_dm_settings(
+                        bot,
+                        user_id,
+                        f"📏 <b>Configure Message Length Limit</b>\n\n"
+                        f"<b>Group:</b> <code>{html.escape(title)}</code>\n\n"
+                        f"Please enter your custom character limit between <code>0</code> and <code>4096</code> (0 to disable):\n"
+                        f"<i>Send /cancel to abort.</i>"
+                    )
+                    return
                 nice_name = subname_param.replace("_", " ").title()
                 await send_or_replace_dm_settings(
                     bot,
@@ -4032,6 +4144,15 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         except ValueError:
             await query.answer()
             return
+    elif action == "setlen":
+        # format: prefix:setlen:<val>:<chat_id>
+        try:
+            target_len = int(parts[2])
+            chat_id = int(parts[3])
+        except (ValueError, IndexError):
+            await query.answer()
+            return
+        subname = "msglength"
     elif action in ("toggle", "cycle"):
         # e.g. set:toggle:<key>:<chat_id>:<subname>
         key = parts[2]
@@ -4122,6 +4243,19 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer(f"{key}: {status_str}")
         return
 
+    # 5B. Direct Message Length Preset Selection
+    if action == "setlen":
+        s["max_message_length"] = max(0, min(4096, target_len))
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu("msglength", chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        len_desc = f"{target_len} chars" if target_len > 0 else "Unlimited"
+        await query.answer(f"Length limit: {len_desc}")
+        return
+
     # 6. Generic Cycle Option
     if action == "cycle":
         cycles = {
@@ -4135,7 +4269,8 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
             "bot_action": ["ban", "kick"],
             "slow_mode": [0, 10, 30, 60],
             "magic_stickers_limit": [0, 3, 5],
-            "max_message_length": [0, 500, 1000, 2000],
+            "max_message_length": [0, 100, 250, 500, 750, 1000, 1500, 2000, 3000, 4000],
+            "msg_length_action": ["delete", "warn"],
             "banned_words_action": ["delete", "warn"],
         }
         options = cycles.get(key, ["delete", "warn"])
@@ -4155,6 +4290,17 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
     if action == "cust":
         if is_dm:
             PENDING_CUSTOM_INPUT[user_id] = (chat_id, subname)
+            if subname in ("msglength", "message_length", "length"):
+                await query.message.answer(
+                    "📏 <b>Enter custom maximum message length:</b>\n\n"
+                    "Please send an integer between <code>0</code> and <code>4096</code> characters.\n"
+                    "• <code>0</code> = Unlimited (Disable limit)\n"
+                    "• E.g. <code>1200</code> for 1,200 characters\n\n"
+                    "<i>Send /cancel to abort.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                await query.answer("Enter character limit in PM...")
+                return
             nice_name = subname.replace("_", " ").title()
             await query.message.answer(
                 f"✍️ <b>Please send your custom {nice_name} message now:</b>\n"
@@ -5035,6 +5181,38 @@ async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
                 f"────────────────────────\n\n"
                 f"⚠️ <i>Please confirm to dispatch this broadcast. It will be throttled at 25 msgs/sec.</i>",
                 reply_markup=confirm_kb,
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if subname in ("msglength", "message_length", "length"):
+            try:
+                val = int(custom_text)
+                if val < 0 or val > 4096:
+                    raise ValueError()
+            except ValueError:
+                PENDING_CUSTOM_INPUT[user_id] = (chat_id, subname)
+                await message.answer(
+                    "❌ <b>Invalid message length!</b>\n"
+                    "Please enter an integer between <code>0</code> and <code>4096</code> (0 to disable limit).\n\n"
+                    "<i>Send /cancel to abort.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            s["max_message_length"] = val
+            DatabaseService.save_settings_background(chat_id, chat_title, s)
+            lim_desc = f"{val} characters" if val > 0 else "Unlimited (Disabled)"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Return to Message Length Settings", callback_data=f"set:menu:msglength:{chat_id}")],
+                [InlineKeyboardButton(text="🏠 Main Menu", callback_data="dm:main_menu")]
+            ])
+            await message.answer(
+                f"✅ <b>Message Length Limit Updated!</b>\n\n"
+                f"<b>Group:</b> <code>{html.escape(chat_title)}</code>\n"
+                f"<b>Max Allowed Length:</b> <code>{lim_desc}</code>\n\n"
+                f"<i>Your updated configuration is live immediately across the group.</i>",
+                reply_markup=kb,
                 parse_mode=ParseMode.HTML
             )
             return
@@ -6009,6 +6187,7 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="warnflood", description="Configure flood frequency warning"),
         BotCommand(command="antiflood", description="Toggle anti-flood protection engine"),
         BotCommand(command="antispam", description="Toggle anti-spam links & quote engine"),
+        BotCommand(command="msglength", description="Configure message character length limit"),
         BotCommand(command="rules", description="View group regulations"),
         BotCommand(command="setrules", description="Configure regulations"),
         BotCommand(command="welcome", description="Preview welcome greeting"),

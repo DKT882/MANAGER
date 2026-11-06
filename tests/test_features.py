@@ -335,6 +335,55 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         approve_idx = call_order.index("approve_chat_join_request")
         self.assertLess(dm_idx, approve_idx, "Private DM MUST be dispatched BEFORE approving join request!")
 
+    def test_msglength_model_and_defaults(self):
+        self.assertIn("max_message_length", bot.DEFAULT_CHAT_CONFIG)
+        self.assertIn("msg_length_action", bot.DEFAULT_CHAT_CONFIG)
+        self.assertEqual(bot.DEFAULT_CHAT_CONFIG["msg_length_action"], "delete")
+
+        model = ChatSettingsModel(
+            chat_id=-100999,
+            max_message_length=1500,
+            msg_length_action="warn"
+        )
+        self.assertEqual(model.max_message_length, 1500)
+        self.assertEqual(model.msg_length_action, "warn")
+
+        d = model.to_in_memory_dict()
+        self.assertEqual(d["max_message_length"], 1500)
+        self.assertEqual(d["msg_length_action"], "warn")
+
+        restored = ChatSettingsModel.from_in_memory_dict(-100999, "Test Chat", d)
+        self.assertEqual(restored.max_message_length, 1500)
+        self.assertEqual(restored.msg_length_action, "warn")
+
+    def test_msglength_menu_formatting_and_keyboard(self):
+        chat_id = -100444555
+        bot.CHAT_SETTINGS[chat_id] = {
+            "max_message_length": 1000,
+            "msg_length_action": "warn"
+        }
+        text = bot.format_msglength_text("My Test Group", bot.CHAT_SETTINGS[chat_id])
+        self.assertIn("Message Length Limit", text)
+        self.assertIn("1000 characters", text)
+        self.assertIn("WARN", text)
+
+        kb = bot.generate_msglength_keyboard(chat_id, is_dm=True)
+        all_buttons = [btn for row in kb.inline_keyboard for btn in row]
+        callback_datas = [btn.callback_data for btn in all_buttons]
+        button_texts = [btn.text for btn in all_buttons]
+
+        # Preset checking
+        self.assertTrue(any("dm:setlen:100:" in d for d in callback_datas))
+        self.assertTrue(any("dm:setlen:500:" in d for d in callback_datas))
+        self.assertTrue(any("dm:setlen:1000:" in d for d in callback_datas))
+        self.assertTrue(any("dm:setlen:4000:" in d for d in callback_datas))
+        self.assertTrue(any("🟢 1000" in t for t in button_texts))
+
+        # Action toggle and custom buttons
+        self.assertTrue(any("dm:cycle:msg_length_action:" in d for d in callback_datas))
+        self.assertTrue(any("dm:cust:msglength:" in d for d in callback_datas))
+        self.assertTrue(any("dm:page:2:" in d for d in callback_datas))
+
 
 if __name__ == "__main__":
     unittest.main()

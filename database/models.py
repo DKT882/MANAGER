@@ -142,6 +142,8 @@ class ChatSettingsModel(BaseModel):
     welcome_pm_enabled: bool = Field(default=False, description="Send private DM welcome greeting when member request is accepted")
     welcome_pm_msg: str = Field(default="👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉", description="Custom private DM welcome template")
     antispam_enabled: bool = Field(default=True, description="Master toggle for all anti-spam restrictions")
+    max_message_length: int = Field(default=0, description="Max allowed characters per message (0 = disabled)")
+    msg_length_action: str = Field(default="delete", description="Enforcement action on message length violation: delete or warn")
 
     # Future-Proofing Extensibility Bags
     feature_flags: Dict[str, bool] = Field(
@@ -197,6 +199,8 @@ class ChatSettingsModel(BaseModel):
             "welcome_pm_enabled": getattr(self, "welcome_pm_enabled", False),
             "welcome_pm_msg": getattr(self, "welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"),
             "antispam_enabled": getattr(self, "antispam_enabled", True),
+            "max_message_length": getattr(self, "max_message_length", 0),
+            "msg_length_action": getattr(self, "msg_length_action", "delete"),
         })
         return data
 
@@ -274,6 +278,8 @@ class ChatSettingsModel(BaseModel):
             welcome_pm_enabled=mem_dict.get("welcome_pm_enabled", False),
             welcome_pm_msg=mem_dict.get("welcome_pm_msg", "👋 Hello {name}!\nYour request to join <b>{chat_title}</b> has been approved! Welcome to the group! 🎉"),
             antispam_enabled=mem_dict.get("antispam_enabled", True),
+            max_message_length=mem_dict.get("max_message_length", 0),
+            msg_length_action=mem_dict.get("msg_length_action", "delete"),
             custom_attributes=custom_attrs,
         )
 
