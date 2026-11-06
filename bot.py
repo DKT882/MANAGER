@@ -2305,61 +2305,6 @@ async def handle_cmd_antispam(message: Message, command: CommandObject, bot: Bot
     await send_ephemeral(message, f"🛡️ <b>Anti-Spam Engine:</b> {status_str}")
 
 
-@router.message(Command("msglength", "length", "setlen"))
-async def handle_cmd_msglength(message: Message, command: CommandObject, bot: Bot) -> None:
-    """Configures maximum message length limit and violation action (delete vs warn)."""
-    await wipe_trigger(message)
-    user_id = message.from_user.id if message.from_user else 0
-    sender_chat_id = message.sender_chat.id if message.sender_chat else None
-    if not await check_admin_rights(bot, message.chat.id, user_id, "can_restrict_members", sender_chat_id=sender_chat_id):
-        await send_ephemeral(message, "⚠️ Only administrators can change message length settings.")
-        return
-
-    chat_id = message.chat.id
-    settings = CHAT_SETTINGS[chat_id]
-    arg = (command.args or "").strip().lower()
-
-    if not arg:
-        cur_len = settings.get("max_message_length", 0)
-        cur_act = settings.get("msg_length_action", "delete").upper()
-        cur_desc = f"{cur_len} chars" if cur_len > 0 else "Unlimited (Disabled)"
-        await send_ephemeral(
-            message,
-            f"📏 <b>Message Length Limit:</b> <code>{cur_desc}</code>\n"
-            f"🔨 <b>Violation Action:</b> <code>{cur_act}</code>\n\n"
-            "Usage: <code>/msglength &lt;0-4096&gt; [delete|warn]</code> or <code>/msglength off</code>"
-        )
-        return
-
-    tokens = arg.split()
-    first_token = tokens[0]
-
-    if first_token in ("off", "disable", "unlimited", "0"):
-        settings["max_message_length"] = 0
-    else:
-        try:
-            val = int(first_token)
-            if val < 0 or val > 4096:
-                await send_ephemeral(message, "⚠️ Message length must be between <code>0</code> and <code>4096</code>.")
-                return
-            settings["max_message_length"] = val
-        except ValueError:
-            await send_ephemeral(message, "⚠️ Invalid format. Usage: <code>/msglength &lt;0-4096&gt; [delete|warn]</code>")
-            return
-
-    if len(tokens) > 1:
-        act_token = tokens[1]
-        if act_token in ("warn", "delete"):
-            settings["msg_length_action"] = act_token
-
-    chat_title = await get_cached_chat_title(bot, chat_id, fallback="Group")
-    DatabaseService.save_settings_background(chat_id, chat_title, settings)
-    new_len = settings["max_message_length"]
-    new_act = settings.get("msg_length_action", "delete").upper()
-    new_desc = f"{new_len} chars" if new_len > 0 else "Unlimited (Disabled)"
-    await send_ephemeral(message, f"📏 <b>Message Length Limit:</b> <code>{new_desc}</code> (Action: <code>{new_act}</code>)")
-
-
 # ==============================================================================
 # INTERACTIVE SETTINGS UI (MATCHING BIOLINK RESTRICTOR ARCHITECTURE)
 # ==============================================================================
@@ -6187,7 +6132,6 @@ async def setup_bot_commands(bot: Bot) -> None:
         BotCommand(command="warnflood", description="Configure flood frequency warning"),
         BotCommand(command="antiflood", description="Toggle anti-flood protection engine"),
         BotCommand(command="antispam", description="Toggle anti-spam links & quote engine"),
-        BotCommand(command="msglength", description="Configure message character length limit"),
         BotCommand(command="rules", description="View group regulations"),
         BotCommand(command="setrules", description="Configure regulations"),
         BotCommand(command="welcome", description="Preview welcome greeting"),
