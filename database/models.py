@@ -67,7 +67,7 @@ class AntiFloodSettings(BaseModel):
     flood_window: float = Field(default=3.0, ge=0.5, le=60.0, description="Window time frame in seconds")
     flood_limit: int = Field(default=5, ge=1, le=100, description="Maximum messages allowed inside window")
     action: ViolationAction = Field(default=ViolationAction.MUTE, description="Automated enforcement action")
-    mute_duration: int = Field(default=900, ge=60, description="Mute duration in seconds upon violation")
+    mute_duration: int = Field(default=900, ge=0, description="Mute duration in seconds upon violation")
 
 
 class WarnSettings(BaseModel):
@@ -78,7 +78,8 @@ class WarnSettings(BaseModel):
 
     warn_limit: int = Field(default=3, ge=1, le=20, description="Threshold of warnings before punishment")
     warn_action: ViolationAction = Field(default=ViolationAction.MUTE, description="Ceiling enforcement action")
-    warn_duration: int = Field(default=86400, ge=60, description="Penalty duration in seconds (e.g. 24h)")
+    warn_duration: int = Field(default=86400, ge=0, description="Penalty duration in seconds (0 = Permanent)")
+    warn_expiry: int = Field(default=0, ge=0, description="Seconds after which active warnings auto-expire (0 = Never)")
     warn_decay_hours: int = Field(default=0, ge=0, description="Hours after which an unpunished warn expires (0 = no decay)")
     warn_cancel_btn: bool = Field(default=True, description="Attach inline cancel button to warn notices")
     custom_warn_msg: str = Field(default="", description="Custom template for warning notices configured via PM")
@@ -184,6 +185,7 @@ class ChatSettingsModel(BaseModel):
             "warn_limit": self.warnings.warn_limit,
             "warn_action": self.warnings.warn_action.value if hasattr(self.warnings.warn_action, "value") else str(self.warnings.warn_action),
             "warn_duration": self.warnings.warn_duration,
+            "warn_expiry": getattr(self.warnings, "warn_expiry", 0),
             "warn_cancel_btn": getattr(self.warnings, "warn_cancel_btn", True),
             "custom_warn_msg": getattr(self.warnings, "custom_warn_msg", ""),
             "auto_warn_enabled": getattr(self.warnings, "auto_warn_enabled", True),
@@ -248,6 +250,7 @@ class ChatSettingsModel(BaseModel):
             warn_limit=int(mem_dict.get("warn_limit", 3)),
             warn_action=warn_action,
             warn_duration=int(mem_dict.get("warn_duration", 86400)),
+            warn_expiry=int(mem_dict.get("warn_expiry", 0)),
             warn_cancel_btn=bool(mem_dict.get("warn_cancel_btn", True)),
             custom_warn_msg=str(mem_dict.get("custom_warn_msg", "")),
             auto_warn_enabled=bool(mem_dict.get("auto_warn_enabled", True)),

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone, date
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from .connection import MongoDBManager, get_db
 from .models import (
     ChatSettingsModel,
@@ -67,9 +67,29 @@ class DatabaseService:
         return count
 
     @staticmethod
-    async def hydrate_warn_cache(warn_cache_dict: Dict[int, Dict[int, int]]) -> int:
+    def _to_epoch(val: Any) -> Optional[float]:
+        """Converts datetime or ISO timestamp string safely to UTC epoch float."""
+        if isinstance(val, datetime):
+            dt = val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        if isinstance(val, str):
+            try:
+                dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    async def hydrate_warn_cache(
+        warn_cache_dict: Dict[int, Dict[int, int]],
+        warn_ts_dict: Optional[Dict[int, Dict[int, float]]] = None
+    ) -> int:
         """
         Loads active user warning counters from MongoDB into the bot's runtime warn cache.
+        Optionally populates warn_ts_dict with last_warned_at UTC epoch timestamps.
         """
         db = get_db()
         if db is None:
@@ -80,15 +100,19 @@ class DatabaseService:
             # Bandwidth & RAM optimized projection: load strictly active counters
             cursor = db.user_warnings.find(
                 {"warn_count": {"$gt": 0}},
-                {"_id": 0, "chat_id": 1, "user_id": 1, "warn_count": 1}
+                {"_id": 0, "chat_id": 1, "user_id": 1, "warn_count": 1, "last_warned_at": 1}
             )
             async for doc in cursor:
                 chat_id = doc.get("chat_id")
                 user_id = doc.get("user_id")
-                warn_count = doc.get("warn_count", 0)
+                warn_count = int(doc.get("warn_count", 0))
 
-                if chat_id and user_id:
+                if chat_id and user_id and warn_count > 0:
                     warn_cache_dict[chat_id][user_id] = warn_count
+                    if warn_ts_dict is not None:
+                        ts = DatabaseService._to_epoch(doc.get("last_warned_at"))
+                        if ts is not None:
+                            warn_ts_dict[chat_id][user_id] = ts
                     count += 1
 
             print(f"[DATABASE] Hydrated {count} active user warnings into memory cache.")
@@ -96,6 +120,28 @@ class DatabaseService:
             print(f"[DATABASE ERROR] Failed to hydrate warnings: {e}")
 
         return count
+
+    @staticmethod
+    async def get_user_warn_state(chat_id: int, user_id: int) -> Tuple[int, Optional[float]]:
+        """
+        Reads a single user's active warn count and last_warned_at epoch from MongoDB.
+        Used strictly as a cache-miss safeguard so warnings never reset unexpectedly.
+        """
+        db = get_db()
+        if db is None or not MongoDBManager.is_connected():
+            return 0, None
+        try:
+            doc = await db.user_warnings.find_one(
+                {"chat_id": chat_id, "user_id": user_id},
+                {"_id": 0, "warn_count": 1, "last_warned_at": 1}
+            )
+            if not doc:
+                return 0, None
+            cnt = max(0, int(doc.get("warn_count", 0)))
+            ts = DatabaseService._to_epoch(doc.get("last_warned_at"))
+            return cnt, ts
+        except Exception:
+            return 0, None
 
     # --------------------------------------------------------------------------
     # 2. Write-Behind Persistence (Chat Settings)

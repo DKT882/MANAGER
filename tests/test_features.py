@@ -384,6 +384,132 @@ class TestAcceptedMembersAndPMWelcome(unittest.TestCase):
         self.assertTrue(any("dm:cust:msglength:" in d for d in callback_datas))
         self.assertTrue(any("dm:page:2:" in d for d in callback_datas))
 
+    def test_duration_formatting_and_parsing(self):
+        self.assertEqual(bot.format_duration(0), "Permanent")
+        self.assertEqual(bot.format_duration(0, zero_label="Never"), "Never")
+        self.assertEqual(bot.format_duration(900), "15m")
+        self.assertEqual(bot.format_duration(86400), "1d")
+        self.assertEqual(bot.format_duration(604800), "1w")
+        self.assertEqual(bot.format_duration(5184000), "2mo")
+        self.assertEqual(bot.format_duration_long(5184000), "2 months")
+
+        self.assertEqual(bot.parse_custom_duration_input("1d"), 86400)
+        self.assertEqual(bot.parse_custom_duration_input("1w"), 604800)
+        self.assertEqual(bot.parse_custom_duration_input("2mo"), 5184000)
+        self.assertEqual(bot.parse_custom_duration_input("2M"), 5184000)
+        self.assertEqual(bot.parse_custom_duration_input("15m"), 900)
+        self.assertEqual(bot.parse_custom_duration_input("0"), 0)
+        self.assertEqual(bot.parse_custom_duration_input("never"), 0)
+        self.assertIsNone(bot.parse_custom_duration_input("invalid_dur"))
+
+    def test_warndur_and_expiry_menus_and_model(self):
+        # Permanent duration (0) must validate cleanly without Pydantic ge=60 error
+        model = ChatSettingsModel.from_in_memory_dict(
+            -100777888,
+            "Duration Test Group",
+            {"warn_duration": 0, "warn_expiry": 604800}
+        )
+        self.assertEqual(model.warnings.warn_duration, 0)
+        self.assertEqual(model.warnings.warn_expiry, 604800)
+        mem = model.to_in_memory_dict()
+        self.assertEqual(mem["warn_duration"], 0)
+        self.assertEqual(mem["warn_expiry"], 604800)
+
+        chat_id = -100777888
+        bot.CHAT_SETTINGS[chat_id]["warn_duration"] = 5184000  # 2mo
+        bot.CHAT_SETTINGS[chat_id]["warn_expiry"] = 604800    # 1w
+
+        dur_text, dur_kb = bot.render_submenu("warndur", "Duration Test", bot.CHAT_SETTINGS[chat_id], chat_id, is_dm=True)
+        self.assertIn("2 months", dur_text)
+        dur_cb = [btn.callback_data for row in dur_kb.inline_keyboard for btn in row if btn.callback_data]
+        dur_labels = [btn.text for row in dur_kb.inline_keyboard for btn in row]
+        self.assertTrue(any("dm:setwarndur:86400:" in d for d in dur_cb))
+        self.assertTrue(any("dm:setwarndur:604800:" in d for d in dur_cb))
+        self.assertTrue(any("dm:setwarndur:5184000:" in d for d in dur_cb))
+        self.assertTrue(any("🟢 2mo" in t for t in dur_labels))
+        self.assertTrue(any("dm:cust:warndur:" in d for d in dur_cb))
+
+        exp_text, exp_kb = bot.render_submenu("warnexpiry", "Duration Test", bot.CHAT_SETTINGS[chat_id], chat_id, is_dm=True)
+        self.assertIn("1 week", exp_text)
+        exp_cb = [btn.callback_data for row in exp_kb.inline_keyboard for btn in row if btn.callback_data]
+        exp_labels = [btn.text for row in exp_kb.inline_keyboard for btn in row]
+        self.assertTrue(any("dm:setwarnexp:604800:" in d for d in exp_cb))
+        self.assertTrue(any("🟢 1w" in t for t in exp_labels))
+        self.assertTrue(any("dm:cust:warnexpiry:" in d for d in exp_cb))
+
+    def test_warn_counter_increments_and_db_fallback(self):
+        import asyncio
+        import time
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        chat_id = -100666777
+        user_id = 555444333
+        bot.WARN_CACHE.clear()
+        bot.WARN_TIMESTAMPS.clear()
+        bot.CHAT_SETTINGS[chat_id] = {
+            **bot.DEFAULT_CHAT_CONFIG,
+            "warn_limit": 3,
+            "warn_action": "mute",
+            "warn_duration": 86400,
+            "warn_expiry": 0,
+            "auto_warn_enabled": True,
+        }
+        bot.CHAT_TITLES[chat_id] = "Warn Sequence Group"
+
+        sent_texts = []
+        recorded_counts = []
+
+        mock_bot = MagicMock()
+        mock_bot.id = 999000
+
+        async def fake_send_message(chat_id, text, **kwargs):
+            sent_texts.append(text)
+            return MagicMock()
+
+        mock_bot.send_message = AsyncMock(side_effect=fake_send_message)
+        mock_bot.restrict_chat_member = AsyncMock(return_value=True)
+
+        target_user = MagicMock()
+        target_user.id = user_id
+        target_user.full_name = "Test Member"
+        target_user.username = "test_member"
+
+        def fake_record_warn(cid, uid, admin_id, reason, current_count):
+            recorded_counts.append(current_count)
+
+        with patch.object(bot.DatabaseService, "get_user_warn_state", new=AsyncMock(return_value=(0, None))), \
+             patch.object(bot.DatabaseService, "record_warn_background", side_effect=fake_record_warn), \
+             patch.object(bot.DatabaseService, "log_moderation_background"):
+
+            async def run_seq():
+                # 1st warn -> 1/3
+                await bot.issue_warn_and_notify(mock_bot, chat_id, target_user, 111, "Violation 1")
+                # 2nd warn -> 2/3
+                await bot.issue_warn_and_notify(mock_bot, chat_id, target_user, 111, "Violation 2")
+                # 3rd warn -> ceiling reached (punish & reset)
+                await bot.issue_warn_and_notify(mock_bot, chat_id, target_user, 111, "Violation 3")
+
+            asyncio.run(run_seq())
+
+        self.assertEqual(recorded_counts, [1, 2, 0])
+        self.assertIn("1/3", sent_texts[0])
+        self.assertIn("2/3", sent_texts[1])
+        self.assertIn("WARNING CEILING REACHED", sent_texts[2])
+        self.assertEqual(bot.WARN_CACHE[chat_id].get(user_id, 0), 0)
+        mock_bot.restrict_chat_member.assert_awaited_once()
+
+        # Verify cache-miss restores persisted DB count instead of restarting at 1/3
+        bot.WARN_CACHE.clear()
+        bot.WARN_TIMESTAMPS.clear()
+        sent_texts.clear()
+        with patch.object(bot.DatabaseService, "get_user_warn_state", new=AsyncMock(return_value=(1, time.time()))), \
+             patch.object(bot.DatabaseService, "record_warn_background", side_effect=fake_record_warn), \
+             patch.object(bot.DatabaseService, "log_moderation_background"):
+            asyncio.run(bot.issue_warn_and_notify(mock_bot, chat_id, target_user, 111, "After Cache Miss"))
+
+        self.assertIn("2/3", sent_texts[0])
+        self.assertEqual(bot.WARN_CACHE[chat_id][user_id], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

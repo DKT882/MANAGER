@@ -47,8 +47,8 @@ class MongoDBManager:
                 maxPoolSize=3,
                 minPoolSize=1,
                 maxIdleTimeMS=45000,
-                serverSelectionTimeoutMS=2500,
-                connectTimeoutMS=2500,
+                serverSelectionTimeoutMS=6000,
+                connectTimeoutMS=6000,
                 compressors="zlib",
                 zlibCompressionLevel=6,
             )

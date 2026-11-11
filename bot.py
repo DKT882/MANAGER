@@ -8,6 +8,7 @@ Features: In-memory Caching, Instant Wipe Trigger, Strict Parallel Native Admin 
 from __future__ import annotations
 
 import asyncio
+import copy
 import html
 import json
 import os
@@ -113,6 +114,7 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "warn_limit": 3,           # Ceiling before automated penalty (1 to 10)
     "warn_action": "mute",     # Automated ceiling action: 'mute', 'ban', 'kick'
     "warn_duration": 86400,    # Penalty duration in seconds (0 = permanent)
+    "warn_expiry": 0,          # Seconds after which active warnings auto-expire (0 = never)
     "warn_cancel_btn": True,   # Attach inline Cancel Warn button to warn notices
     "custom_warn_msg": "",     # Custom warn notice template configured in private DM
     "warn_on_duplicate": True, # Auto-warn on duplicate message repetitions
@@ -184,11 +186,31 @@ DEFAULT_CHAT_CONFIG: Dict[str, Any] = {
     "excepted_admins": [],     # List of admin user IDs explicitly designated to receive reports
 }
 
-# CHAT_SETTINGS: chat_id -> configuration dict
-CHAT_SETTINGS: Dict[int, Dict[str, Any]] = defaultdict(lambda: DEFAULT_CHAT_CONFIG.copy())
+# CHAT_SETTINGS: chat_id -> configuration dict (deepcopy avoids sharing mutable lists/dicts across chats)
+CHAT_SETTINGS: Dict[int, Dict[str, Any]] = defaultdict(lambda: copy.deepcopy(DEFAULT_CHAT_CONFIG))
 
 # WARN_CACHE: chat_id -> user_id -> count
 WARN_CACHE: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+# WARN_TIMESTAMPS: chat_id -> user_id -> UTC epoch float of most recent warning
+WARN_TIMESTAMPS: Dict[int, Dict[int, float]] = defaultdict(dict)
+
+# WARN_LOCKS: (chat_id, user_id) -> asyncio.Lock (serializes concurrent warns for same user)
+WARN_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+
+def _get_warn_lock(chat_id: int, user_id: int) -> asyncio.Lock:
+    key = (chat_id, user_id)
+    lock = WARN_LOCKS.get(key)
+    if lock is None:
+        if len(WARN_LOCKS) > 5000:
+            # Prune unlocked entries if map grows large
+            unlocked = [k for k, v in list(WARN_LOCKS.items()) if not v.locked()]
+            for k in unlocked[:2500]:
+                WARN_LOCKS.pop(k, None)
+        lock = asyncio.Lock()
+        WARN_LOCKS[key] = lock
+    return lock
 
 # FLOOD_CACHE: chat_id -> user_id -> deque of monotonic timestamps
 FLOOD_CACHE: Dict[int, Dict[int, deque]] = defaultdict(lambda: defaultdict(deque))
@@ -251,7 +273,7 @@ PENDING_BROADCAST: Dict[str, Dict[str, Any]] = {}
 GLOBAL_BOT: Optional[Bot] = None
 
 # Pre-compiled high-performance regex patterns
-RE_DURATION = re.compile(r"^(\d+)([smhdw]?)$")
+RE_DURATION = re.compile(r"^(\d+)\s*([a-zA-Z]*)$")
 RE_LINK = re.compile(r"(https?://\S+|t\.me/\S+|telegram\.me/\S+)", re.IGNORECASE)
 RE_TG_LINK = re.compile(r"(t\.me/\S+|telegram\.me/\S+|telegram\.dog/\S+)", re.IGNORECASE)
 RE_ARABIC = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
@@ -289,17 +311,48 @@ def format_uptime(total_seconds: int) -> str:
     return f"{hours}h {minutes}m {secs}s"
 
 
-def format_duration(seconds: int) -> str:
-    """Formats duration seconds into human-readable label."""
+def format_duration(seconds: int, zero_label: str = "Permanent") -> str:
+    """Formats duration seconds into compact human-readable label (e.g. 15m, 1d, 1w, 2mo)."""
     if seconds <= 0:
-        return "Permanent"
+        return zero_label
     if seconds < 60:
         return f"{seconds}s"
     if seconds < 3600:
         return f"{seconds // 60}m"
     if seconds < 86400:
         return f"{seconds // 3600}h"
+    if seconds >= 31536000 and seconds % 31536000 == 0:
+        return f"{seconds // 31536000}y"
+    if seconds >= 2592000 and seconds % 2592000 == 0:
+        return f"{seconds // 2592000}mo"
+    if seconds >= 604800 and seconds % 604800 == 0:
+        return f"{seconds // 604800}w"
     return f"{seconds // 86400}d"
+
+
+def format_duration_long(seconds: int, zero_label: str = "Permanent") -> str:
+    """Formats duration seconds into explicit human-readable text (e.g. '2 months', '1 week')."""
+    if seconds <= 0:
+        return zero_label
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+    if seconds < 3600:
+        m = seconds // 60
+        return f"{m} minute{'s' if m != 1 else ''}"
+    if seconds < 86400:
+        h = seconds // 3600
+        return f"{h} hour{'s' if h != 1 else ''}"
+    if seconds >= 31536000 and seconds % 31536000 == 0:
+        y = seconds // 31536000
+        return f"{y} year{'s' if y != 1 else ''}"
+    if seconds >= 2592000 and seconds % 2592000 == 0:
+        mo = seconds // 2592000
+        return f"{mo} month{'s' if mo != 1 else ''}"
+    if seconds >= 604800 and seconds % 604800 == 0:
+        w = seconds // 604800
+        return f"{w} week{'s' if w != 1 else ''}"
+    d = seconds // 86400
+    return f"{d} day{'s' if d != 1 else ''}"
 
 # ==============================================================================
 # INSTANT WIPE & PARALLEL NATIVE ADMIN RIGHTS ENGINE
@@ -582,31 +635,79 @@ async def check_can_setup_bot(
         return False
 
 
+_UNIT_MULTIPLIERS: Dict[str, Tuple[int, str]] = {
+    "s": (1, "s"), "sec": (1, "s"), "secs": (1, "s"), "second": (1, "s"), "seconds": (1, "s"),
+    "m": (60, "m"), "min": (60, "m"), "mins": (60, "m"), "minute": (60, "m"), "minutes": (60, "m"),
+    "h": (3600, "h"), "hr": (3600, "h"), "hrs": (3600, "h"), "hour": (3600, "h"), "hours": (3600, "h"),
+    "d": (86400, "d"), "day": (86400, "d"), "days": (86400, "d"),
+    "w": (604800, "w"), "wk": (604800, "w"), "wks": (604800, "w"), "week": (604800, "w"), "weeks": (604800, "w"),
+    "mo": (2592000, "mo"), "mon": (2592000, "mo"), "month": (2592000, "mo"), "months": (2592000, "mo"),
+    "y": (31536000, "y"), "yr": (31536000, "y"), "yrs": (31536000, "y"), "year": (31536000, "y"), "years": (31536000, "y"),
+    "": (60, "m"),
+}
+
+
 def parse_time_duration(duration_str: Optional[str]) -> Tuple[int, str]:
     """
-    Converts duration strings (e.g. 30s, 5m, 2h, 1d, 1w) into seconds and clean label.
-    Default fallback: 0 (permanent / indefinite).
+    Converts duration strings (e.g. 30s, 5m, 2h, 1d, 1w, 2mo, 2M) into seconds and clean label.
+    Uppercase 'M' denotes months; lowercase 'm' denotes minutes. Default fallback: 0 (permanent).
     """
     if not duration_str:
         return 0, "indefinitely"
 
-    match = RE_DURATION.match(duration_str.strip().lower())
+    cleaned = duration_str.strip()
+    match = RE_DURATION.match(cleaned)
     if not match:
         return 0, "indefinitely"
 
-    val, unit = match.groups()
+    val, raw_unit = match.groups()
     amount = int(val)
-    multiplier = {
-        "s": 1,
-        "m": 60,
-        "h": 3600,
-        "d": 86400,
-        "w": 604800,
-        "": 60,  # Default to minutes if unit is omitted
-    }.get(unit, 60)
+    if raw_unit == "M":
+        mult, label = 2592000, "mo"
+    else:
+        entry = _UNIT_MULTIPLIERS.get(raw_unit.lower())
+        if not entry:
+            return 0, "indefinitely"
+        mult, label = entry
 
-    seconds = amount * multiplier
-    return seconds, f"{amount}{unit or 'm'}"
+    seconds = amount * mult
+    return seconds, f"{amount}{label}"
+
+
+def parse_custom_duration_input(raw_str: str) -> Optional[int]:
+    """
+    Parses custom admin duration input from private DM settings (e.g. '1d', '1w', '2mo', '2M', '15m', '0', 'never').
+    Returns duration in seconds (0 = permanent/never), or None if invalid/out of bounds.
+    """
+    if not raw_str:
+        return None
+    cleaned = raw_str.strip()
+    low = cleaned.lower()
+    if low in ("0", "off", "never", "permanent", "perm", "forever", "unlimited", "disable", "disabled"):
+        return 0
+
+    match = RE_DURATION.match(cleaned)
+    if not match:
+        return None
+
+    val_str, raw_unit = match.groups()
+    amount = int(val_str)
+    if amount <= 0:
+        return 0
+
+    if raw_unit == "M":
+        mult = 2592000
+    else:
+        entry = _UNIT_MULTIPLIERS.get(raw_unit.lower())
+        if not entry:
+            return None
+        mult = entry[0]
+
+    total_seconds = amount * mult
+    # Telegram restriction bounds: minimum 30s (sub-30s treated as forever), cap at 365 days
+    if total_seconds < 30 or total_seconds > 31536000:
+        return None
+    return total_seconds
 
 
 async def resolve_target(
@@ -712,6 +813,9 @@ def format_warn_notice(
     s = CHAT_SETTINGS[chat_id]
     custom_tpl = s.get("custom_warn_msg", "").strip()
     action_str = s.get("warn_action", "mute").upper()
+    dur_str = format_duration(int(s.get("warn_duration", 86400)))
+    exp_sec = int(s.get("warn_expiry", 0))
+    exp_str = format_duration(exp_sec, zero_label="Never")
     user_mention = f"<a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a>"
     username_str = f"@{user.username}" if user.username else user.full_name
 
@@ -725,16 +829,20 @@ def format_warn_notice(
         res = res.replace("{limit}", str(ceiling))
         res = res.replace("{remaining}", str(max(0, ceiling - count)))
         res = res.replace("{action}", action_str)
+        res = res.replace("{duration}", dur_str)
+        res = res.replace("{expiry}", exp_str)
         res = res.replace("{chat}", html.escape(chat_title))
         return res
 
+    expiry_line = f"\n⏳ <b>Warn Expires in:</b> <code>{exp_str}</code>" if exp_sec > 0 else ""
     return (
         f"⚠️ <b>ANTI-SPAM WARNING NOTICE</b>\n\n"
         f"👤 <b>User:</b> {user_mention}\n"
         f"🏷️ <b>Group:</b> <code>{html.escape(chat_title)}</code>\n"
         f"📋 <b>Reason:</b> {html.escape(reason)}\n"
         f"🔢 <b>Warnings:</b> <b>{count}/{ceiling}</b>\n"
-        f"⚖️ <b>Penalty on {ceiling} warns:</b> <code>{action_str}</code>"
+        f"⚖️ <b>Penalty on {ceiling} warns:</b> <code>{action_str}</code> ({dur_str})"
+        f"{expiry_line}"
     )
 
 
@@ -763,6 +871,8 @@ async def issue_warn_and_notify(
     Issues a warning increment in memory and MongoDB, evaluates warning ceiling,
     enforces automated penalty if reached, or sends customizable warning notice
     with optional inline Cancel Warn button (cancellable by any administrator).
+    Serialized per (chat_id, user_id) and backed by MongoDB fallback so warn counts
+    always progress reliably (1/3 -> 2/3 -> 3/3) and never silently reset.
     """
     settings = CHAT_SETTINGS[chat_id]
 
@@ -770,23 +880,49 @@ async def issue_warn_and_notify(
     if admin_id == bot.id and not settings.get("auto_warn_enabled", True):
         return
 
-    ceiling = settings.get("warn_limit", 3)
+    ceiling = max(1, int(settings.get("warn_limit", 3)))
+    warn_expiry = int(settings.get("warn_expiry", 0))
 
-    WARN_CACHE[chat_id][target_user.id] += 1
-    current_warns = WARN_CACHE[chat_id][target_user.id]
+    async with _get_warn_lock(chat_id, target_user.id):
+        # Cache-miss safeguard: hydrate existing count from MongoDB if missing from RAM
+        if target_user.id not in WARN_CACHE.get(chat_id, {}):
+            db_count, db_ts = await DatabaseService.get_user_warn_state(chat_id, target_user.id)
+            if db_count > 0:
+                WARN_CACHE[chat_id][target_user.id] = db_count
+                if db_ts is not None:
+                    WARN_TIMESTAMPS[chat_id][target_user.id] = db_ts
 
-    DatabaseService.record_warn_background(chat_id, target_user.id, admin_id, reason, current_warns)
-    DatabaseService.log_moderation_background(chat_id, admin_id, target_user.id, "warn", reason)
+        # Enforce Warn Auto-Expiry if configured (> 0)
+        now_epoch = time.time()
+        if warn_expiry > 0:
+            last_ts = WARN_TIMESTAMPS.get(chat_id, {}).get(target_user.id)
+            if last_ts is not None and (now_epoch - last_ts) >= warn_expiry:
+                WARN_CACHE[chat_id].pop(target_user.id, None)
+                WARN_TIMESTAMPS[chat_id].pop(target_user.id, None)
+
+        WARN_CACHE[chat_id][target_user.id] += 1
+        WARN_TIMESTAMPS[chat_id][target_user.id] = now_epoch
+        current_warns = WARN_CACHE[chat_id][target_user.id]
+        reached_ceiling = current_warns >= ceiling
+
+        if reached_ceiling:
+            WARN_CACHE[chat_id].pop(target_user.id, None)
+            if not WARN_CACHE[chat_id]:
+                WARN_CACHE.pop(chat_id, None)
+            WARN_TIMESTAMPS[chat_id].pop(target_user.id, None)
+            if not WARN_TIMESTAMPS[chat_id]:
+                WARN_TIMESTAMPS.pop(chat_id, None)
+
+        # Persist atomically: reset warn_count to 0 in the same update if ceiling is reached
+        stored_count = 0 if reached_ceiling else current_warns
+        DatabaseService.record_warn_background(chat_id, target_user.id, admin_id, reason, stored_count)
+        DatabaseService.log_moderation_background(chat_id, admin_id, target_user.id, "warn", reason)
 
     chat_title = await get_cached_chat_title(bot, chat_id, fallback="Group")
 
-    if current_warns >= ceiling:
-        WARN_CACHE[chat_id].pop(target_user.id, None)
-        if not WARN_CACHE[chat_id]:
-            WARN_CACHE.pop(chat_id, None)
-
+    if reached_ceiling:
         action = settings.get("warn_action", "mute")
-        duration = settings.get("warn_duration", 86400)
+        duration = int(settings.get("warn_duration", 86400))
         until_ts = int(time.time() + duration) if duration > 0 else None
 
         try:
@@ -2132,6 +2268,9 @@ async def handle_resetwarn(message: Message, command: CommandObject, bot: Bot) -
     WARN_CACHE[message.chat.id].pop(target_id, None)
     if not WARN_CACHE[message.chat.id]:
         WARN_CACHE.pop(message.chat.id, None)
+    WARN_TIMESTAMPS[message.chat.id].pop(target_id, None)
+    if not WARN_TIMESTAMPS[message.chat.id]:
+        WARN_TIMESTAMPS.pop(message.chat.id, None)
     DatabaseService.reset_warn_background(message.chat.id, target_id)
     DatabaseService.log_moderation_background(message.chat.id, user_id, target_id, "resetwarn")
     mention = f"<a href='tg://user?id={target_id}'>{html.escape(target_name or f'User {target_id}')}</a>"
@@ -2146,8 +2285,24 @@ async def handle_get_warns(message: Message, command: CommandObject, bot: Bot) -
     if not target_id:
         target_id = message.from_user.id if message.from_user else 0
 
-    count = WARN_CACHE[message.chat.id].get(target_id, 0)
-    ceiling = CHAT_SETTINGS[message.chat.id].get("warn_limit", 3)
+    chat_id = message.chat.id
+    if target_id not in WARN_CACHE.get(chat_id, {}):
+        db_count, db_ts = await DatabaseService.get_user_warn_state(chat_id, target_id)
+        if db_count > 0:
+            WARN_CACHE[chat_id][target_id] = db_count
+            if db_ts is not None:
+                WARN_TIMESTAMPS[chat_id][target_id] = db_ts
+
+    warn_expiry = int(CHAT_SETTINGS[chat_id].get("warn_expiry", 0))
+    if warn_expiry > 0:
+        last_ts = WARN_TIMESTAMPS.get(chat_id, {}).get(target_id)
+        if last_ts is not None and (time.time() - last_ts) >= warn_expiry:
+            WARN_CACHE[chat_id].pop(target_id, None)
+            WARN_TIMESTAMPS[chat_id].pop(target_id, None)
+            DatabaseService.reset_warn_background(chat_id, target_id)
+
+    count = WARN_CACHE[chat_id].get(target_id, 0)
+    ceiling = CHAT_SETTINGS[chat_id].get("warn_limit", 3)
 
     try:
         notice = await message.answer(f"⚠️ User Warning Count: <b>{count}/{ceiling}</b>", parse_mode=ParseMode.HTML)
@@ -3171,7 +3326,8 @@ def generate_warn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardM
     auto_warn = s.get("auto_warn_enabled", True)
     w_limit = s.get("warn_limit", 3)
     w_action = s.get("warn_action", "mute").upper()
-    w_dur = format_duration(s.get("warn_duration", 86400))
+    w_dur = format_duration(int(s.get("warn_duration", 86400)))
+    w_exp = format_duration(int(s.get("warn_expiry", 0)), zero_label="Never")
     cancel_on = s.get("warn_cancel_btn", True)
     custom_msg = s.get("custom_warn_msg", "").strip()
     warn_dup = s.get("warn_on_duplicate", True)
@@ -3195,7 +3351,8 @@ def generate_warn_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardM
             InlineKeyboardButton(text=f"🔨 Punishment: {w_action} (MUTE/BAN/KICK)", callback_data=f"{prefix}warn_action:{chat_id}")
         ],
         [
-            InlineKeyboardButton(text=f"⏱️ Duration: {w_dur}", callback_data=f"{prefix}warn_dur:{chat_id}")
+            InlineKeyboardButton(text=f"⏱️ Penalty Dur: {w_dur}", callback_data=f"{prefix}menu:warndur:{chat_id}"),
+            InlineKeyboardButton(text=f"⏳ Warn Expiry: {w_exp}", callback_data=f"{prefix}menu:warnexpiry:{chat_id}"),
         ],
         [
             InlineKeyboardButton(
@@ -3249,7 +3406,8 @@ def format_warn_text(chat_title: str, s: Dict[str, Any]) -> str:
     auto_warn = s.get("auto_warn_enabled", True)
     w_limit = s.get("warn_limit", 3)
     w_action = s.get("warn_action", "mute").upper()
-    w_dur = format_duration(s.get("warn_duration", 86400))
+    w_dur = format_duration_long(int(s.get("warn_duration", 86400)), zero_label="Permanent")
+    w_exp = format_duration_long(int(s.get("warn_expiry", 0)), zero_label="Never (Keep Forever)")
     cancel_on = s.get("warn_cancel_btn", True)
     custom_msg = s.get("custom_warn_msg", "").strip()
     warn_dup = s.get("warn_on_duplicate", True)
@@ -3266,14 +3424,90 @@ def format_warn_text(chat_title: str, s: Dict[str, Any]) -> str:
         f"• <b>Violation Ceiling:</b> <code>{w_limit} warnings</code>\n"
         f"• <b>Punishment Action:</b> <code>{w_action}</code> (MUTE / BAN / KICK)\n"
         f"• <b>Penalty Duration:</b> <code>{w_dur}</code>\n"
+        f"• <b>Warn Auto-Expiry:</b> <code>{w_exp}</code>\n"
         f"• <b>Warn on Duplicates:</b> {'<code>🟢 ACTIVE</code>' if warn_dup else '<i>⚪ DISABLED</i>'} "
         f"(Repeats: <code>{dup_limit}x</code> in <code>{dup_win}s</code>)\n"
         f"• <b>Warn on Message Flood:</b> {'<code>🟢 ACTIVE</code>' if warn_flood else '<i>⚪ DISABLED</i>'} "
         f"(Ceiling: <code>{f_limit} msgs</code> in <code>{f_win}s</code>)\n"
         f"• <b>Inline Cancel Button:</b> {'<code>ENABLED</code>' if cancel_on else '<i>DISABLED</i>'}\n"
         f"• <b>Warn Notice Template:</b> <code>{status_custom}</code>\n\n"
-        f"<i>Tap buttons below to toggle auto-warn, adjust frequency/duplicate thresholds, or customize templates:</i>"
+        f"<i>Tap buttons below to toggle auto-warn, configure penalty/expiry durations (1d, 1w, 2mo, etc.), or customize templates:</i>"
     )
+
+
+def format_warndur_text(chat_title: str, s: Dict[str, Any]) -> str:
+    w_dur_long = format_duration_long(int(s.get("warn_duration", 86400)), zero_label="Permanent")
+    w_action = s.get("warn_action", "mute").upper()
+    w_limit = s.get("warn_limit", 3)
+    return (
+        f"⏱️ <b>WARN PENALTY DURATION</b>\n"
+        f"Group: <code>{html.escape(chat_title)}</code>\n\n"
+        f"Determines how long a member is penalized (<code>{w_action}</code>) upon reaching <b>{w_limit}</b> warnings.\n\n"
+        f"<b>Current Penalty Duration:</b> <code>{w_dur_long}</code>\n\n"
+        f"<i>Select a preset duration below or tap ✍️ Custom to set any duration (e.g. 30m, 1d, 1w, 2mo):</i>"
+    )
+
+
+def generate_warndur_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    cur = int(s.get("warn_duration", 86400))
+
+    def _btn(sec: int, label: str) -> InlineKeyboardButton:
+        text = f"🟢 {label}" if cur == sec else label
+        return InlineKeyboardButton(text=text, callback_data=f"{prefix}setwarndur:{sec}:{chat_id}")
+
+    if is_dm:
+        custom_btn = InlineKeyboardButton(text="✍️ Custom Duration", callback_data=f"{prefix}cust:warndur:{chat_id}")
+    else:
+        custom_btn = InlineKeyboardButton(
+            text="✍️ Custom Duration in DM ↗️",
+            url=f"https://t.me/{BOT_IDENTITY.get('username', 'personal_guardBot')}?start=custom_warndur_{abs(chat_id)}"
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(900, "15m"), _btn(3600, "1h"), _btn(21600, "6h"), _btn(43200, "12h")],
+        [_btn(86400, "1d"), _btn(259200, "3d"), _btn(604800, "1w"), _btn(1209600, "2w")],
+        [_btn(2592000, "1mo"), _btn(5184000, "2mo"), _btn(15552000, "6mo"), _btn(0, "♾️ Perm")],
+        [custom_btn],
+        [InlineKeyboardButton(text="⬅️ Back to Warn Settings", callback_data=f"{prefix}menu:warn:{chat_id}")],
+    ])
+
+
+def format_warnexpiry_text(chat_title: str, s: Dict[str, Any]) -> str:
+    w_exp_long = format_duration_long(int(s.get("warn_expiry", 0)), zero_label="Never (Keep Forever)")
+    return (
+        f"⏳ <b>WARN AUTO-EXPIRY DURATION</b>\n"
+        f"Group: <code>{html.escape(chat_title)}</code>\n\n"
+        f"Automatically clears a member's active warnings after this much time passes without a violation.\n\n"
+        f"<b>Current Warn Expiry:</b> <code>{w_exp_long}</code>\n\n"
+        f"<i>Select a preset duration below or tap ✍️ Custom to specify any expiry (e.g. 1d, 1w, 2mo):</i>"
+    )
+
+
+def generate_warnexpiry_keyboard(chat_id: int, is_dm: bool = False) -> InlineKeyboardMarkup:
+    prefix = "dm:" if is_dm else "set:"
+    s = CHAT_SETTINGS[chat_id]
+    cur = int(s.get("warn_expiry", 0))
+
+    def _btn(sec: int, label: str) -> InlineKeyboardButton:
+        text = f"🟢 {label}" if cur == sec else label
+        return InlineKeyboardButton(text=text, callback_data=f"{prefix}setwarnexp:{sec}:{chat_id}")
+
+    if is_dm:
+        custom_btn = InlineKeyboardButton(text="✍️ Custom Expiry", callback_data=f"{prefix}cust:warnexpiry:{chat_id}")
+    else:
+        custom_btn = InlineKeyboardButton(
+            text="✍️ Custom Expiry in DM ↗️",
+            url=f"https://t.me/{BOT_IDENTITY.get('username', 'personal_guardBot')}?start=custom_warnexpiry_{abs(chat_id)}"
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(0, "Never"), _btn(3600, "1h"), _btn(43200, "12h"), _btn(86400, "1d")],
+        [_btn(259200, "3d"), _btn(604800, "1w"), _btn(1209600, "2w"), _btn(2592000, "1mo")],
+        [_btn(5184000, "2mo"), _btn(15552000, "6mo"), custom_btn],
+        [InlineKeyboardButton(text="⬅️ Back to Warn Settings", callback_data=f"{prefix}menu:warn:{chat_id}")],
+    ])
 
 
 def generate_warn_custom_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -3639,6 +3873,20 @@ async def handle_start(message: Message, command: CommandObject, bot: Bot) -> No
                         f"📏 <b>Configure Message Length Limit</b>\n\n"
                         f"<b>Group:</b> <code>{html.escape(title)}</code>\n\n"
                         f"Please enter your custom character limit between <code>0</code> and <code>4096</code> (0 to disable):\n"
+                        f"<i>Send /cancel to abort.</i>"
+                    )
+                    return
+                if subname_param in ("warndur", "warnexpiry"):
+                    label = "Warn Penalty Duration" if subname_param == "warndur" else "Warn Auto-Expiry Duration"
+                    zero_hint = "Permanent" if subname_param == "warndur" else "Never Expire"
+                    await send_or_replace_dm_settings(
+                        bot,
+                        user_id,
+                        f"⏱️ <b>Configure Custom {label}</b>\n\n"
+                        f"<b>Group:</b> <code>{html.escape(title)}</code>\n\n"
+                        f"Send your custom duration now (e.g. <code>30m</code>, <code>6h</code>, <code>1d</code>, <code>1w</code>, <code>2mo</code>, <code>2M</code>).\n"
+                        f"• Units: <code>s</code>=secs, <code>m</code>=mins, <code>h</code>=hours, <code>d</code>=days, <code>w</code>=weeks, <code>mo</code>/<code>M</code>=months\n"
+                        f"• Send <code>0</code> for {zero_hint}\n\n"
                         f"<i>Send /cancel to abort.</i>"
                     )
                     return
@@ -4011,6 +4259,10 @@ def render_submenu(subname: str, chat_title: str, s: Dict[str, Any], chat_id: in
         return format_porn_text(chat_title, s), generate_porn_keyboard(chat_id, is_dm=is_dm)
     elif subname == "warn":
         return format_warn_text(chat_title, s), generate_warn_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "warndur":
+        return format_warndur_text(chat_title, s), generate_warndur_keyboard(chat_id, is_dm=is_dm)
+    elif subname == "warnexpiry":
+        return format_warnexpiry_text(chat_title, s), generate_warnexpiry_keyboard(chat_id, is_dm=is_dm)
     elif subname == "night":
         return format_night_text(chat_title, s), generate_night_keyboard(chat_id, is_dm=is_dm)
     elif subname == "tag":
@@ -4089,15 +4341,15 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         except ValueError:
             await query.answer()
             return
-    elif action == "setlen":
-        # format: prefix:setlen:<val>:<chat_id>
+    elif action in ("setlen", "setwarndur", "setwarnexp"):
+        # format: prefix:setlen:<val>:<chat_id> | prefix:setwarndur:<sec>:<chat_id> | prefix:setwarnexp:<sec>:<chat_id>
         try:
             target_len = int(parts[2])
             chat_id = int(parts[3])
         except (ValueError, IndexError):
             await query.answer()
             return
-        subname = "msglength"
+        subname = "msglength" if action == "setlen" else ("warndur" if action == "setwarndur" else "warnexpiry")
     elif action in ("toggle", "cycle"):
         # e.g. set:toggle:<key>:<chat_id>:<subname>
         key = parts[2]
@@ -4188,7 +4440,7 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer(f"{key}: {status_str}")
         return
 
-    # 5B. Direct Message Length Preset Selection
+    # 5B. Direct Preset Selection (Message Length, Warn Penalty Duration, Warn Auto-Expiry)
     if action == "setlen":
         s["max_message_length"] = max(0, min(4096, target_len))
         DatabaseService.save_settings_background(chat_id, chat_title, s)
@@ -4199,6 +4451,28 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
             pass
         len_desc = f"{target_len} chars" if target_len > 0 else "Unlimited"
         await query.answer(f"Length limit: {len_desc}")
+        return
+
+    if action == "setwarndur":
+        s["warn_duration"] = max(0, min(31536000, target_len))
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu("warndur", chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer(f"Warn Penalty Duration: {format_duration_long(s['warn_duration'], zero_label='Permanent')}")
+        return
+
+    if action == "setwarnexp":
+        s["warn_expiry"] = max(0, min(31536000, target_len))
+        DatabaseService.save_settings_background(chat_id, chat_title, s)
+        text, kb = render_submenu("warnexpiry", chat_title, s, chat_id, is_dm)
+        try:
+            await query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await query.answer(f"Warn Expiry: {format_duration_long(s['warn_expiry'], zero_label='Never')}")
         return
 
     # 6. Generic Cycle Option
@@ -4245,6 +4519,19 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
                     parse_mode=ParseMode.HTML
                 )
                 await query.answer("Enter character limit in PM...")
+                return
+            if subname in ("warndur", "warnexpiry"):
+                label = "Warn Penalty Duration" if subname == "warndur" else "Warn Auto-Expiry Duration"
+                zero_hint = "Permanent" if subname == "warndur" else "Never Expire"
+                await query.message.answer(
+                    f"⏱️ <b>Enter custom {label}:</b>\n\n"
+                    f"Send duration such as <code>30m</code>, <code>6h</code>, <code>1d</code>, <code>1w</code>, <code>2mo</code>, or <code>2M</code>.\n"
+                    f"• Units: <code>s</code>=secs, <code>m</code>=mins, <code>h</code>=hours, <code>d</code>=days, <code>w</code>=weeks, <code>mo</code>/<code>M</code>=months\n"
+                    f"• Send <code>0</code> for {zero_hint}\n\n"
+                    f"<i>Send /cancel to abort.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                await query.answer("Enter custom duration in PM...")
                 return
             nice_name = subname.replace("_", " ").title()
             await query.message.answer(
@@ -4312,9 +4599,9 @@ async def handle_settings_callback(query: CallbackQuery, bot: Bot) -> None:
         s["warn_action"] = actions[(idx + 1) % len(actions)]
         await query.answer(f"Warn Punishment: {s['warn_action'].upper()}")
     elif action == "warn_dur":
-        durations = [3600, 21600, 43200, 86400, 604800, 0]
+        durations = [900, 3600, 21600, 43200, 86400, 259200, 604800, 1209600, 2592000, 5184000, 15552000, 0]
         cur = int(s.get("warn_duration", 86400))
-        idx = durations.index(cur) if cur in durations else 3
+        idx = durations.index(cur) if cur in durations else 4
         s["warn_duration"] = durations[(idx + 1) % len(durations)]
         await query.answer(f"Warn Duration: {format_duration(s['warn_duration'])}")
     elif action == "warn_toggle_cancel":
@@ -4520,17 +4807,28 @@ async def handle_cancel_warn_callback(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("⚠️ Only chat administrators can cancel warnings!", show_alert=True)
         return
 
-    current_count = WARN_CACHE[chat_id].get(target_id, 0)
-    new_count = max(0, current_count - 1)
-    if new_count <= 0:
-        WARN_CACHE[chat_id].pop(target_id, None)
-        if not WARN_CACHE[chat_id]:
-            WARN_CACHE.pop(chat_id, None)
-    else:
-        WARN_CACHE[chat_id][target_id] = new_count
+    async with _get_warn_lock(chat_id, target_id):
+        if target_id not in WARN_CACHE.get(chat_id, {}):
+            db_count, db_ts = await DatabaseService.get_user_warn_state(chat_id, target_id)
+            if db_count > 0:
+                WARN_CACHE[chat_id][target_id] = db_count
+                if db_ts is not None:
+                    WARN_TIMESTAMPS[chat_id][target_id] = db_ts
 
-    DatabaseService.cancel_warn_background(chat_id, target_id, new_count)
-    DatabaseService.log_moderation_background(chat_id, admin_user.id, target_id, "cancel_warn", "Warning cancelled by admin")
+        current_count = WARN_CACHE[chat_id].get(target_id, 0)
+        new_count = max(0, current_count - 1)
+        if new_count <= 0:
+            WARN_CACHE[chat_id].pop(target_id, None)
+            if not WARN_CACHE[chat_id]:
+                WARN_CACHE.pop(chat_id, None)
+            WARN_TIMESTAMPS[chat_id].pop(target_id, None)
+            if not WARN_TIMESTAMPS[chat_id]:
+                WARN_TIMESTAMPS.pop(chat_id, None)
+        else:
+            WARN_CACHE[chat_id][target_id] = new_count
+
+        DatabaseService.cancel_warn_background(chat_id, target_id, new_count)
+        DatabaseService.log_moderation_background(chat_id, admin_user.id, target_id, "cancel_warn", "Warning cancelled by admin")
 
     ceiling = CHAT_SETTINGS[chat_id].get("warn_limit", 3)
     admin_name = html.escape(admin_user.full_name)
@@ -5126,6 +5424,46 @@ async def handle_dm_custom_text(message: Message, bot: Bot) -> None:
                 f"────────────────────────\n\n"
                 f"⚠️ <i>Please confirm to dispatch this broadcast. It will be throttled at 25 msgs/sec.</i>",
                 reply_markup=confirm_kb,
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if subname in ("warndur", "warnexpiry"):
+            parsed_sec = parse_custom_duration_input(custom_text)
+            if parsed_sec is None:
+                PENDING_CUSTOM_INPUT[user_id] = (chat_id, subname)
+                await message.answer(
+                    "❌ <b>Invalid duration format!</b>\n"
+                    "Please enter a duration between <code>30s</code> and <code>365d</code>, or <code>0</code> for Permanent/Never.\n"
+                    "Examples: <code>15m</code>, <code>6h</code>, <code>1d</code>, <code>1w</code>, <code>2mo</code>, <code>2M</code>\n\n"
+                    "<i>Send /cancel to abort.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+
+            is_dur = (subname == "warndur")
+            field_key = "warn_duration" if is_dur else "warn_expiry"
+            zero_txt = "Permanent" if is_dur else "Never (Keep Forever)"
+            title_txt = "Warn Penalty Duration" if is_dur else "Warn Auto-Expiry Duration"
+            s[field_key] = parsed_sec
+            DatabaseService.save_settings_background(chat_id, chat_title, s)
+
+            short_lbl = format_duration(parsed_sec, zero_label=zero_txt)
+            long_lbl = format_duration_long(parsed_sec, zero_label=zero_txt)
+            tip = ""
+            if custom_text.strip().endswith("m") and not custom_text.strip().lower().endswith("mo"):
+                tip = "\n💡 <i>Tip: lowercase <code>m</code> = minutes; use <code>mo</code> or uppercase <code>M</code> for months (e.g. <code>2mo</code>).</i>"
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"⚙️ Return to {title_txt}", callback_data=f"dm:menu:{subname}:{chat_id}")],
+                [InlineKeyboardButton(text="⚠️ Warn Settings", callback_data=f"dm:menu:warn:{chat_id}")]
+            ])
+            await message.answer(
+                f"✅ <b>{title_txt} Updated!</b>\n\n"
+                f"<b>Group:</b> <code>{html.escape(chat_title)}</code>\n"
+                f"<b>Duration:</b> <code>{long_lbl}</code> (<code>{short_lbl}</code>){tip}\n\n"
+                f"<i>Your updated configuration is live immediately across the group.</i>",
+                reply_markup=kb,
                 parse_mode=ParseMode.HTML
             )
             return
@@ -6377,16 +6715,28 @@ async def resource_optimizer_worker() -> None:
             for cid in empty_dup_chats:
                 DUPLICATE_CACHE.pop(cid, None)
 
-            # 3. Clean zero-warn entries from WARN_CACHE
+            # 3. Clean zero-warn & expired entries from WARN_CACHE (never wipe active warnings!)
+            now_epoch_cleanup = time.time()
             empty_warn_chats = []
             for chat_id, user_dict in list(WARN_CACHE.items()):
-                zero_users = [uid for uid, count in list(user_dict.items()) if count <= 0]
-                for uid in zero_users:
+                exp_sec = int(CHAT_SETTINGS[chat_id].get("warn_expiry", 0)) if chat_id in CHAT_SETTINGS else 0
+                stale_users = []
+                for uid, count in list(user_dict.items()):
+                    if count <= 0:
+                        stale_users.append(uid)
+                    elif exp_sec > 0:
+                        last_ts = WARN_TIMESTAMPS.get(chat_id, {}).get(uid)
+                        if last_ts is not None and (now_epoch_cleanup - last_ts) >= exp_sec:
+                            stale_users.append(uid)
+                            DatabaseService.reset_warn_background(chat_id, uid)
+                for uid in stale_users:
                     user_dict.pop(uid, None)
+                    WARN_TIMESTAMPS.get(chat_id, {}).pop(uid, None)
                 if not user_dict:
                     empty_warn_chats.append(chat_id)
             for cid in empty_warn_chats:
                 WARN_CACHE.pop(cid, None)
+                WARN_TIMESTAMPS.pop(cid, None)
 
             # 4. Clean orphan private DM keys from CHAT_SETTINGS (supergroups have negative IDs)
             private_chats = [cid for cid in list(CHAT_SETTINGS.keys()) if cid > 0]
@@ -6425,8 +6775,10 @@ async def resource_optimizer_worker() -> None:
                 _LAST_DM_SENT_TS.pop(k, None)
 
             # 6. HARD 500MB RAM CIRCUIT BREAKER TIER CHECKS:
-            if rss_mb > 100.0:
-                # Tier 1 Relief (>100MB): Clear admin cache and compress flood deques
+            # NOTE: Never clear WARN_CACHE or CHAT_SETTINGS under memory pressure;
+            # they hold persistent moderation state that would reset warn counts back to 1/3.
+            if rss_mb > 280.0:
+                # Tier 1 Relief (>280MB): Clear admin cache and compress flood deques
                 ADMIN_CACHE.clear()
                 for chat_id, user_dict in list(FLOOD_CACHE.items()):
                     recent_users = {uid: dq for uid, dq in user_dict.items() if dq and (now - dq[-1] <= 5.0)}
@@ -6435,11 +6787,10 @@ async def resource_optimizer_worker() -> None:
                     else:
                         FLOOD_CACHE.pop(chat_id, None)
 
-            if rss_mb > 250.0:
-                # Tier 2 Emergency Relief (>250MB): Shed flood and warn memory
+            if rss_mb > 340.0:
+                # Tier 2 Emergency Relief (>340MB): Shed disposable flood/lookup caches only
                 FLOOD_CACHE.clear()
                 DUPLICATE_CACHE.clear()
-                WARN_CACHE.clear()
                 USERNAME_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
@@ -6448,11 +6799,11 @@ async def resource_optimizer_worker() -> None:
                 _LAST_DM_SENT_TS.clear()
                 CHAT_TITLES.clear()
 
-            if rss_mb > 400.0:
-                # Tier 3 Critical Circuit Breaker (>400MB): Complete heap shed before Render's 512MB OOM
+            if rss_mb > 420.0:
+                # Tier 3 Critical Circuit Breaker (>420MB): Complete disposable heap shed before Render's 512MB OOM
                 ADMIN_CACHE.clear()
                 FLOOD_CACHE.clear()
-                WARN_CACHE.clear()
+                DUPLICATE_CACHE.clear()
                 USERNAME_CACHE.clear()
                 PENDING_CUSTOM_WARN.clear()
                 PENDING_CUSTOM_INPUT.clear()
@@ -6460,7 +6811,7 @@ async def resource_optimizer_worker() -> None:
                 LAST_DM_SETTINGS_MSG.clear()
                 _LAST_DM_SENT_TS.clear()
                 CHAT_TITLES.clear()
-                print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed heap to protect container.")
+                print(f"[CIRCUIT BREAKER] Hard memory guard active at {rss_mb}MB. Trimmed disposable caches to protect container.")
 
             # Trigger Python garbage collection
             gc.collect()
@@ -7246,7 +7597,7 @@ async def main() -> None:
     await MongoDBManager.connect()
     if MongoDBManager.is_connected():
         await DatabaseService.hydrate_settings_cache(CHAT_SETTINGS, CHAT_TITLES)
-        await DatabaseService.hydrate_warn_cache(WARN_CACHE)
+        await DatabaseService.hydrate_warn_cache(WARN_CACHE, WARN_TIMESTAMPS)
         await DatabaseService.hydrate_accepted_members_cache(ACCEPTED_MEMBERS_CACHE)
 
     # Register admin-only command catalog with Telegram API
